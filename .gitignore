@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env.local
+.playwright-cli/
+.tooling/
+android/.gradle/
+android/build/
+android/local.properties
+android/app/build/
+output/
