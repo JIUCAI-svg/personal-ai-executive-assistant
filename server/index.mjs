@@ -301,24 +301,37 @@ function chineseNumber(value) {
   return digits[value];
 }
 
-function explicitTimeActions(message) {
+function inferImplicitTimeType(text, context = {}) {
+  if (!/(调整|改成|改到|设为|设置为|改为|换成|提前到|推迟到|延后到)/.test(text)) return '';
+  const conversation = Array.isArray(context.conversation) ? context.conversation : [];
+  for (let index = conversation.length - 1; index >= 0; index -= 1) {
+    const content = String(conversation[index]?.content || '');
+    if (/(睡觉|睡下|上床|入睡|睡眠|睡)/.test(content)) return 'sleep';
+    if (/(起床|起身|起来|醒来|睡醒)/.test(content)) return 'wake';
+  }
+  return '';
+}
+
+function explicitTimeActions(message, context = {}) {
   const text = String(message || '');
   const expression = /(?:(凌晨|早上|上午|中午|下午|傍晚|晚上|今晚)\s*)?(\d{1,2}|[零一二三四五六七八九十两]{1,3})\s*(?::\s*(\d{1,2})|点\s*(?:(\d{1,2})\s*分?|半)?)/g;
   const actions = [];
+  const implicitType = inferImplicitTimeType(text, context);
   for (const match of text.matchAll(expression)) {
     let hour = chineseNumber(match[2]);
     const minute = match[3] !== undefined ? Number(match[3]) : match[4] !== undefined ? Number(match[4]) : match[0].includes('半') ? 30 : 0;
     if (!Number.isInteger(hour) || hour > 23 || minute > 59) continue;
     // "今晚 00:40" is already a midnight time; only shift 1-11 o'clock to PM.
     if (['下午', '傍晚', '晚上', '今晚'].includes(match[1]) && hour > 0 && hour < 12) hour += 12;
+    if (!match[1] && implicitType === 'sleep' && hour >= 6 && hour < 12) hour += 12;
     const index = match.index || 0;
     const before = text.slice(Math.max(0, index - 4), index);
     const after = text.slice(index + match[0].length, index + match[0].length + 4);
     const time = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
-    if (/(睡觉|睡下|上床|入睡|睡)/.test(after) || /(睡觉|睡下|上床|入睡|睡)[^，。；;]{0,3}$/.test(before)) {
+    if (/(睡觉|睡下|上床|入睡|睡)/.test(after) || /(睡觉|睡下|上床|入睡|睡)[^，。；;]{0,3}$/.test(before) || (implicitType === 'sleep' && !match[1])) {
       actions.push({ type: 'set_sleep_time', time, reason: '根据你刚刚说明的作息时间更新。' });
     }
-    if (/(起床|起(?:来|身)?)/.test(after) || /(起床|起(?:来|身)?)[^，。；;]{0,3}$/.test(before)) {
+    if (/(起床|起(?:来|身)?)/.test(after) || /(起床|起(?:来|身)?)[^，。；;]{0,3}$/.test(before) || (implicitType === 'wake' && !match[1])) {
       actions.push({ type: 'set_wake_time', time, reason: '根据你刚刚说明的作息时间更新。' });
     }
   }
@@ -447,7 +460,7 @@ function enforceUserIntent(result, message, context) {
   if (explicitlyComplete) {
     result.actions.push({ type: 'complete_current_task', reason: '用户明确说明当前任务已完成。' });
   }
-  for (const action of explicitTimeActions(message)) {
+  for (const action of explicitTimeActions(message, context)) {
     result.actions = result.actions.filter((item) => item.type !== action.type);
     result.actions.push(action);
   }
@@ -715,7 +728,8 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       today_plan: planBefore.scheduled,
       current_task: planBefore.current_task,
       projects: stateBefore.projects,
-      project_name: projectName
+      project_name: projectName,
+      conversation
     };
     async function finishAssistantResponse(result, degraded = false) {
       const execution = await store.executeActions(result.actions, {
@@ -760,6 +774,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         body: JSON.stringify({
           model: aiModel,
           temperature: 0.45,
+          max_tokens: 2048,
           ...(aiReasoningEffort ? { reasoning_effort: aiReasoningEffort } : {}),
           response_format: { type: 'json_object' },
           messages: [
