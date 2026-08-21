@@ -27,6 +27,9 @@ const port = Number(process.env.PORT || 8787);
 const aiBaseUrl = String(process.env.AI_BASE_URL || '').replace(/\/$/, '');
 const aiApiKey = String(process.env.AI_API_KEY || '');
 const aiModel = String(process.env.AI_MODEL || '');
+const aiReasoningEffort = ['low', 'medium', 'high'].includes(process.env.AI_REASONING_EFFORT)
+  ? process.env.AI_REASONING_EFFORT
+  : '';
 const aiGatewayToken = String(process.env.AI_GATEWAY_TOKEN || '');
 const app = express();
 const clients = new Set();
@@ -631,6 +634,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         body: JSON.stringify({
           model: aiModel,
           temperature: 0.45,
+          ...(aiReasoningEffort ? { reasoning_effort: aiReasoningEffort } : {}),
           response_format: { type: 'json_object' },
           messages: [
             { role: 'system', content: assistantSystemPrompt() },
