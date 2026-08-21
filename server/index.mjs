@@ -273,6 +273,33 @@ function explicitTimeActions(message) {
   return actions.filter((action, index) => actions.findIndex((item) => item.type === action.type) === index);
 }
 
+function explicitTaskCreationActions(message, context = {}) {
+  const text = stringValue(message, 800);
+  if (!text || /(取消|删除|删掉|移除|不再安排|跳过|顺延|推迟)/.test(text)) return [];
+  if (!/(安排|新增|添加|加上|加入|创建|建立|我想做|我要做|今天做|今天想做|打算做|准备做)/.test(text)) return [];
+
+  const markedTitle = text.match(/(?:任务|事项|事情)\s*[：:]\s*([^，,。；;]+?)(?=\s*(?:，|,|。|；|;|$))/);
+  const actionTitle = text.match(/(?:安排|新增|添加|加上|加入|创建|建立)\s*(?:一个|一项|个)?(?:任务|事项|事情)?\s*[：:]?\s*([^，,。；;]+?)(?=\s*(?:，|,|。|；|;|$))/);
+  const naturalTitle = text.match(/(?:今天|明天)?\s*(?:我)?\s*(?:打算|准备|想要|要|想)做\s*([^，,。；;]+?)(?=\s*(?:，|,|。|；|;|$))/);
+  let title = stringValue(markedTitle?.[1] || actionTitle?.[1] || naturalTitle?.[1], 120)
+    .replace(/^(?:今天|明天|现在|请|帮我|我要|我想|做一个|一个|一项)\s*/, '')
+    .trim();
+  if (!title || title.length < 2) return [];
+
+  const durationMatch = text.match(/(?:预计|大约|时长|用时|需要|花)\s*(\d{1,3})\s*(?:分钟|min)/i);
+  const projectMatch = text.match(/(?:放到|加入|归到|关联到|放进)\s*([^，,。；;]{1,60}?)(?:项目(?:里|中)?|之中)/);
+  const requestedProject = stringValue(projectMatch?.[1] || context.project_name, 80);
+  const project = findProjectByReference(context.projects || [], requestedProject);
+  return [{
+    type: 'create_task',
+    title,
+    estimated_minutes: durationMatch ? Number(durationMatch[1]) : 45,
+    priority: /(最高优先|最重要|紧急|优先完成)/.test(text) ? 5 : 3,
+    ...(project ? { project: project.name } : {}),
+    reason: '根据你明确说明的事项加入今日计划。'
+  }];
+}
+
 function normalizeActions(actions) {
   if (!Array.isArray(actions)) return [];
   const allowedTypes = new Set([
@@ -346,6 +373,14 @@ function enforceUserIntent(result, message, context) {
     result.actions.push(action);
   }
   return result;
+}
+
+function localFallbackResult(message, context) {
+  return enforceUserIntent({
+    reply: 'AI 服务暂时没有回复。我已先执行这条可以明确判断的计划调整，稍后可以继续对话。',
+    actions: explicitTaskCreationActions(message, context),
+    memoryCandidates: []
+  }, message, context);
 }
 
 function parseAssistantContent(content) {
@@ -549,7 +584,9 @@ app.post('/api/assistant/respond', async (request, response, next) => {
     });
     const intentContext = {
       today_plan: planBefore.scheduled,
-      current_task: planBefore.current_task
+      current_task: planBefore.current_task,
+      projects: stateBefore.projects,
+      project_name: projectName
     };
     async function finishAssistantResponse(result, degraded = false) {
       const execution = await stateStore.executeActions(result.actions, {
@@ -558,6 +595,18 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         allow_memory_distillation: hydratedThread.allow_memory_distillation,
         persist_action_log: hydratedThread.mode !== 'temporary' || hydratedThread.save_full_conversation
       });
+      if (degraded) {
+        const completed = execution.results.filter((item) => item.ok);
+        const created = completed.find((item) => item.type === 'create_task');
+        const cancelled = completed.find((item) => item.type === 'cancel_task');
+        const deferred = completed.find((item) => item.type === 'defer_task');
+        const sleep = completed.find((item) => item.type === 'set_sleep_time');
+        const wake = completed.find((item) => item.type === 'set_wake_time');
+        if (created) result.reply = `已把「${created.task.title}」加入真实任务库，预计 ${created.task.estimated_minutes} 分钟，并按今天的剩余时间重新安排。`;
+        else if (cancelled) result.reply = `已取消「${cancelled.title}」，它已从今天的计划中移除。`;
+        else if (deferred) result.reply = `已把「${deferred.title}」顺延，今天不再安排它。`;
+        else if (sleep || wake) result.reply = `作息已更新：${sleep ? `今晚 ${sleep.value} 睡觉` : ''}${sleep && wake ? '，' : ''}${wake ? `明天 ${wake.value} 起床` : ''}。我已按新的可用时间重排计划。`;
+      }
       const pendingMemories = await stateStore.addMemoryCandidates(result.memoryCandidates, hydratedThread);
       const assistantMessage = await stateStore.appendMessage(hydratedThread, 'assistant', result.reply, execution.results);
       const transcriptPath = await appendConversationTranscript(hydratedThread, [
@@ -594,19 +643,13 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       });
     } catch (error) {
       console.error('AI relay connection error', error?.cause?.code || error?.name || 'unknown');
-      const fallback = enforceUserIntent({
-        reply: 'AI 服务暂时没有回复。我已先执行这条可以明确判断的计划调整，稍后可以继续对话。',
-        actions: [], memoryCandidates: []
-      }, message, intentContext);
+      const fallback = localFallbackResult(message, intentContext);
       return finishAssistantResponse(fallback, true);
     }
     const upstreamBody = await upstream.json().catch(() => null);
     if (!upstream.ok) {
       console.error('AI relay error', upstream.status, upstreamBody);
-      const fallback = enforceUserIntent({
-        reply: 'AI 服务暂时没有返回有效结果。我已先执行这条可以明确判断的计划调整，稍后可以继续对话。',
-        actions: [], memoryCandidates: []
-      }, message, intentContext);
+      const fallback = localFallbackResult(message, intentContext);
       return finishAssistantResponse(fallback, true);
     }
     const content = upstreamBody?.choices?.[0]?.message?.content;
