@@ -64,6 +64,34 @@ function normalizeText(value, limit = 240) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
 }
 
+function memoryKey(value) {
+  return normalizeText(value, 220)
+    .toLocaleLowerCase('zh-CN')
+    .replace(/[\s，,。.!！?？：:；;、·“”"'‘’()（）\-+]/g, '')
+    .replace(/[的了我你他她它在与和及对为是一个这那请记住用户时]/g, '');
+}
+
+function sameMemory(left, right) {
+  const leftKey = memoryKey(left);
+  const rightKey = memoryKey(right);
+  if (!leftKey || !rightKey) return false;
+  if (leftKey === rightKey || leftKey.includes(rightKey) || rightKey.includes(leftKey)) return true;
+  const leftNumbers = leftKey.match(/\d+/g) || [];
+  const rightNumbers = rightKey.match(/\d+/g) || [];
+  if (leftNumbers.length && rightNumbers.length && leftNumbers.join(',') !== rightNumbers.join(',')) return false;
+  const available = new Map();
+  for (const character of leftKey) available.set(character, (available.get(character) || 0) + 1);
+  let shared = 0;
+  for (const character of rightKey) {
+    const count = available.get(character) || 0;
+    if (count > 0) {
+      shared += 1;
+      available.set(character, count - 1);
+    }
+  }
+  return shared / Math.max(leftKey.length, rightKey.length) >= 0.8;
+}
+
 function defaultState() {
   const now = nowParts();
   const createdAt = `${now.date}T${now.time}:00+08:00`;
@@ -173,7 +201,7 @@ function mergeIntervals(intervals) {
 function buildPlan(state, current = nowParts()) {
   const window = todayPlanningWindow(state.settings, current);
   const taskItems = state.tasks
-    .filter((task) => ['open', 'in_progress', 'deferred'].includes(task.status))
+    .filter((task) => ['open', 'in_progress'].includes(task.status))
     .sort((left, right) => (right.priority - left.priority) || (dueWeight(left) - dueWeight(right)) || left.created_at.localeCompare(right.created_at));
   const blocks = state.unavailable_blocks
     .filter((block) => block.date === current.date || block.date === window.end_date)
@@ -196,7 +224,9 @@ function buildPlan(state, current = nowParts()) {
   const planningLimit = window.end_absolute_minutes - bufferMinutes;
   let cursor = Math.min(window.end_absolute_minutes, window.current_minutes + 5);
   const scheduled = [];
-  const deferred = [];
+  const deferred = state.tasks
+    .filter((task) => task.status === 'deferred')
+    .map((task) => ({ ...task, reason: '已按你的要求顺延，等待下次安排' }));
 
   function nextAvailableStart(start, duration) {
     let candidate = start;
@@ -397,10 +427,13 @@ export class AssistantStateStore {
     if (!thread?.allow_memory_distillation || !Array.isArray(candidates) || candidates.length === 0) return [];
     return this.mutate((state) => {
       const current = isoAt(nowParts().date, nowParts().time);
+      const existing = state.memory_items.map((item) => item.content);
       const created = candidates
         .map((content) => normalizeText(content, 220))
         .filter(Boolean)
         .slice(0, 5)
+        .filter((content) => !existing.some((item) => sameMemory(item, content)))
+        .filter((content, index, items) => !items.slice(0, index).some((item) => sameMemory(item, content)))
         .map((content) => ({
           id: id(),
           project_id: thread.project_id || null,
@@ -483,9 +516,14 @@ export class AssistantStateStore {
         } else if (type === 'capture_memory') {
           const content = normalizeText(action.title || action.reason, 220);
           if (content && context.allow_memory_distillation !== false) {
-            const memory = { id: id(), project_id: context.project_id || null, kind: 'fact', content, status: 'pending_review', created_at: timestamp, updated_at: timestamp };
-            state.memory_items.push(memory);
-            result = { type, ok: true, memory, reason: '已加入待确认记忆。' };
+            const memory = state.memory_items.find((item) => sameMemory(item.content, content));
+            if (memory) {
+              result = { type, ok: true, memory, reason: '相同的待确认记忆已经存在。' };
+            } else {
+              const created = { id: id(), project_id: context.project_id || null, kind: 'fact', content, status: 'pending_review', created_at: timestamp, updated_at: timestamp };
+              state.memory_items.push(created);
+              result = { type, ok: true, memory: created, reason: '已加入待确认记忆。' };
+            }
           } else if (content) {
             result = { type, ok: false, reason: '本次对话未开启长期记忆沉淀。' };
           }

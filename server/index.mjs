@@ -261,7 +261,8 @@ function explicitTimeActions(message) {
     let hour = chineseNumber(match[2]);
     const minute = match[3] !== undefined ? Number(match[3]) : match[4] !== undefined ? Number(match[4]) : match[0].includes('半') ? 30 : 0;
     if (!Number.isInteger(hour) || hour > 23 || minute > 59) continue;
-    if (['下午', '傍晚', '晚上', '今晚'].includes(match[1]) && hour < 12) hour += 12;
+    // "今晚 00:40" is already a midnight time; only shift 1-11 o'clock to PM.
+    if (['下午', '傍晚', '晚上', '今晚'].includes(match[1]) && hour > 0 && hour < 12) hour += 12;
     const index = match.index || 0;
     const before = text.slice(Math.max(0, index - 4), index);
     const after = text.slice(index + match[0].length, index + match[0].length + 4);
@@ -274,6 +275,28 @@ function explicitTimeActions(message) {
     }
   }
   return actions.filter((action, index) => actions.findIndex((item) => item.type === action.type) === index);
+}
+
+function explicitUnavailableActions(message) {
+  const text = String(message || '');
+  if (!/(出门|外出|不可用|不在|有事|占用)/.test(text)) return [];
+  const expression = /(?:(今天|今晚)\s*)?(\d{1,2})\s*(?::\s*(\d{1,2})|点\s*(?:(\d{1,2})\s*分?|半)?)\s*(?:到|至|[-~～])\s*(\d{1,2})\s*(?::\s*(\d{1,2})|点\s*(?:(\d{1,2})\s*分?|半)?)/g;
+  const actions = [];
+  for (const match of text.matchAll(expression)) {
+    let startHour = Number(match[2]);
+    let endHour = Number(match[5]);
+    const startMinute = match[3] !== undefined ? Number(match[3]) : match[4] !== undefined ? Number(match[4]) : match[0].includes('半') ? 30 : 0;
+    const endMinute = match[6] !== undefined ? Number(match[6]) : match[7] !== undefined ? Number(match[7]) : /(?:到|至|[-~～])\s*\d{1,2}\s*点\s*半/.test(match[0]) ? 30 : 0;
+    if (![startHour, endHour, startMinute, endMinute].every(Number.isInteger) || startHour > 23 || endHour > 23 || startMinute > 59 || endMinute > 59) continue;
+    if (match[1] === '今晚') {
+      if (startHour > 0 && startHour < 12) startHour += 12;
+      if (endHour > 0 && endHour < 12) endHour += 12;
+    }
+    const start = `${String(startHour).padStart(2, '0')}:${String(startMinute).padStart(2, '0')}`;
+    const end = `${String(endHour).padStart(2, '0')}:${String(endMinute).padStart(2, '0')}`;
+    if (start < end) actions.push({ type: 'set_unavailable_period', start, end, reason: '用户明确说明该时段不可用。' });
+  }
+  return actions.slice(0, 2);
 }
 
 function explicitTaskCreationActions(message, context = {}) {
@@ -352,14 +375,17 @@ function mentionedTaskFromContext(message, context) {
 function enforceUserIntent(result, message, context) {
   const normalized = String(message || '').replace(/\s+/g, '').toLowerCase();
   const explicitlyComplete = /(完成|做完|搞定|结束了|已经做了|已完成)/.test(normalized)
-    && !/(不做|不想做|取消|删除|删掉|移除|跳过|先不|别安排|顺延|推迟)/.test(normalized);
+    && !/(不做|不想做|取消|删除|删掉|移除|跳过|先不|别安排|顺延|推迟|吗|[?？])/.test(normalized);
   const cancelIntent = /(取消|删除|删掉|移除|不再安排)/.test(normalized);
-  const deferIntent = /(今天不做|不想做|跳过|先不|别安排|顺延|推迟)/.test(normalized);
+  const deferQuestion = /(?:可|能|是否|哪些|什么).{0,5}顺延|顺延.{0,5}(?:吗|哪些|什么)/.test(normalized);
+  const deferIntent = /(今天不做|不想做|跳过|先不|别安排|顺延|推迟)/.test(normalized) && !deferQuestion;
   const cancelAllIntent = /(所有|全部|整个).{0,8}(任务|安排|计划)|(清空|清除).{0,8}(任务|安排|计划)/.test(normalized);
+
+  // Task status changes require an explicit user command, never an AI inference from a question.
+  result.actions = result.actions.filter((action) => !['complete_current_task', 'cancel_task', 'cancel_all_tasks', 'defer_task'].includes(action.type));
   if ((cancelIntent || deferIntent) && !explicitlyComplete) {
     const currentReference = /(?:这个|当前|正在).{0,5}(?:任务|安排|计划)|(?:取消|删除|删掉|移除).{0,6}(?:它|这个)/.test(normalized);
     const mentionedTask = mentionedTaskFromContext(message, context) || (currentReference ? stringValue(context?.current_task?.title, 120) : '');
-    result.actions = result.actions.filter((action) => !['complete_current_task', 'cancel_task', 'cancel_all_tasks', 'defer_task'].includes(action.type));
     if (cancelAllIntent && cancelIntent) {
       result.actions.push({ type: 'cancel_all_tasks', reason: '用户明确要求取消全部任务和安排' });
     } else if (mentionedTask) {
@@ -370,10 +396,19 @@ function enforceUserIntent(result, message, context) {
       });
     }
   }
-  if (!explicitlyComplete) result.actions = result.actions.filter((action) => action.type !== 'complete_current_task');
+  if (explicitlyComplete) {
+    result.actions.push({ type: 'complete_current_task', reason: '用户明确说明当前任务已完成。' });
+  }
   for (const action of explicitTimeActions(message)) {
     result.actions = result.actions.filter((item) => item.type !== action.type);
     result.actions.push(action);
+  }
+  for (const action of explicitUnavailableActions(message)) {
+    result.actions = result.actions.filter((item) => item.type !== 'set_unavailable_period');
+    result.actions.push(action);
+    if (!result.actions.some((item) => item.type === 'replan_today')) {
+      result.actions.push({ type: 'replan_today', reason: '已根据用户说明的不可用时段重新安排。' });
+    }
   }
   return result;
 }
@@ -657,7 +692,13 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       return finishAssistantResponse(fallback, true);
     }
     const content = upstreamBody?.choices?.[0]?.message?.content;
-    const result = enforceUserIntent(parseAssistantContent(content), message, intentContext);
+    let result;
+    try {
+      result = enforceUserIntent(parseAssistantContent(content), message, intentContext);
+    } catch (error) {
+      console.error('AI response parsing error', error?.message || 'unknown');
+      return finishAssistantResponse(localFallbackResult(message, intentContext), true);
+    }
     return finishAssistantResponse(result);
   } catch (error) {
     if (error instanceof SyntaxError) return response.status(502).json({ error: 'AI 返回格式异常，请重试。' });
