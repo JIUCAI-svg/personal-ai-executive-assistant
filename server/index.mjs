@@ -803,7 +803,6 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       const { result, attempts } = await requestAssistantModel({
         model: aiModel,
         temperature: 0.45,
-        max_tokens: 2048,
         ...(aiReasoningEffort ? { reasoning_effort: aiReasoningEffort } : {}),
         response_format: { type: 'json_object' },
         messages: [
