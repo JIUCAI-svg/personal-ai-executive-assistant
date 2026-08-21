@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import chokidar from 'chokidar';
 import express from 'express';
 import matter from 'gray-matter';
+import { AssistantStateStore } from './state-store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(__dirname, '..');
@@ -29,6 +30,7 @@ const aiModel = String(process.env.AI_MODEL || '');
 const aiGatewayToken = String(process.env.AI_GATEWAY_TOKEN || '');
 const app = express();
 const clients = new Set();
+const stateStore = new AssistantStateStore(vaultPath);
 let revision = Date.now();
 
 app.use(express.json({ limit: '200kb' }));
@@ -176,12 +178,40 @@ async function createKnowledgeNote({ title, body, kind = 'note', project = '', s
   return relativePath;
 }
 
+async function appendConversationTranscript(thread, entries) {
+  if (!thread?.save_full_conversation || !Array.isArray(entries) || entries.length === 0) return null;
+  const folder = path.join(vaultPath, '10-Notes', '对话记录');
+  const filename = `${dateStamp()}-向前对话记录.md`;
+  const absolutePath = path.join(folder, filename);
+  await mkdir(folder, { recursive: true });
+  const time = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false
+  }).format(new Date());
+  const project = thread.project_name ? ` · ${thread.project_name}` : '';
+  const header = matter.stringify('# 向前对话记录\n', {
+    created: dateStamp(), type: 'conversation-log', mode: thread.mode, source: 'personal-ai-executive-assistant',
+    ...(thread.project_name ? { project: thread.project_name } : {})
+  });
+  const existing = existsSync(absolutePath) ? await readFile(absolutePath, 'utf8') : header;
+  const transcript = entries.map((entry) => `### ${entry.role === 'assistant' ? '向前' : '我'} · ${time}\n\n${normalizeText(entry.content, 12000)}`).join('\n\n');
+  await writeFile(absolutePath, `${existing.trimEnd()}\n\n## 本次对话${project}\n\n${transcript}\n`, 'utf8');
+  revision = Date.now();
+  const relativePath = path.relative(vaultPath, absolutePath).replaceAll('\\', '/');
+  sendEvent({ revision, change: 'updated', relativePath });
+  return relativePath;
+}
+
+function isLoopbackRequest(request) {
+  const address = String(request.ip || request.socket?.remoteAddress || '').replace(/^::ffff:/, '');
+  return address === '::1' || address === 'localhost' || address.startsWith('127.');
+}
+
 function assistantAuthorized(request, response) {
   if (!aiBaseUrl || !aiApiKey || !aiModel) {
     response.status(503).json({ error: 'AI 网关尚未配置。' });
     return false;
   }
-  if (aiGatewayToken && request.get('x-forward-token') !== aiGatewayToken) {
+  if (aiGatewayToken && !isLoopbackRequest(request) && request.get('x-forward-token') !== aiGatewayToken) {
     response.status(401).json({ error: 'AI 网关访问令牌不匹配。' });
     return false;
   }
@@ -190,6 +220,57 @@ function assistantAuthorized(request, response) {
 
 function stringValue(value, maxLength = 240) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+function compactProjectName(value) {
+  return stringValue(value, 120).toLocaleLowerCase('zh-CN').replace(/[\s·•，,。.:：-]/g, '');
+}
+
+function findProjectByReference(projects, reference) {
+  const query = compactProjectName(reference);
+  if (!query) return null;
+  const exact = projects.find((item) => compactProjectName(item.name) === query);
+  if (exact) return exact;
+  return projects.find((item) => {
+    const name = compactProjectName(item.name);
+    return name.includes(query) || query.includes(name);
+  }) || null;
+}
+
+function chineseNumber(value) {
+  if (/^\d{1,2}$/.test(value)) return Number(value);
+  const digits = { 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  if (value === '十') return 10;
+  if (value.includes('十')) {
+    const [tensText, unitsText] = value.split('十');
+    const tens = tensText ? digits[tensText] : 1;
+    const units = unitsText ? digits[unitsText] : 0;
+    return tens * 10 + units;
+  }
+  return digits[value];
+}
+
+function explicitTimeActions(message) {
+  const text = String(message || '');
+  const expression = /(?:(凌晨|早上|上午|中午|下午|傍晚|晚上|今晚)\s*)?(\d{1,2}|[零一二三四五六七八九十两]{1,3})\s*(?::\s*(\d{1,2})|点\s*(?:(\d{1,2})\s*分?|半)?)/g;
+  const actions = [];
+  for (const match of text.matchAll(expression)) {
+    let hour = chineseNumber(match[2]);
+    const minute = match[3] !== undefined ? Number(match[3]) : match[4] !== undefined ? Number(match[4]) : match[0].includes('半') ? 30 : 0;
+    if (!Number.isInteger(hour) || hour > 23 || minute > 59) continue;
+    if (['下午', '傍晚', '晚上', '今晚'].includes(match[1]) && hour < 12) hour += 12;
+    const index = match.index || 0;
+    const before = text.slice(Math.max(0, index - 4), index);
+    const after = text.slice(index + match[0].length, index + match[0].length + 4);
+    const time = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+    if (/(睡觉|睡下|上床|入睡|睡)/.test(after) || /(睡觉|睡下|上床|入睡|睡)[^，。；;]{0,3}$/.test(before)) {
+      actions.push({ type: 'set_sleep_time', time, reason: '根据你刚刚说明的作息时间更新。' });
+    }
+    if (/(起床|起(?:来|身)?)/.test(after) || /(起床|起(?:来|身)?)[^，。；;]{0,3}$/.test(before)) {
+      actions.push({ type: 'set_wake_time', time, reason: '根据你刚刚说明的作息时间更新。' });
+    }
+  }
+  return actions.filter((action, index) => actions.findIndex((item) => item.type === action.type) === index);
 }
 
 function normalizeActions(actions) {
@@ -217,7 +298,10 @@ function normalizeActions(actions) {
       ...(stringValue(action.task, 120) ? { task: stringValue(action.task, 120) } : {}),
       ...(stringValue(action.title, 120) ? { title: stringValue(action.title, 120) } : {}),
       ...(Number.isFinite(Number(action.estimated_minutes)) ? { estimated_minutes: Math.max(5, Math.min(480, Number(action.estimated_minutes))) } : {}),
+      ...(Number.isFinite(Number(action.priority)) ? { priority: Math.max(1, Math.min(5, Number(action.priority))) } : {}),
       ...(stringValue(action.project, 80) ? { project: stringValue(action.project, 80) } : {}),
+      ...(stringValue(action.due_at, 40) ? { due_at: stringValue(action.due_at, 40) } : {}),
+      ...(stringValue(action.date, 10) ? { date: stringValue(action.date, 10) } : {}),
       ...(stringValue(action.reason, 240) ? { reason: stringValue(action.reason, 240) } : {})
     }));
 }
@@ -243,7 +327,8 @@ function enforceUserIntent(result, message, context) {
   const deferIntent = /(今天不做|不想做|跳过|先不|别安排|顺延|推迟)/.test(normalized);
   const cancelAllIntent = /(所有|全部|整个).{0,8}(任务|安排|计划)|(清空|清除).{0,8}(任务|安排|计划)/.test(normalized);
   if ((cancelIntent || deferIntent) && !explicitlyComplete) {
-    const mentionedTask = mentionedTaskFromContext(message, context);
+    const currentReference = /(?:这个|当前|正在).{0,5}(?:任务|安排|计划)|(?:取消|删除|删掉|移除).{0,6}(?:它|这个)/.test(normalized);
+    const mentionedTask = mentionedTaskFromContext(message, context) || (currentReference ? stringValue(context?.current_task?.title, 120) : '');
     result.actions = result.actions.filter((action) => !['complete_current_task', 'cancel_task', 'cancel_all_tasks', 'defer_task'].includes(action.type));
     if (cancelAllIntent && cancelIntent) {
       result.actions.push({ type: 'cancel_all_tasks', reason: '用户明确要求取消全部任务和安排' });
@@ -256,6 +341,10 @@ function enforceUserIntent(result, message, context) {
     }
   }
   if (!explicitlyComplete) result.actions = result.actions.filter((action) => action.type !== 'complete_current_task');
+  for (const action of explicitTimeActions(message)) {
+    result.actions = result.actions.filter((item) => item.type !== action.type);
+    result.actions.push(action);
+  }
   return result;
 }
 
@@ -272,9 +361,15 @@ function parseAssistantContent(content) {
   };
 }
 
-async function assistantKnowledgeContext() {
+async function assistantKnowledgeContext({ enabled = true, projectName = '' } = {}) {
+  if (!enabled) return [];
   if (!existsSync(vaultPath)) return [];
-  return (await readVaultDocuments())
+  const normalizedProject = normalizeText(projectName, 120).toLocaleLowerCase('zh-CN');
+  const documents = await readVaultDocuments();
+  const scoped = normalizedProject
+    ? documents.filter((document) => `${document.folder}\n${document.title}\n${JSON.stringify(document.frontmatter)}`.toLocaleLowerCase('zh-CN').includes(normalizedProject))
+    : documents;
+  return scoped
     .slice(0, 5)
     .map((document) => ({ title: document.title, folder: document.folder, preview: document.preview }));
 }
@@ -294,7 +389,7 @@ function assistantSystemPrompt() {
     {"type":"cancel_task","task":"任务名","reason":"..."},
     {"type":"cancel_all_tasks","reason":"..."},
     {"type":"defer_task","task":"任务名","reason":"..."},
-    {"type":"create_task","title":"任务名","estimated_minutes":45,"project":"项目名","reason":"..."},
+    {"type":"create_task","title":"任务名","estimated_minutes":45,"priority":3,"project":"项目名","due_at":"可选 ISO 时间","reason":"..."},
     {"type":"set_unavailable_period","start":"HH:mm","end":"HH:mm","reason":"..."},
     {"type":"capture_memory","title":"要沉淀的信息","project":"可选项目","reason":"..."},
     {"type":"replan_today","reason":"..."}
@@ -310,7 +405,7 @@ function assistantSystemPrompt() {
 - 用户说“取消所有任务、全部清空计划”时，使用 cancel_all_tasks，清空今天和已顺延的安排。
 - 用户说“今天不做、跳过、顺延、明天再做”时，使用 defer_task，该任务保留但移到之后；取消和顺延不能混用。
 - 用户说外出或某段时间不可用时，使用 set_unavailable_period；用户说疲惫时，使用 defer_task 推迟高消耗任务，并使用 replan_today。
-- 用户新增一件事时，使用 create_task；不要直接声称它已经加入计划而没有 action。
+- 用户新增一件事时，使用 create_task；不要直接声称它已经加入计划而没有 action。若未给预计时长，按合理的最小可执行时长估计，并在回复中说明。
 - 长期记忆只提取稳定偏好、明确决定、项目里程碑或重要事实；不要把普通闲聊自动写入。
 - 不要编造任务、进度、日期或知识库内容。`;
 }
@@ -320,54 +415,203 @@ app.get('/api/assistant/status', (request, response) => {
   response.json({ ok: true, model: aiModel, provider: 'OpenAI-compatible relay', configured: true });
 });
 
+async function resolveConversationThread(body = {}) {
+  const existing = await stateStore.getThread(stringValue(body.thread_id, 80));
+  if (existing) return existing;
+  const requestedMode = stringValue(body.conversation_mode || body.mode, 40);
+  const mode = ['temporary', 'assistant', 'project', 'daily_planning'].includes(requestedMode) ? requestedMode : 'assistant';
+  const options = body.conversation_options || {};
+  const state = await stateStore.bootstrap();
+  const projectId = stringValue(options.project_id || body.project_id, 80);
+  const projectName = stringValue(options.project || body.project, 120);
+  const project = state.projects.find((item) => item.id === projectId) || findProjectByReference(state.projects, projectName);
+  const thread = await stateStore.createThread({
+    mode,
+    project_id: project?.id || null,
+    memory_scope: options.memory_scope ?? (mode !== 'temporary'),
+    save_full_conversation: options.save_full_conversation ?? (mode !== 'temporary'),
+    allow_memory_distillation: options.allow_memory_distillation ?? (mode !== 'temporary')
+  });
+  return { ...thread, project_name: project?.name || '' };
+}
+
+function threadProjectName(thread, state) {
+  return state.projects.find((item) => item.id === thread?.project_id)?.name || '';
+}
+
+app.get('/api/assistant/state', async (_request, response, next) => {
+  try {
+    response.json({ ok: true, state: await stateStore.bootstrap() });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/assistant/threads', async (request, response, next) => {
+  try {
+    response.json({ ok: true, threads: await stateStore.listThreads(request.query.limit) });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/assistant/threads/:id', async (request, response, next) => {
+  try {
+    const thread = await stateStore.getThreadMessages(stringValue(request.params.id, 80), request.query.limit);
+    if (!thread) return response.status(404).json({ error: '未找到这段对话。' });
+    response.json({ ok: true, thread });
+  } catch (error) { next(error); }
+});
+
+app.patch('/api/assistant/threads/:id', async (request, response, next) => {
+  try {
+    const options = request.body?.conversation_options || request.body || {};
+    const thread = await stateStore.updateThreadOptions(stringValue(request.params.id, 80), options);
+    if (!thread) return response.status(404).json({ error: '这段对话没有保存，因此没有可更新的对话设置。' });
+    response.json({ ok: true, thread, state: await stateStore.bootstrap() });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/assistant/threads', async (request, response, next) => {
+  try {
+    const thread = await resolveConversationThread(request.body || {});
+    response.status(201).json({ ok: true, thread });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/assistant/actions', async (request, response, next) => {
+  try {
+    const body = request.body || {};
+    const thread = await resolveConversationThread(body);
+    const execution = await stateStore.executeActions(normalizeActions(body.actions), {
+      thread_id: thread.id,
+      project_id: thread.project_id,
+      task_id: stringValue(body.task_id, 80),
+      allow_memory_distillation: thread.allow_memory_distillation,
+      persist_action_log: thread.mode !== 'temporary' || thread.save_full_conversation
+    });
+    response.json({ ok: true, thread, ...execution, state: await stateStore.bootstrap() });
+  } catch (error) { next(error); }
+});
+
+app.patch('/api/assistant/memories/:id', async (request, response, next) => {
+  try {
+    const status = stringValue(request.body?.status, 40);
+    const memory = await stateStore.updateMemoryStatus(request.params.id, status, request.body?.content);
+    if (!memory) return response.status(404).json({ error: '未找到这条记忆。' });
+    let relativePath = null;
+    if (memory.status === 'active') {
+      relativePath = await createKnowledgeNote({
+        title: '已确认记忆', body: memory.content, kind: 'note', source: 'personal-ai-executive-assistant'
+      });
+    }
+    response.json({ ok: true, memory, relativePath, state: await stateStore.bootstrap() });
+  } catch (error) { next(error); }
+});
+
 app.post('/api/assistant/respond', async (request, response, next) => {
   try {
     if (!assistantAuthorized(request, response)) return;
-    const message = stringValue(request.body?.message, 4000);
+    const body = request.body || {};
+    const message = stringValue(body.message, 4000);
     if (!message) return response.status(400).json({ error: '需要一条消息。' });
 
-    const conversation = Array.isArray(request.body?.conversation)
-      ? request.body.conversation.slice(-12).map((entry) => ({
-          role: entry?.role === 'assistant' ? 'assistant' : 'user',
-          content: stringValue(entry?.content, 1800)
+    const thread = await resolveConversationThread(body);
+    const stateBefore = await stateStore.bootstrap();
+    const projectName = threadProjectName(thread, stateBefore);
+    const hydratedThread = { ...thread, project_name: projectName };
+    const userMessage = await stateStore.appendMessage(hydratedThread, 'user', message);
+    const storedConversation = userMessage
+      ? (await stateStore.recentMessages(hydratedThread.id, 16)).filter((entry) => entry.id !== userMessage.id)
+      : [];
+    const suppliedConversation = Array.isArray(body.conversation)
+      ? body.conversation.slice(-12).map((entry) => ({
+          role: entry?.role === 'assistant' ? 'assistant' : 'user', content: stringValue(entry?.content, 1800)
         })).filter((entry) => entry.content)
       : [];
-    const context = request.body?.context || {};
-    const knowledge = await assistantKnowledgeContext();
+    const conversation = storedConversation.length ? storedConversation : suppliedConversation;
+    const context = body.context || {};
+    const knowledge = await assistantKnowledgeContext({
+      enabled: hydratedThread.memory_scope && hydratedThread.mode !== 'temporary',
+      projectName: hydratedThread.mode === 'project' ? projectName : ''
+    });
+    const planBefore = stateBefore.plan;
     const contextText = JSON.stringify({
-      now: stringValue(context.now, 40),
-      sleep_time: stringValue(context.sleep_time, 5),
-      wake_time: stringValue(context.wake_time, 5),
-      today_plan: Array.isArray(context.today_plan) ? context.today_plan.slice(0, 12) : [],
-      knowledge
-    });
-    const upstream = await fetch(`${aiBaseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${aiApiKey}`,
-        'Content-Type': 'application/json'
+      now: planBefore.now,
+      conversation_mode: hydratedThread.mode,
+      project: projectName || null,
+      sleep_time: planBefore.sleep_time,
+      wake_time: planBefore.wake_time,
+      today_plan: planBefore.scheduled.slice(0, 12),
+      current_task: planBefore.current_task,
+      deferred_tasks: planBefore.deferred.slice(0, 8),
+      recent_client_context: {
+        now: stringValue(context.now, 40),
+        note: stringValue(context.note, 500)
       },
-      body: JSON.stringify({
-        model: aiModel,
-        temperature: 0.45,
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: assistantSystemPrompt() },
-          { role: 'system', content: `当前可用上下文（只使用其中真实内容）：${contextText}` },
-          ...conversation,
-          { role: 'user', content: message }
-        ]
-      }),
-      signal: AbortSignal.timeout(45_000)
+      knowledge: hydratedThread.memory_scope ? knowledge : []
     });
-    const body = await upstream.json().catch(() => null);
-    if (!upstream.ok) {
-      console.error('AI relay error', upstream.status, body);
-      return response.status(502).json({ error: 'AI 服务暂时没有返回有效结果。', detail: `upstream_${upstream.status}` });
+    const intentContext = {
+      today_plan: planBefore.scheduled,
+      current_task: planBefore.current_task
+    };
+    async function finishAssistantResponse(result, degraded = false) {
+      const execution = await stateStore.executeActions(result.actions, {
+        thread_id: hydratedThread.id, project_id: hydratedThread.project_id,
+        task_id: stringValue(context.current_task_id, 80),
+        allow_memory_distillation: hydratedThread.allow_memory_distillation,
+        persist_action_log: hydratedThread.mode !== 'temporary' || hydratedThread.save_full_conversation
+      });
+      const pendingMemories = await stateStore.addMemoryCandidates(result.memoryCandidates, hydratedThread);
+      const assistantMessage = await stateStore.appendMessage(hydratedThread, 'assistant', result.reply, execution.results);
+      const transcriptPath = await appendConversationTranscript(hydratedThread, [
+        { role: 'user', content: message }, { role: 'assistant', content: result.reply }
+      ]);
+      return response.json({
+        ok: true, degraded, model: aiModel, thread: hydratedThread, reply: result.reply, actions: result.actions,
+        actionResults: execution.results, memoryCandidates: result.memoryCandidates, pendingMemories, memoryRead: knowledge,
+        plan: execution.plan, transcriptPath, messageIds: { user: userMessage?.id || null, assistant: assistantMessage?.id || null },
+        state: await stateStore.bootstrap()
+      });
     }
-    const content = body?.choices?.[0]?.message?.content;
-    const result = enforceUserIntent(parseAssistantContent(content), message, context);
-    response.json({ ok: true, model: aiModel, ...result });
+
+    let upstream;
+    try {
+      upstream = await fetch(`${aiBaseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${aiApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: aiModel,
+          temperature: 0.45,
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: assistantSystemPrompt() },
+            { role: 'system', content: `当前可用上下文（只使用其中真实内容）：${contextText}` },
+            ...conversation,
+            { role: 'user', content: message }
+          ]
+        }),
+        signal: AbortSignal.timeout(45_000)
+      });
+    } catch (error) {
+      console.error('AI relay connection error', error?.cause?.code || error?.name || 'unknown');
+      const fallback = enforceUserIntent({
+        reply: 'AI 服务暂时没有回复。我已先执行这条可以明确判断的计划调整，稍后可以继续对话。',
+        actions: [], memoryCandidates: []
+      }, message, intentContext);
+      return finishAssistantResponse(fallback, true);
+    }
+    const upstreamBody = await upstream.json().catch(() => null);
+    if (!upstream.ok) {
+      console.error('AI relay error', upstream.status, upstreamBody);
+      const fallback = enforceUserIntent({
+        reply: 'AI 服务暂时没有返回有效结果。我已先执行这条可以明确判断的计划调整，稍后可以继续对话。',
+        actions: [], memoryCandidates: []
+      }, message, intentContext);
+      return finishAssistantResponse(fallback, true);
+    }
+    const content = upstreamBody?.choices?.[0]?.message?.content;
+    const result = enforceUserIntent(parseAssistantContent(content), message, intentContext);
+    return finishAssistantResponse(result);
   } catch (error) {
     if (error instanceof SyntaxError) return response.status(502).json({ error: 'AI 返回格式异常，请重试。' });
     next(error);
