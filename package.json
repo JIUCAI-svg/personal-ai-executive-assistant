@@ -12,6 +12,7 @@
     "start": "node server/index.mjs"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.112.3",
     "@vitejs/plugin-react": "latest",
     "chokidar": "latest",
     "concurrently": "latest",
@@ -21,6 +22,5 @@
     "react": "latest",
     "react-dom": "latest",
     "vite": "latest"
-  },
-  "devDependencies": {}
+  }
 }

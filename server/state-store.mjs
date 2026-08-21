@@ -92,7 +92,7 @@ function sameMemory(left, right) {
   return shared / Math.max(leftKey.length, rightKey.length) >= 0.8;
 }
 
-function defaultState() {
+export function createDefaultAssistantState() {
   const now = nowParts();
   const createdAt = `${now.date}T${now.time}:00+08:00`;
   const examProject = id();
@@ -127,8 +127,8 @@ function defaultState() {
   };
 }
 
-function repairState(source) {
-  const base = defaultState();
+export function repairAssistantState(source) {
+  const base = createDefaultAssistantState();
   const state = source && typeof source === 'object' ? source : {};
   return {
     ...base,
@@ -292,11 +292,11 @@ export class AssistantStateStore {
   }
 
   async read() {
-    if (!existsSync(this.filePath)) return defaultState();
+    if (!existsSync(this.filePath)) return createDefaultAssistantState();
     try {
-      return repairState(JSON.parse(await readFile(this.filePath, 'utf8')));
+      return repairAssistantState(JSON.parse(await readFile(this.filePath, 'utf8')));
     } catch {
-      return defaultState();
+      return createDefaultAssistantState();
     }
   }
 

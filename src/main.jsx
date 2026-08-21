@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { createClient } from '@supabase/supabase-js';
 import {
   Bell, Bot, Brain, CalendarDays, Check, ChevronDown, ChevronRight, Circle,
-  Clock3, Command, FileText, Flame, FolderKanban, HeartPulse, ListChecks, Menu,
+  Clock3, Cloud, CloudOff, Command, FileText, Flame, FolderKanban, HeartPulse, ListChecks, LogIn, LogOut, Menu,
   MessageCircle, Mic, MoreHorizontal, MoveRight, PenLine, Plus, RefreshCw, Send, Settings2,
   Sparkles, SunMedium, Target, X, Zap
 } from 'lucide-react';
@@ -95,6 +96,15 @@ function App() {
   const [showVault, setShowVault] = useState(false);
   const [selectedDocument, setSelectedDocument] = useState(null);
   const [aiBusy, setAiBusy] = useState(false);
+  const [supabaseClient, setSupabaseClient] = useState(null);
+  const [session, setSession] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [syncStatus, setSyncStatus] = useState({ mode: 'checking', detail: '' });
+  const [showAccount, setShowAccount] = useState(false);
+  const [authMode, setAuthMode] = useState('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [authBusy, setAuthBusy] = useState(false);
   const endRef = useRef(null);
 
   const mode = modes.find((item) => item.id === conversationMode) || modes[0];
@@ -112,6 +122,68 @@ function App() {
   const planned = plan.filter((item) => !['done', 'deferred', 'cancelled'].includes(item.state));
   const scheduleMinutes = planned.reduce((total, item) => total + item.duration, 0);
   const flexible = plan.filter((item) => item.state === 'flex' || item.state === 'deferred');
+
+  async function apiFetch(path, options = {}, authentication = null) {
+    const headers = new Headers(options.headers || {});
+    const includeAuthentication = authentication === true || (authentication !== false && syncStatus.mode === 'cloud');
+    if (session?.access_token && includeAuthentication) {
+      headers.set('Authorization', `Bearer ${session.access_token}`);
+    }
+    return fetch(path, { ...options, headers });
+  }
+
+  async function loadAssistantState(forceAuthentication = false) {
+    try {
+      const response = await apiFetch('/api/assistant/state', {}, forceAuthentication);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '读取计划失败');
+      applyAssistantData(payload);
+      const firstProject = payload.state?.projects?.[0];
+      if (firstProject && !projectId) setProjectId(firstProject.id);
+    } catch (error) {
+      setNotice(error.message || '计划数据暂时没有连接');
+    }
+  }
+
+  async function loadThreads(forceAuthentication = false, restoreLatest = false) {
+    try {
+      const response = await apiFetch('/api/assistant/threads', {}, forceAuthentication);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '读取对话历史失败');
+      const nextThreads = payload.threads || [];
+      setThreads(nextThreads);
+      if (restoreLatest && !threadId && nextThreads[0]?.id) {
+        await openThread(nextThreads[0].id, forceAuthentication);
+      }
+    } catch (error) {
+      setNotice(error.message || '读取对话历史失败');
+    }
+  }
+
+  async function refreshSync(nextSession = session) {
+    if (!nextSession?.access_token) {
+      setSyncStatus({ mode: 'local', detail: '未登录，本机数据仍可使用' });
+      await Promise.all([loadAssistantState(false), loadThreads(false, true)]);
+      return;
+    }
+    setSyncStatus({ mode: 'checking', detail: '正在检查云端数据' });
+    try {
+      const response = await apiFetch('/api/assistant/sync/status', {}, true);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '检查同步状态失败');
+      if (payload.snapshot?.exists) {
+        setSyncStatus({ mode: 'cloud', detail: payload.snapshot.updatedAt ? `上次同步 ${messageTime(payload.snapshot.updatedAt)}` : '云端数据已连接' });
+        await Promise.all([loadAssistantState(true), loadThreads(true, true)]);
+      } else {
+        setSyncStatus({ mode: 'needs_import', detail: '云端尚无数据，等待你确认首次上传' });
+        await Promise.all([loadAssistantState(false), loadThreads(false, true)]);
+      }
+    } catch (error) {
+      setSyncStatus({ mode: 'error', detail: error.message || '同步服务未连接' });
+      await Promise.all([loadAssistantState(false), loadThreads(false, true)]);
+    }
+  }
+
   useEffect(() => {
     const id = window.setInterval(() => setNow(timeNow()), 30000);
     return () => window.clearInterval(id);
@@ -128,34 +200,42 @@ function App() {
     if (Array.isArray(payload.memoryRead)) setMemoryRead(payload.memoryRead);
   }
 
-  async function loadAssistantState() {
-    try {
-      const response = await fetch('/api/assistant/state');
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || '读取计划失败');
-      applyAssistantData(payload);
-      const firstProject = payload.state?.projects?.[0];
-      if (firstProject && !projectId) setProjectId(firstProject.id);
-    } catch (error) {
-      setNotice(error.message || '计划数据暂时没有连接');
+  useEffect(() => {
+    let active = true;
+    let unsubscribe = () => {};
+    async function initializeAuthentication() {
+      try {
+        const response = await fetch('/api/auth/config');
+        const config = await response.json();
+        if (!response.ok || !config.configured) {
+          if (active) setSyncStatus({ mode: 'unavailable', detail: 'Supabase 尚未配置，本机模式可继续使用' });
+          return;
+        }
+        const client = createClient(config.url, config.anonKey, {
+          auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
+        });
+        if (!active) return;
+        setSupabaseClient(client);
+        const { data } = await client.auth.getSession();
+        if (active) setSession(data.session || null);
+        const listener = client.auth.onAuthStateChange((_event, nextSession) => {
+          if (active) setSession(nextSession || null);
+        });
+        unsubscribe = () => listener.data.subscription.unsubscribe();
+      } catch (error) {
+        if (active) setSyncStatus({ mode: 'error', detail: 'Supabase 配置读取失败，本机模式可继续使用' });
+      } finally {
+        if (active) setAuthReady(true);
+      }
     }
-  }
-
-  async function loadThreads() {
-    try {
-      const response = await fetch('/api/assistant/threads');
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || '读取对话历史失败');
-      setThreads(payload.threads || []);
-    } catch (error) {
-      setNotice(error.message || '读取对话历史失败');
-    }
-  }
+    initializeAuthentication();
+    return () => { active = false; unsubscribe(); };
+  }, []);
 
   useEffect(() => {
-    loadAssistantState();
-    loadThreads();
-  }, []);
+    if (!authReady) return;
+    refreshSync(session);
+  }, [authReady, session]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
@@ -211,7 +291,7 @@ function App() {
 
   async function updateMemory(memory, status, content = memory.content) {
     try {
-      const response = await fetch(`/api/assistant/memories/${memory.id}`, {
+      const response = await apiFetch(`/api/assistant/memories/${memory.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -239,7 +319,7 @@ function App() {
     if (!current || aiBusy) return;
     setAiBusy(true);
     try {
-      const response = await fetch('/api/assistant/actions', {
+      const response = await apiFetch('/api/assistant/actions', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           thread_id: threadId,
@@ -265,7 +345,7 @@ function App() {
   async function handleUserMessage(text) {
     setAiBusy(true);
     try {
-      const response = await fetch('/api/assistant/respond', {
+      const response = await apiFetch('/api/assistant/respond', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: text,
@@ -323,7 +403,7 @@ function App() {
     setShowNewConversation(false);
     setShowConversationOptions(false);
     try {
-      const response = await fetch('/api/assistant/threads', {
+      const response = await apiFetch('/api/assistant/threads', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           conversation_mode: selected,
@@ -341,9 +421,9 @@ function App() {
     }
   }
 
-  async function openThread(id) {
+  async function openThread(id, forceAuthentication = false) {
     try {
-      const response = await fetch(`/api/assistant/threads/${id}`);
+      const response = await apiFetch(`/api/assistant/threads/${id}`, {}, forceAuthentication);
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '读取对话失败');
       const thread = payload.thread;
@@ -372,7 +452,7 @@ function App() {
     if (Object.hasOwn(nextOptions, 'allow_memory_distillation')) setDistillMemory(nextOptions.allow_memory_distillation);
     if (!threadId || conversationMode === 'temporary') return;
     try {
-      const response = await fetch(`/api/assistant/threads/${threadId}`, {
+      const response = await apiFetch(`/api/assistant/threads/${threadId}`, {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ conversation_options: nextOptions })
       });
@@ -382,6 +462,67 @@ function App() {
       loadThreads();
     } catch (error) {
       setNotice(error.message || '更新对话设置失败');
+    }
+  }
+
+  async function submitAuthentication(event) {
+    event.preventDefault();
+    if (!supabaseClient || authBusy) return;
+    setAuthBusy(true);
+    try {
+      const normalizedEmail = email.trim();
+      if (!normalizedEmail || password.length < 6) throw new Error('请输入邮箱和至少 6 位密码。');
+      const result = authMode === 'register'
+        ? await supabaseClient.auth.signUp({ email: normalizedEmail, password, options: { emailRedirectTo: window.location.origin } })
+        : await supabaseClient.auth.signInWithPassword({ email: normalizedEmail, password });
+      if (result.error) throw result.error;
+      if (result.data.session) {
+        setSession(result.data.session);
+        setShowAccount(false);
+        setNotice('登录成功，正在检查你的云端数据。');
+      } else {
+        setNotice('注册成功，请先在邮箱中确认账号，然后返回这里登录。');
+        setAuthMode('login');
+      }
+    } catch (error) {
+      setNotice(error.message || '登录失败，请检查邮箱、密码和 Supabase 配置。');
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function initializeCloudSync() {
+    if (!session?.access_token || authBusy) return;
+    setAuthBusy(true);
+    try {
+      const response = await apiFetch('/api/assistant/sync/initialize', { method: 'POST' }, true);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '首次同步失败');
+      setSyncStatus({ mode: 'cloud', detail: '本机数据已同步到云端' });
+      applyAssistantData(payload);
+      await loadThreads(true);
+      setNotice('本机的任务、计划、对话、记忆和作息已上传到云端。');
+      setShowAccount(false);
+    } catch (error) {
+      setNotice(error.message || '首次同步失败');
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function signOut() {
+    if (!supabaseClient) return;
+    setAuthBusy(true);
+    try {
+      const { error } = await supabaseClient.auth.signOut();
+      if (error) throw error;
+      setSession(null);
+      setShowAccount(false);
+      setNotice('已退出云端账号，当前回到本机模式。');
+    } catch (error) {
+      setNotice(error.message || '退出登录失败');
+    } finally {
+      setAuthBusy(false);
     }
   }
 
@@ -431,7 +572,7 @@ function App() {
           ))}
         </div>
         <div className="sidebar-footer">
-          <button className="profile"><span>JC</span><div><strong>九菜</strong><small>执行节奏：稳步</small></div><MoreHorizontal size={18} /></button>
+          <button className="profile" onClick={() => setShowAccount(true)}><span>{session?.user?.email ? session.user.email.slice(0, 1).toUpperCase() : 'JC'}</span><div><strong>{session?.user?.email || '九菜'}</strong><small>{syncStatus.mode === 'cloud' ? '云端同步中' : '本机模式'}</small></div>{syncStatus.mode === 'cloud' ? <Cloud size={18} /> : <MoreHorizontal size={18} />}</button>
         </div>
       </aside>
       {showSidebar && <button className="sidebar-backdrop" onClick={() => setShowSidebar(false)} aria-label="关闭导航" />}
@@ -540,6 +681,11 @@ function App() {
       {showNewConversation && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="新建对话"><button className="modal-backdrop" onClick={() => setShowNewConversation(false)} aria-label="关闭新建对话" /><section className="new-conversation-modal"><div className="modal-header"><div><span>新建对话</span><p>选择 AI 本次可以了解什么。</p></div><button className="icon-button" onClick={() => setShowNewConversation(false)} aria-label="关闭"><X size={20} /></button></div><div className="new-mode-list">{modes.map((item) => { const Icon = item.icon; return <button key={item.id} onClick={() => selectMode(item.id)}><span className={`new-mode-icon ${item.id}`}><Icon size={20} /></span><span><strong>{item.label}</strong><small>{item.description}</small></span><ChevronRight size={18} /></button>; })}</div></section></div>}
       {showHistory && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="所有对话"><button className="modal-backdrop" onClick={() => setShowHistory(false)} aria-label="关闭对话历史" /><section className="history-modal"><div className="modal-header"><div><span>所有对话</span><p>恢复任一已保存的对话，继续使用原来的上下文。</p></div><button className="icon-button" onClick={() => setShowHistory(false)} aria-label="关闭"><X size={20} /></button></div><div className="history-list">{threads.length ? threads.map((thread) => <button key={thread.id} onClick={() => openThread(thread.id)}><MessageCircle size={17} /><span><strong>{modes.find((item) => item.id === thread.mode)?.label || '对话'}{thread.project_name ? ` · ${thread.project_name}` : ''}</strong><small>{thread.preview || '尚未发送消息'} · {messageTime(thread.updated_at)}</small></span><em>{thread.message_count}</em><ChevronRight size={17} /></button>) : <p className="empty-state">还没有已保存的对话。</p>}</div></section></div>}
       {showVault && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="本地知识库"><button className="modal-backdrop" onClick={() => { setShowVault(false); setSelectedDocument(null); }} aria-label="关闭知识库" /><section className="vault-modal"><div className="modal-header"><div><span>本地知识库</span><p>{vault.connected ? `${vault.documentCount} 篇 Markdown · ${vault.folders.length} 个目录 · 文件改动会自动刷新` : '尚未连接本地桥接服务'}</p></div><button className="icon-button" onClick={() => { setShowVault(false); setSelectedDocument(null); }} aria-label="关闭"><X size={20} /></button></div>{vaultError && <p className="vault-modal-error">{vaultError}</p>}{selectedDocument ? <div className="document-reader"><button className="back-button" onClick={() => setSelectedDocument(null)}>‹ 返回资料列表</button><small>{selectedDocument.relativePath}</small><h2>{selectedDocument.title}</h2><pre>{selectedDocument.content}</pre></div> : <><div className="vault-modal-toolbar"><span className={`connection-status ${vault.connected ? 'online' : ''}`}><span /> {vault.connected ? '已连接到 Obsidian 文件夹' : '等待桥接服务'}</span><button className="icon-button" onClick={() => loadVault(true)} aria-label="刷新知识库"><RefreshCw size={17} /></button></div><div className="vault-document-list">{vaultDocuments.map((document) => <button key={document.id} onClick={() => openDocument(document.id)}><FileText size={18} /><span><strong>{document.title}</strong><small>{document.folder} · {document.preview || '没有正文摘要'}</small></span><ChevronRight size={17} /></button>)}{vault.connected && vaultDocuments.length === 0 && <p className="empty-state">知识库里还没有 Markdown 资料。</p>}</div></>}</section></div>}
+      {showAccount && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="云端同步与登录"><button className="modal-backdrop" onClick={() => setShowAccount(false)} aria-label="关闭同步设置" /><section className="account-modal"><div className="modal-header"><div><span>云端同步</span><p>任务、计划、对话、记忆和作息在登录后同步；Obsidian 文件夹继续保留在本机。</p></div><button className="icon-button" onClick={() => setShowAccount(false)} aria-label="关闭"><X size={20} /></button></div>
+        {syncStatus.mode === 'cloud' && <div className="sync-state connected"><Cloud size={18} /><div><strong>已连接云端</strong><small>{session?.user?.email || '当前账号'} · {syncStatus.detail}</small></div></div>}
+        {syncStatus.mode === 'needs_import' && <div className="sync-state waiting"><Cloud size={18} /><div><strong>云端还没有你的数据</strong><small>本机数据尚未上传，确认后才会同步到此账号。</small></div></div>}
+        {['local', 'unavailable', 'error', 'checking'].includes(syncStatus.mode) && <div className="sync-state"><CloudOff size={18} /><div><strong>{syncStatus.mode === 'checking' ? '正在连接云端' : '当前使用本机数据'}</strong><small>{syncStatus.detail}</small></div></div>}
+        {session?.user ? <div className="account-actions">{syncStatus.mode === 'needs_import' && <button className="primary-command" onClick={initializeCloudSync} disabled={authBusy}><Cloud size={16} /> {authBusy ? '正在上传…' : '将本机数据同步到云端'}</button>}{syncStatus.mode === 'cloud' && <button className="secondary-command" onClick={() => refreshSync(session)} disabled={authBusy}><RefreshCw size={16} /> 刷新云端数据</button>}<button className="text-command" onClick={signOut} disabled={authBusy}><LogOut size={16} /> 退出登录</button></div> : supabaseClient ? <form className="account-form" onSubmit={submitAuthentication}><div className="auth-switch"><button type="button" className={authMode === 'login' ? 'selected' : ''} onClick={() => setAuthMode('login')}>登录</button><button type="button" className={authMode === 'register' ? 'selected' : ''} onClick={() => setAuthMode('register')}>注册</button></div><label>邮箱<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" placeholder="you@example.com" required /></label><label>密码<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={authMode === 'register' ? 'new-password' : 'current-password'} minLength="6" placeholder="至少 6 位" required /></label><button className="primary-command" type="submit" disabled={authBusy}><LogIn size={16} /> {authBusy ? '正在处理…' : authMode === 'register' ? '创建账号' : '登录并同步'}</button></form> : <p className="vault-modal-error">Supabase 配置还未就绪。补充有效项目 URL 和 Publishable/anon key 后，刷新此页即可登录。</p>}</section></div>}
     </div>
   );
 }

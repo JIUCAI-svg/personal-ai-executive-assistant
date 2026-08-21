@@ -7,6 +7,7 @@ import chokidar from 'chokidar';
 import express from 'express';
 import matter from 'gray-matter';
 import { AssistantStateStore } from './state-store.mjs';
+import { SupabaseStateStore } from './supabase-state-store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(__dirname, '..');
@@ -31,12 +32,59 @@ const aiReasoningEffort = ['low', 'medium', 'high'].includes(process.env.AI_REAS
   ? process.env.AI_REASONING_EFFORT
   : '';
 const aiGatewayToken = String(process.env.AI_GATEWAY_TOKEN || '');
+const supabaseUrl = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const supabaseAnonKey = String(process.env.SUPABASE_ANON_KEY || '');
 const app = express();
 const clients = new Set();
 const stateStore = new AssistantStateStore(vaultPath);
 let revision = Date.now();
 
 app.use(express.json({ limit: '200kb' }));
+
+function supabaseIsConfigured() {
+  return Boolean(supabaseUrl && supabaseAnonKey);
+}
+
+function requestError(message, status = 500, code = '') {
+  const error = new Error(message);
+  error.status = status;
+  error.code = code;
+  return error;
+}
+
+function accessTokenFromRequest(request) {
+  const match = String(request.get('authorization') || '').match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() || '';
+}
+
+async function authenticatedSupabaseUser(request) {
+  if (!supabaseIsConfigured()) throw requestError('Supabase 尚未配置。', 503, 'SUPABASE_NOT_CONFIGURED');
+  const accessToken = accessTokenFromRequest(request);
+  if (!accessToken) throw requestError('请先登录后再同步。', 401, 'AUTH_REQUIRED');
+  let upstream;
+  try {
+    upstream = await fetch(`${supabaseUrl}/auth/v1/user`, {
+      headers: { apikey: supabaseAnonKey, Authorization: `Bearer ${accessToken}` },
+      signal: AbortSignal.timeout(10_000)
+    });
+  } catch {
+    throw requestError('无法连接 Supabase，请检查网络和项目配置。', 503, 'SUPABASE_UNREACHABLE');
+  }
+  const user = await upstream.json().catch(() => null);
+  if (!upstream.ok || !user?.id) throw requestError('登录已失效，请重新登录。', 401, 'SUPABASE_AUTH_EXPIRED');
+  return { id: user.id, email: user.email || '', accessToken };
+}
+
+async function requestStateStore(request) {
+  const accessToken = accessTokenFromRequest(request);
+  if (!accessToken) return { store: stateStore, source: 'local', user: null };
+  const user = await authenticatedSupabaseUser(request);
+  return {
+    store: new SupabaseStateStore({ url: supabaseUrl, anonKey: supabaseAnonKey, accessToken: user.accessToken, userId: user.id }),
+    source: 'cloud',
+    user
+  };
+}
 
 function documentId(relativePath) {
   return crypto.createHash('sha1').update(relativePath).digest('hex').slice(0, 16);
@@ -488,17 +536,17 @@ app.get('/api/assistant/status', (request, response) => {
   response.json({ ok: true, model: aiModel, provider: 'OpenAI-compatible relay', configured: true });
 });
 
-async function resolveConversationThread(body = {}) {
-  const existing = await stateStore.getThread(stringValue(body.thread_id, 80));
+async function resolveConversationThread(store, body = {}) {
+  const existing = await store.getThread(stringValue(body.thread_id, 80));
   if (existing) return existing;
   const requestedMode = stringValue(body.conversation_mode || body.mode, 40);
   const mode = ['temporary', 'assistant', 'project', 'daily_planning'].includes(requestedMode) ? requestedMode : 'assistant';
   const options = body.conversation_options || {};
-  const state = await stateStore.bootstrap();
+  const state = await store.bootstrap();
   const projectId = stringValue(options.project_id || body.project_id, 80);
   const projectName = stringValue(options.project || body.project, 120);
   const project = state.projects.find((item) => item.id === projectId) || findProjectByReference(state.projects, projectName);
-  const thread = await stateStore.createThread({
+  const thread = await store.createThread({
     mode,
     project_id: project?.id || null,
     memory_scope: options.memory_scope ?? (mode !== 'temporary'),
@@ -512,61 +560,103 @@ function threadProjectName(thread, state) {
   return state.projects.find((item) => item.id === thread?.project_id)?.name || '';
 }
 
-app.get('/api/assistant/state', async (_request, response, next) => {
+app.get('/api/auth/config', (_request, response) => {
+  response.json({
+    ok: true,
+    configured: supabaseIsConfigured(),
+    url: supabaseIsConfigured() ? supabaseUrl : '',
+    anonKey: supabaseIsConfigured() ? supabaseAnonKey : ''
+  });
+});
+
+app.get('/api/assistant/sync/status', async (request, response, next) => {
   try {
-    response.json({ ok: true, state: await stateStore.bootstrap() });
+    const user = await authenticatedSupabaseUser(request);
+    const store = new SupabaseStateStore({ url: supabaseUrl, anonKey: supabaseAnonKey, accessToken: user.accessToken, userId: user.id });
+    const snapshot = await store.hasSnapshot();
+    response.json({ ok: true, source: 'cloud', user: { email: user.email }, snapshot });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/assistant/sync/initialize', async (request, response, next) => {
+  try {
+    const user = await authenticatedSupabaseUser(request);
+    const store = new SupabaseStateStore({ url: supabaseUrl, anonKey: supabaseAnonKey, accessToken: user.accessToken, userId: user.id });
+    const snapshot = await store.hasSnapshot();
+    if (snapshot.exists) return response.status(409).json({ error: '云端已经有数据，请刷新后继续使用云端版本。', code: 'CLOUD_STATE_EXISTS' });
+    const localState = await stateStore.bootstrap();
+    delete localState.plan;
+    await store.mutate((state) => {
+      for (const key of Object.keys(state)) delete state[key];
+      Object.assign(state, localState);
+      return true;
+    });
+    response.status(201).json({ ok: true, source: 'cloud', state: await store.bootstrap(), snapshot: await store.hasSnapshot() });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/assistant/state', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    response.json({ ok: true, source, state: await store.bootstrap() });
   } catch (error) { next(error); }
 });
 
 app.get('/api/assistant/threads', async (request, response, next) => {
   try {
-    response.json({ ok: true, threads: await stateStore.listThreads(request.query.limit) });
+    const { store, source } = await requestStateStore(request);
+    response.json({ ok: true, source, threads: await store.listThreads(request.query.limit) });
   } catch (error) { next(error); }
 });
 
 app.get('/api/assistant/threads/:id', async (request, response, next) => {
   try {
-    const thread = await stateStore.getThreadMessages(stringValue(request.params.id, 80), request.query.limit);
+    const { store, source } = await requestStateStore(request);
+    const thread = await store.getThreadMessages(stringValue(request.params.id, 80), request.query.limit);
     if (!thread) return response.status(404).json({ error: '未找到这段对话。' });
-    response.json({ ok: true, thread });
+    response.json({ ok: true, source, thread });
   } catch (error) { next(error); }
 });
 
 app.patch('/api/assistant/threads/:id', async (request, response, next) => {
   try {
+    const { store, source } = await requestStateStore(request);
     const options = request.body?.conversation_options || request.body || {};
-    const thread = await stateStore.updateThreadOptions(stringValue(request.params.id, 80), options);
+    const thread = await store.updateThreadOptions(stringValue(request.params.id, 80), options);
     if (!thread) return response.status(404).json({ error: '这段对话没有保存，因此没有可更新的对话设置。' });
-    response.json({ ok: true, thread, state: await stateStore.bootstrap() });
+    response.json({ ok: true, source, thread, state: await store.bootstrap() });
   } catch (error) { next(error); }
 });
 
 app.post('/api/assistant/threads', async (request, response, next) => {
   try {
-    const thread = await resolveConversationThread(request.body || {});
-    response.status(201).json({ ok: true, thread });
+    const { store, source } = await requestStateStore(request);
+    const thread = await resolveConversationThread(store, request.body || {});
+    response.status(201).json({ ok: true, source, thread });
   } catch (error) { next(error); }
 });
 
 app.post('/api/assistant/actions', async (request, response, next) => {
   try {
+    const { store, source } = await requestStateStore(request);
     const body = request.body || {};
-    const thread = await resolveConversationThread(body);
-    const execution = await stateStore.executeActions(normalizeActions(body.actions), {
+    const thread = await resolveConversationThread(store, body);
+    const execution = await store.executeActions(normalizeActions(body.actions), {
       thread_id: thread.id,
       project_id: thread.project_id,
       task_id: stringValue(body.task_id, 80),
       allow_memory_distillation: thread.allow_memory_distillation,
       persist_action_log: thread.mode !== 'temporary' || thread.save_full_conversation
     });
-    response.json({ ok: true, thread, ...execution, state: await stateStore.bootstrap() });
+    response.json({ ok: true, source, thread, ...execution, state: await store.bootstrap() });
   } catch (error) { next(error); }
 });
 
 app.patch('/api/assistant/memories/:id', async (request, response, next) => {
   try {
+    const { store, source } = await requestStateStore(request);
     const status = stringValue(request.body?.status, 40);
-    const memory = await stateStore.updateMemoryStatus(request.params.id, status, request.body?.content);
+    const memory = await store.updateMemoryStatus(request.params.id, status, request.body?.content);
     if (!memory) return response.status(404).json({ error: '未找到这条记忆。' });
     let relativePath = null;
     if (memory.status === 'active') {
@@ -574,24 +664,25 @@ app.patch('/api/assistant/memories/:id', async (request, response, next) => {
         title: '已确认记忆', body: memory.content, kind: 'note', source: 'personal-ai-executive-assistant'
       });
     }
-    response.json({ ok: true, memory, relativePath, state: await stateStore.bootstrap() });
+    response.json({ ok: true, source, memory, relativePath, state: await store.bootstrap() });
   } catch (error) { next(error); }
 });
 
 app.post('/api/assistant/respond', async (request, response, next) => {
   try {
     if (!assistantAuthorized(request, response)) return;
+    const { store, source } = await requestStateStore(request);
     const body = request.body || {};
     const message = stringValue(body.message, 4000);
     if (!message) return response.status(400).json({ error: '需要一条消息。' });
 
-    const thread = await resolveConversationThread(body);
-    const stateBefore = await stateStore.bootstrap();
+    const thread = await resolveConversationThread(store, body);
+    const stateBefore = await store.bootstrap();
     const projectName = threadProjectName(thread, stateBefore);
     const hydratedThread = { ...thread, project_name: projectName };
-    const userMessage = await stateStore.appendMessage(hydratedThread, 'user', message);
+    const userMessage = await store.appendMessage(hydratedThread, 'user', message);
     const storedConversation = userMessage
-      ? (await stateStore.recentMessages(hydratedThread.id, 16)).filter((entry) => entry.id !== userMessage.id)
+      ? (await store.recentMessages(hydratedThread.id, 16)).filter((entry) => entry.id !== userMessage.id)
       : [];
     const suppliedConversation = Array.isArray(body.conversation)
       ? body.conversation.slice(-12).map((entry) => ({
@@ -627,7 +718,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       project_name: projectName
     };
     async function finishAssistantResponse(result, degraded = false) {
-      const execution = await stateStore.executeActions(result.actions, {
+      const execution = await store.executeActions(result.actions, {
         thread_id: hydratedThread.id, project_id: hydratedThread.project_id,
         task_id: stringValue(context.current_task_id, 80),
         allow_memory_distillation: hydratedThread.allow_memory_distillation,
@@ -645,16 +736,16 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         else if (deferred) result.reply = `已把「${deferred.title}」顺延，今天不再安排它。`;
         else if (sleep || wake) result.reply = `作息已更新：${sleep ? `今晚 ${sleep.value} 睡觉` : ''}${sleep && wake ? '，' : ''}${wake ? `明天 ${wake.value} 起床` : ''}。我已按新的可用时间重排计划。`;
       }
-      const pendingMemories = await stateStore.addMemoryCandidates(result.memoryCandidates, hydratedThread);
-      const assistantMessage = await stateStore.appendMessage(hydratedThread, 'assistant', result.reply, execution.results);
+      const pendingMemories = await store.addMemoryCandidates(result.memoryCandidates, hydratedThread);
+      const assistantMessage = await store.appendMessage(hydratedThread, 'assistant', result.reply, execution.results);
       const transcriptPath = await appendConversationTranscript(hydratedThread, [
         { role: 'user', content: message }, { role: 'assistant', content: result.reply }
       ]);
       return response.json({
-        ok: true, degraded, model: aiModel, thread: hydratedThread, reply: result.reply, actions: result.actions,
+        ok: true, source, degraded, model: aiModel, thread: hydratedThread, reply: result.reply, actions: result.actions,
         actionResults: execution.results, memoryCandidates: result.memoryCandidates, pendingMemories, memoryRead: knowledge,
         plan: execution.plan, transcriptPath, messageIds: { user: userMessage?.id || null, assistant: assistantMessage?.id || null },
-        state: await stateStore.bootstrap()
+        state: await store.bootstrap()
       });
     }
 
@@ -765,7 +856,10 @@ app.get('/api/vault/events', (request, response) => {
 
 app.use((error, _request, response, _next) => {
   console.error(error);
-  response.status(500).json({ error: '本地知识库桥接服务遇到错误。' });
+  response.status(Number(error?.status) || 500).json({
+    error: error?.message || '本地知识库桥接服务遇到错误。',
+    ...(error?.code ? { code: error.code } : {})
+  });
 });
 
 const androidApkPath = path.join(appRoot, 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
