@@ -31,6 +31,7 @@ const aiModel = String(process.env.AI_MODEL || '');
 const aiReasoningEffort = ['low', 'medium', 'high'].includes(process.env.AI_REASONING_EFFORT)
   ? process.env.AI_REASONING_EFFORT
   : '';
+const aiMaxRetries = 6;
 const aiGatewayToken = String(process.env.AI_GATEWAY_TOKEN || '');
 const supabaseUrl = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const supabaseAnonKey = String(process.env.SUPABASE_ANON_KEY || '');
@@ -544,6 +545,41 @@ function assistantSystemPrompt() {
 - 不要编造任务、进度、日期或知识库内容。`;
 }
 
+function waitForAiRetry(attempt) {
+  return new Promise((resolve) => setTimeout(resolve, Math.min(2400, 400 * attempt)));
+}
+
+async function requestAssistantModel(payload) {
+  let lastError = null;
+  for (let retry = 0; retry <= aiMaxRetries; retry += 1) {
+    if (retry > 0) await waitForAiRetry(retry);
+    try {
+      const upstream = await fetch(`${aiBaseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${aiApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(45_000)
+      });
+      const upstreamBody = await upstream.json().catch(() => null);
+      if (!upstream.ok) {
+        throw new Error(`AI 网关返回 HTTP ${upstream.status}`);
+      }
+      const content = upstreamBody?.choices?.[0]?.message?.content;
+      if (!String(content || '').trim()) {
+        throw new Error('AI 返回正文为空。');
+      }
+      return { result: parseAssistantContent(content), attempts: retry + 1 };
+    } catch (error) {
+      lastError = error;
+      console.error(`AI attempt ${retry + 1}/${aiMaxRetries + 1} failed`, error?.cause?.code || error?.message || error?.name || 'unknown');
+    }
+  }
+  throw lastError || new Error('AI 请求失败。');
+}
+
 app.get('/api/assistant/status', (request, response) => {
   if (!assistantAuthorized(request, response)) return;
   response.json({ ok: true, model: aiModel, provider: 'OpenAI-compatible relay', configured: true });
@@ -763,49 +799,27 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       });
     }
 
-    let upstream;
     try {
-      upstream = await fetch(`${aiBaseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${aiApiKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          model: aiModel,
-          temperature: 0.45,
-          max_tokens: 2048,
-          ...(aiReasoningEffort ? { reasoning_effort: aiReasoningEffort } : {}),
-          response_format: { type: 'json_object' },
-          messages: [
-            { role: 'system', content: assistantSystemPrompt() },
-            { role: 'system', content: `当前可用上下文（只使用其中真实内容）：${contextText}` },
-            ...conversation,
-            { role: 'user', content: message }
-          ]
-        }),
-        signal: AbortSignal.timeout(45_000)
+      const { result, attempts } = await requestAssistantModel({
+        model: aiModel,
+        temperature: 0.45,
+        max_tokens: 2048,
+        ...(aiReasoningEffort ? { reasoning_effort: aiReasoningEffort } : {}),
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: assistantSystemPrompt() },
+          { role: 'system', content: `当前可用上下文（只使用其中真实内容）：${contextText}` },
+          ...conversation,
+          { role: 'user', content: message }
+        ]
       });
+      const normalizedResult = enforceUserIntent(result, message, intentContext);
+      normalizedResult.retryCount = attempts - 1;
+      return finishAssistantResponse(normalizedResult);
     } catch (error) {
-      console.error('AI relay connection error', error?.cause?.code || error?.name || 'unknown');
-      const fallback = localFallbackResult(message, intentContext);
-      return finishAssistantResponse(fallback, true);
-    }
-    const upstreamBody = await upstream.json().catch(() => null);
-    if (!upstream.ok) {
-      console.error('AI relay error', upstream.status, upstreamBody);
-      const fallback = localFallbackResult(message, intentContext);
-      return finishAssistantResponse(fallback, true);
-    }
-    const content = upstreamBody?.choices?.[0]?.message?.content;
-    let result;
-    try {
-      result = enforceUserIntent(parseAssistantContent(content), message, intentContext);
-    } catch (error) {
-      console.error('AI response parsing error', error?.message || 'unknown');
+      console.error('AI failed after retries', error?.message || 'unknown');
       return finishAssistantResponse(localFallbackResult(message, intentContext), true);
     }
-    return finishAssistantResponse(result);
   } catch (error) {
     if (error instanceof SyntaxError) return response.status(502).json({ error: 'AI 返回格式异常，请重试。' });
     next(error);
