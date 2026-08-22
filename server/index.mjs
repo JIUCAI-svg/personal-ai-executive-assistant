@@ -11,6 +11,7 @@ import { SupabaseStateStore } from './supabase-state-store.mjs';
 import {
   ASSISTANT_TOOL_NAMES,
   assistantSkillCatalog,
+  assistantSkillPrompt,
   assistantToolCatalog,
   assistantToolPrompt
 } from './assistant-tools.mjs';
@@ -820,6 +821,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         response_format: { type: 'json_object' },
         messages: [
           { role: 'system', content: assistantSystemPrompt() },
+          { role: 'system', content: `当前对话模式为 ${hydratedThread.mode}，可使用的 Skill：\n${assistantSkillPrompt(hydratedThread.mode)}` },
           { role: 'system', content: `当前可用上下文（只使用其中真实内容）：${contextText}` },
           ...conversation,
           { role: 'user', content: message }

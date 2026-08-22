@@ -111,3 +111,17 @@ export function assistantSkillCatalog() {
     tools: [...skill.tools]
   }));
 }
+
+export function assistantSkillPrompt(mode = 'assistant') {
+  const modeSkills = {
+    temporary: ['daily_assistant'],
+    assistant: ['daily_assistant', 'task_management', 'dynamic_planning', 'knowledge_memory'],
+    project: ['daily_assistant', 'task_management', 'knowledge_memory'],
+    daily_planning: ['daily_assistant', 'task_management', 'dynamic_planning', 'daily_review']
+  };
+  const selected = new Set(modeSkills[mode] || modeSkills.assistant);
+  return ASSISTANT_SKILLS
+    .filter((skill) => selected.has(skill.name))
+    .map((skill) => `- ${skill.name}: ${skill.description}`)
+    .join('\n');
+}
