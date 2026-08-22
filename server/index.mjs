@@ -8,6 +8,12 @@ import express from 'express';
 import matter from 'gray-matter';
 import { AssistantStateStore } from './state-store.mjs';
 import { SupabaseStateStore } from './supabase-state-store.mjs';
+import {
+  ASSISTANT_TOOL_NAMES,
+  assistantSkillCatalog,
+  assistantToolCatalog,
+  assistantToolPrompt
+} from './assistant-tools.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(__dirname, '..');
@@ -390,20 +396,8 @@ function explicitTaskCreationActions(message, context = {}) {
 
 function normalizeActions(actions) {
   if (!Array.isArray(actions)) return [];
-  const allowedTypes = new Set([
-    'set_sleep_time',
-    'set_wake_time',
-    'complete_current_task',
-    'cancel_task',
-    'cancel_all_tasks',
-    'defer_task',
-    'create_task',
-    'set_unavailable_period',
-    'capture_memory',
-    'replan_today'
-  ]);
   return actions
-    .filter((action) => action && allowedTypes.has(action.type))
+    .filter((action) => action && ASSISTANT_TOOL_NAMES.has(action.type))
     .slice(0, 8)
     .map((action) => ({
       type: action.type,
@@ -532,6 +526,9 @@ function assistantSystemPrompt() {
   "memory_candidates": ["需要用户确认后写入长期记忆的候选"]
 }
 
+可调用工具（actions.type 必须使用以下名称）：
+${assistantToolPrompt()}
+
 规则：
 - 只在用户明确表达或对计划有直接影响时返回 actions；普通聊天可返回空数组。
 - 时间必须 24 小时制 HH:mm。用户说“今晚一点睡”就设为 01:00；说“明天八点起”就设为 08:00。
@@ -582,7 +579,20 @@ async function requestAssistantModel(payload) {
 
 app.get('/api/assistant/status', (request, response) => {
   if (!assistantAuthorized(request, response)) return;
-  response.json({ ok: true, model: aiModel, provider: 'OpenAI-compatible relay', configured: true });
+  response.json({
+    ok: true,
+    model: aiModel,
+    provider: 'OpenAI-compatible relay',
+    configured: true,
+    tools: assistantToolCatalog(),
+    skills: assistantSkillCatalog()
+  });
+});
+
+// Read-only catalog for diagnostics and future MCP/Skill clients.
+app.get('/api/assistant/tools', (request, response) => {
+  if (!assistantAuthorized(request, response)) return;
+  response.json({ ok: true, tools: assistantToolCatalog(), skills: assistantSkillCatalog() });
 });
 
 async function resolveConversationThread(store, body = {}) {
@@ -793,7 +803,10 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       ]);
       return response.json({
         ok: true, source, degraded, model: aiModel, thread: hydratedThread, reply: result.reply, actions: result.actions,
-        actionResults: execution.results, memoryCandidates: result.memoryCandidates, pendingMemories, memoryRead: knowledge,
+        toolCalls: result.actions.map((action) => ({ name: action.type, arguments: { ...action } })),
+        actionResults: execution.results,
+        toolResults: execution.results,
+        memoryCandidates: result.memoryCandidates, pendingMemories, memoryRead: knowledge,
         plan: execution.plan, transcriptPath, messageIds: { user: userMessage?.id || null, assistant: assistantMessage?.id || null },
         state: await store.bootstrap()
       });
