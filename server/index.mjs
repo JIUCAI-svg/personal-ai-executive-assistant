@@ -10,6 +10,7 @@ import { AssistantStateStore } from './state-store.mjs';
 import { SupabaseStateStore } from './supabase-state-store.mjs';
 import {
   ASSISTANT_TOOL_NAMES,
+  assistantMcpTools,
   assistantSkillCatalog,
   assistantSkillPrompt,
   assistantToolCatalog,
@@ -594,6 +595,76 @@ app.get('/api/assistant/status', (request, response) => {
 app.get('/api/assistant/tools', (request, response) => {
   if (!assistantAuthorized(request, response)) return;
   response.json({ ok: true, tools: assistantToolCatalog(), skills: assistantSkillCatalog() });
+});
+
+function mcpResponse(id, result) {
+  return { jsonrpc: '2.0', id: id ?? null, result };
+}
+
+function mcpError(id, code, message, data = undefined) {
+  return { jsonrpc: '2.0', id: id ?? null, error: { code, message, ...(data === undefined ? {} : { data }) } };
+}
+
+function mcpArguments(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+// Minimal MCP-compatible JSON-RPC bridge. It intentionally delegates every
+// mutation to the same state store used by the chat runtime.
+app.post('/api/mcp', async (request, response, next) => {
+  if (!assistantAuthorized(request, response)) return;
+  const body = request.body || {};
+  const id = body.id;
+  const method = stringValue(body.method, 80);
+  try {
+    if (method === 'initialize') {
+      return response.json(mcpResponse(id, {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'personal-ai-executive-assistant', version: revision.toString() }
+      }));
+    }
+    if (method === 'notifications/initialized') return response.status(204).end();
+    if (method === 'tools/list') return response.json(mcpResponse(id, { tools: assistantMcpTools() }));
+    if (method !== 'tools/call') return response.status(400).json(mcpError(id, -32601, `不支持 MCP 方法：${method || '空方法'}`));
+
+    const params = body.params || {};
+    const name = stringValue(params.name, 80);
+    if (!ASSISTANT_TOOL_NAMES.has(name)) {
+      return response.status(400).json(mcpError(id, -32602, `未注册的工具：${name || '空工具名'}`));
+    }
+    const action = normalizeActions([{ ...mcpArguments(params.arguments), type: name }])[0];
+    if (!action) return response.status(400).json(mcpError(id, -32602, '工具参数格式不正确。'));
+    const { store, source } = await requestStateStore(request);
+    const thread = await resolveConversationThread(store, {
+      thread_id: params.thread_id,
+      conversation_mode: params.conversation_mode || 'assistant',
+      project_id: params.project_id,
+      conversation_options: params.conversation_options
+    });
+    const execution = await store.executeActions([action], {
+      thread_id: thread.id,
+      project_id: thread.project_id,
+      task_id: stringValue(params.task_id, 80),
+      allow_memory_distillation: thread.allow_memory_distillation,
+      persist_action_log: thread.mode !== 'temporary' || thread.save_full_conversation
+    });
+    const result = execution.results[0] || { type: name, ok: false, reason: '工具没有返回执行结果。' };
+    const payload = {
+      source,
+      thread_id: thread.id,
+      requested: action,
+      result,
+      plan: execution.plan
+    };
+    return response.json(mcpResponse(id, {
+      content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+      isError: !result.ok,
+      structuredContent: payload
+    }));
+  } catch (error) {
+    return next(error);
+  }
 });
 
 async function resolveConversationThread(store, body = {}) {

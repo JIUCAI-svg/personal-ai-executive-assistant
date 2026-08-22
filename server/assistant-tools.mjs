@@ -59,6 +59,17 @@ export const ASSISTANT_TOOLS = Object.freeze([
 
 export const ASSISTANT_TOOL_NAMES = new Set(ASSISTANT_TOOLS.map((tool) => tool.name));
 
+const NUMBER_PARAMETERS = new Set(['estimated_minutes', 'priority']);
+const REQUIRED_PARAMETERS = {
+  set_sleep_time: ['time'],
+  set_wake_time: ['time'],
+  cancel_task: ['task'],
+  defer_task: ['task'],
+  create_task: ['title'],
+  set_unavailable_period: ['start', 'end'],
+  capture_memory: ['title']
+};
+
 export const ASSISTANT_SKILLS = Object.freeze([
   {
     name: 'daily_assistant',
@@ -101,6 +112,28 @@ export function assistantToolCatalog() {
     name: tool.name,
     description: tool.description,
     parameters: { ...tool.parameters }
+  }));
+}
+
+function parameterSchema(name, description) {
+  return {
+    type: NUMBER_PARAMETERS.has(name) ? 'number' : 'string',
+    description
+  };
+}
+
+export function assistantMcpTools() {
+  return ASSISTANT_TOOLS.map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: {
+      type: 'object',
+      properties: Object.fromEntries(
+        Object.entries(tool.parameters).map(([name, description]) => [name, parameterSchema(name, description)])
+      ),
+      required: [...(REQUIRED_PARAMETERS[tool.name] || [])],
+      additionalProperties: false
+    }
   }));
 }
 
