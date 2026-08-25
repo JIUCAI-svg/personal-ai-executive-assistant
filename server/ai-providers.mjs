@@ -8,6 +8,20 @@ function uniqueModels(values) {
   return [...new Set((Array.isArray(values) ? values : []).map((value) => text(value, 160)).filter(Boolean))];
 }
 
+const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+
+function uniqueReasoningEfforts(values) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => text(value, 20).toLowerCase())
+    .filter((value) => REASONING_EFFORTS.has(value)))];
+}
+
+function apiMode(value) {
+  return text(value || 'chat_completions', 40).toLowerCase() === 'responses'
+    ? 'responses'
+    : 'chat_completions';
+}
+
 function catalogModels(catalog) {
   if (!catalog || typeof catalog !== 'object') return [];
   const values = [...(Array.isArray(catalog.models) ? catalog.models : [])];
@@ -35,7 +49,8 @@ function normalizeProfile(id, profile = {}) {
     name: text(profile.name || id, 120),
     base_url: text(profile.base_url, 500).replace(/\/$/, ''),
     api_key: text(profile.api_key, 1000),
-    api_mode: text(profile.api_mode || 'chat_completions', 40),
+    api_mode: apiMode(profile.api_mode),
+    reasoning_efforts: uniqueReasoningEfforts(profile.reasoning_efforts || profile.reasoning_levels),
     selected_model: selectedModel,
     models
   };
@@ -78,13 +93,14 @@ export function providerCatalog(registry) {
     name: profile.name,
     base_url: profile.base_url,
     api_mode: profile.api_mode,
+    reasoning_efforts: profile.reasoning_efforts,
     selected_model: profile.selected_model,
     models: profile.models,
     active: profile.id === registry.active
   }));
 }
 
-export function selectAiProvider(registry, providerId, model, fallbackModel = '') {
+export function selectAiProvider(registry, providerId, model, fallbackModel = '', reasoningEffort = '') {
   const requestedId = text(providerId, 120);
   const profile = registry.profiles[requestedId] || registry.profiles[registry.active] || Object.values(registry.profiles)[0];
   if (!profile) return null;
@@ -96,5 +112,18 @@ export function selectAiProvider(registry, providerId, model, fallbackModel = ''
     error.code = 'MODEL_NOT_AVAILABLE';
     throw error;
   }
-  return { ...profile, model: requestedModel };
+  const requestedEffort = text(reasoningEffort, 20).toLowerCase();
+  if (requestedEffort && !REASONING_EFFORTS.has(requestedEffort)) {
+    const error = new Error('推理等级不受支持。');
+    error.status = 400;
+    error.code = 'REASONING_EFFORT_NOT_AVAILABLE';
+    throw error;
+  }
+  if (requestedEffort && profile.reasoning_efforts.length && !profile.reasoning_efforts.includes(requestedEffort)) {
+    const error = new Error(`推理等级不在提供商“${profile.name}”的可用列表中。`);
+    error.status = 400;
+    error.code = 'REASONING_EFFORT_NOT_AVAILABLE';
+    throw error;
+  }
+  return { ...profile, model: requestedModel, reasoning_effort: requestedEffort };
 }

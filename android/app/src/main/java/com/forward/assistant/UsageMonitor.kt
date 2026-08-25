@@ -61,13 +61,22 @@ data class UsageAppSnapshot(
     val sessionStartedAt: Long = 0L
 )
 
+data class DeviceActivitySnapshot(
+    val date: String,
+    val firstActiveAt: String,
+    val lastActiveAt: String,
+    val firstForegroundApp: String,
+    val lastForegroundApp: String
+)
+
 data class UsageMonitorSnapshot(
     val enabled: Boolean,
     val targetApps: List<UsageAppSnapshot>,
     val autoTopTen: Boolean,
     val topApps: List<UsagePackageSummary>,
     val lastEvent: String,
-    val updatedAt: String
+    val updatedAt: String,
+    val deviceActivity: DeviceActivitySnapshot? = null
 ) {
     private val primary get() = targetApps.firstOrNull()
     val packageName get() = primary?.packageName.orEmpty()
@@ -85,6 +94,7 @@ object UsageMonitorStore {
     private const val KEY_TARGET_NAMES = "target_names"
     private const val KEY_TARGET_USAGE = "target_usage"
     private const val KEY_TOP_APPS = "top_apps"
+    private const val KEY_DEVICE_ACTIVITY = "device_activity"
     private const val KEY_AUTO_TOP_TEN = "auto_top_ten"
     // Existing installs keep this target until the user changes the selection.
     private const val DEFAULT_PACKAGE = "com.ss.android.ugc.aweme.lite"
@@ -182,11 +192,12 @@ object UsageMonitorStore {
             autoTopTen = autoTopTen(context),
             topApps = readTopApps(preferences),
             lastEvent = preferences.getString("last_event", "").orEmpty(),
-            updatedAt = preferences.getString("updated_at", "").orEmpty()
+            updatedAt = preferences.getString("updated_at", "").orEmpty(),
+            deviceActivity = readDeviceActivity(preferences)
         )
     }
 
-    fun saveUsage(context: Context, targetApps: List<UsageAppSnapshot>, topApps: List<UsagePackageSummary>) {
+    fun saveUsage(context: Context, targetApps: List<UsageAppSnapshot>, topApps: List<UsagePackageSummary>, deviceActivity: DeviceActivitySnapshot?) {
         val targetUsage = JSONArray().apply {
             targetApps.forEach { snapshot ->
                 put(JSONObject().apply {
@@ -211,6 +222,10 @@ object UsageMonitorStore {
         prefs(context).edit()
             .putString(KEY_TARGET_USAGE, targetUsage.toString())
             .putString(KEY_TOP_APPS, topUsage.toString())
+            .putString(KEY_DEVICE_ACTIVITY, deviceActivity?.let { activity -> JSONObject().apply {
+                put("date", activity.date); put("first_active_at", activity.firstActiveAt); put("last_active_at", activity.lastActiveAt)
+                put("first_foreground_app", activity.firstForegroundApp); put("last_foreground_app", activity.lastForegroundApp)
+            }.toString() }.orEmpty())
             .putString("updated_at", LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
             .apply()
     }
@@ -277,6 +292,16 @@ object UsageMonitorStore {
                 minutes = item.optInt("today_minutes").coerceAtLeast(0)
             )
         }
+    }
+
+    private fun readDeviceActivity(preferences: android.content.SharedPreferences): DeviceActivitySnapshot? {
+        val value = preferences.getString(KEY_DEVICE_ACTIVITY, "").orEmpty()
+        if (value.isBlank()) return null
+        val item = runCatching { JSONObject(value) }.getOrNull() ?: return null
+        val first = item.optString("first_active_at")
+        val last = item.optString("last_active_at")
+        if (first.isBlank() && last.isBlank()) return null
+        return DeviceActivitySnapshot(item.optString("date", LocalDate.now().toString()), first, last, item.optString("first_foreground_app"), item.optString("last_foreground_app"))
     }
 }
 
@@ -366,8 +391,10 @@ class UsageMonitorService : Service() {
         val usageManager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
         val targetApps = UsageMonitorStore.targetApps(this)
         val targetSnapshots = calculateTargetUsage(usageManager, targetApps, startOfDay, now)
-        val topApps = if (UsageMonitorStore.autoTopTen(this)) calculateTopApps(usageManager, startOfDay, now) else emptyList()
-        UsageMonitorStore.saveUsage(this, targetSnapshots, topApps)
+        val installed = installedUsageApps(this).associateBy { it.packageName }
+        val topApps = if (UsageMonitorStore.autoTopTen(this)) calculateTopApps(usageManager, startOfDay, now, installed) else emptyList()
+        val deviceActivity = calculateDeviceActivity(usageManager, startOfDay, now, installed)
+        UsageMonitorStore.saveUsage(this, targetSnapshots, topApps, deviceActivity)
         val snapshot = UsageMonitorStore.snapshot(this)
         if (UsageMonitorStore.shouldUpload(this)) uploadUsage(snapshot)
         sendTargetReminders(targetSnapshots)
@@ -416,8 +443,7 @@ class UsageMonitorService : Service() {
         }
     }
 
-    private fun calculateTopApps(usageManager: UsageStatsManager, startOfDay: Long, now: Long): List<UsagePackageSummary> {
-        val installed = installedUsageApps(this).associateBy { it.packageName }
+    private fun calculateTopApps(usageManager: UsageStatsManager, startOfDay: Long, now: Long, installed: Map<String, InstalledUsageApp>): List<UsagePackageSummary> {
         return usageManager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startOfDay, now)
             .asSequence()
             .mapNotNull { stat ->
@@ -428,6 +454,30 @@ class UsageMonitorService : Service() {
             .sortedByDescending { it.minutes }
             .take(10)
             .toList()
+    }
+
+    private fun calculateDeviceActivity(usageManager: UsageStatsManager, startOfDay: Long, now: Long, installed: Map<String, InstalledUsageApp>): DeviceActivitySnapshot? {
+        var firstAt = 0L
+        var lastAt = 0L
+        var firstApp = ""
+        var lastApp = ""
+        val events = usageManager.queryEvents(startOfDay, now)
+        val event = UsageEvents.Event()
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event)
+            if (event.eventType != UsageEvents.Event.MOVE_TO_FOREGROUND) continue
+            val app = installed[event.packageName] ?: continue
+            if (firstAt == 0L || event.timeStamp < firstAt) { firstAt = event.timeStamp; firstApp = app.appName }
+            if (event.timeStamp >= lastAt) { lastAt = event.timeStamp; lastApp = app.appName }
+        }
+        if (firstAt == 0L || lastAt == 0L) return null
+        val formatter = DateTimeFormatter.ISO_LOCAL_DATE_TIME
+        return DeviceActivitySnapshot(
+            LocalDate.now().toString(),
+            LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli(firstAt), ZoneId.systemDefault()).format(formatter),
+            LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli(lastAt), ZoneId.systemDefault()).format(formatter),
+            firstApp, lastApp
+        )
     }
 
     private fun sendTargetReminders(targetSnapshots: List<UsageAppSnapshot>) {
@@ -500,6 +550,11 @@ class UsageMonitorService : Service() {
                     }
                 }
             })
+            snapshot.deviceActivity?.let { activity -> put("device_activity", JSONObject().apply {
+                put("date", activity.date); put("first_active_at", activity.firstActiveAt); put("last_active_at", activity.lastActiveAt)
+                put("first_foreground_app", activity.firstForegroundApp); put("last_foreground_app", activity.lastForegroundApp)
+                put("updated_at", snapshot.updatedAt); put("source", "android-usage-monitor")
+            }) }
         }.toString().toByteArray(Charsets.UTF_8)
         val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
@@ -511,6 +566,7 @@ class UsageMonitorService : Service() {
             setRequestProperty("Content-Type", "application/json; charset=utf-8")
             setRequestProperty("Connection", "close")
             if (BuildConfig.AI_GATEWAY_TOKEN.isNotBlank()) setRequestProperty("x-forward-token", BuildConfig.AI_GATEWAY_TOKEN)
+            AssistantSessionStore.token(this@UsageMonitorService).takeIf { it.isNotBlank() }?.let { setRequestProperty("Authorization", "Bearer $it") }
         }
         try {
             connection.outputStream.use { output -> output.write(payload) }

@@ -144,7 +144,13 @@ data class ScheduledPlanItem(
 data class ChatMessage(val fromAssistant: Boolean, val text: String)
 
 data class AssistantAction(val type: String, val time: String? = null, val task: String? = null, val title: String? = null, val start: String? = null, val end: String? = null)
-data class AssistantResult(val reply: String, val actions: List<AssistantAction>)
+data class AssistantResult(
+    val reply: String,
+    val actions: List<AssistantAction>,
+    val plan: RemotePlan? = null,
+    val state: RemoteState? = null,
+    val threadId: String? = null
+)
 data class AiProviderOption(val id: String, val name: String, val models: List<String>, val active: Boolean = false)
 
 private val aiGatewayUrl get() = BuildConfig.AI_GATEWAY_URL
@@ -241,6 +247,21 @@ private fun schedulePlan(
     }
 }
 
+private fun remoteTone(priority: Int): Color = when {
+    priority >= 5 -> Coral
+    priority >= 3 -> Color(0xFF55A496)
+    else -> Color(0xFF968BD0)
+}
+
+private fun remoteScheduledItem(item: RemotePlanItem, deferred: Boolean): ScheduledPlanItem {
+    val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), flexible = deferred, deferred = deferred)
+    if (deferred || item.start.isBlank() || item.end.isBlank()) return ScheduledPlanItem(planItem, deferredByCapacity = true)
+    val date = runCatching { LocalDate.parse(item.date) }.getOrDefault(LocalDate.now())
+    val start = parseClock(item.start) ?: return ScheduledPlanItem(planItem, deferredByCapacity = true)
+    val end = parseClock(item.end) ?: return ScheduledPlanItem(planItem, deferredByCapacity = true)
+    return ScheduledPlanItem(planItem, date.atTime(start), date.atTime(end))
+}
+
 private fun parseClock(text: String): LocalTime? {
     val match = Regex("""(?<!\\d)([01]?\\d|2[0-3])\\s*(?:点|:|：)\\s*([0-5]?\\d)?(?:分)?""").find(text) ?: return null
     var hour = match.groupValues[1].toInt()
@@ -254,6 +275,7 @@ private fun parseClock(text: String): LocalTime? {
 }
 
 private suspend fun requestAssistant(
+    context: Context,
     message: String,
     now: LocalDateTime,
     sleepTime: LocalTime,
@@ -262,11 +284,14 @@ private suspend fun requestAssistant(
     conversation: List<ChatMessage>,
     usageSnapshot: UsageMonitorSnapshot,
     providerId: String,
-    model: String
+    model: String,
+    threadId: String?
 ): AssistantResult = withContext(Dispatchers.IO) {
     check(aiGatewayUrl.isNotBlank()) { "AI 网关地址尚未配置" }
     val payload = JSONObject().apply {
         put("message", message)
+        if (!threadId.isNullOrBlank()) put("thread_id", threadId)
+        put("conversation_mode", "daily_planning")
         if (providerId.isNotBlank()) put("provider_id", providerId)
         if (model.isNotBlank()) put("model", model)
         put("conversation", JSONArray().apply {
@@ -329,6 +354,11 @@ private suspend fun requestAssistant(
                     }
                 }
             })
+            usageSnapshot.deviceActivity?.let { activity -> put("device_activity", JSONObject().apply {
+                put("date", activity.date); put("first_active_at", activity.firstActiveAt); put("last_active_at", activity.lastActiveAt)
+                put("first_foreground_app", activity.firstForegroundApp); put("last_foreground_app", activity.lastForegroundApp)
+                put("updated_at", usageSnapshot.updatedAt); put("source", "android-usage-monitor")
+            }) }
         })
     }
     val payloadBytes = payload.toString().toByteArray(Charsets.UTF_8)
@@ -342,6 +372,7 @@ private suspend fun requestAssistant(
         setRequestProperty("Content-Type", "application/json; charset=utf-8")
         setRequestProperty("Connection", "close")
         if (aiGatewayToken.isNotBlank()) setRequestProperty("x-forward-token", aiGatewayToken)
+        AssistantSessionStore.token(context).takeIf { it.isNotBlank() }?.let { setRequestProperty("Authorization", "Bearer $it") }
     }
     try {
         connection.outputStream.use { output -> output.write(payloadBytes) }
@@ -363,7 +394,10 @@ private suspend fun requestAssistant(
                         end = action.optString("end").ifBlank { null }
                     )
                 }
-            }.orEmpty()
+            }.orEmpty(),
+            plan = parseRemotePlan(json.optJSONObject("plan") ?: json.optJSONObject("state")?.optJSONObject("plan")),
+            state = parseRemoteState(json.optJSONObject("state")),
+            threadId = json.optJSONObject("thread")?.optString("id")?.ifBlank { null }
         )
     } catch (error: Exception) {
         Log.e("ForwardAssistant", "AI gateway request failed: $aiGatewayUrl", error)
@@ -373,13 +407,14 @@ private suspend fun requestAssistant(
     }
 }
 
-private suspend fun requestAiProviders(): List<AiProviderOption> = withContext(Dispatchers.IO) {
+private suspend fun requestAiProviders(context: Context): List<AiProviderOption> = withContext(Dispatchers.IO) {
     val providersUrl = aiGatewayUrl.removeSuffix("/api/assistant/respond") + "/api/assistant/providers"
     val connection = (URL(providersUrl).openConnection() as HttpURLConnection).apply {
         requestMethod = "GET"
         connectTimeout = 8_000
         readTimeout = 15_000
         if (aiGatewayToken.isNotBlank()) setRequestProperty("x-forward-token", aiGatewayToken)
+        AssistantSessionStore.token(context).takeIf { it.isNotBlank() }?.let { setRequestProperty("Authorization", "Bearer $it") }
     }
     try {
         val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
@@ -531,9 +566,18 @@ private fun ForwardApp(activity: MainActivity) {
         var aiProviders by remember { mutableStateOf(emptyList<AiProviderOption>()) }
         var selectedProviderId by remember { mutableStateOf(activity.aiProviderId()) }
         var selectedModel by remember { mutableStateOf(activity.aiModel()) }
+        var remotePlan by remember { mutableStateOf<RemotePlan?>(null) }
+        var remoteMemories by remember { mutableStateOf(emptyList<RemoteMemory>()) }
+        var remoteThreadId by remember { mutableStateOf<String?>(null) }
         var now by remember { mutableStateOf(LocalDateTime.now()) }
         LaunchedEffect(Unit) {
-            runCatching { requestAiProviders() }.onSuccess { providers ->
+            runCatching { gatewayFetchState(activity) }.onSuccess { state ->
+                remotePlan = state.plan
+                remoteMemories = state.memories
+                parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
+                parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
+            }
+            runCatching { requestAiProviders(activity) }.onSuccess { providers ->
                 aiProviders = providers
                 val provider = providers.firstOrNull { it.id == selectedProviderId } ?: providers.firstOrNull { it.active } ?: providers.firstOrNull()
                 if (provider != null) {
@@ -561,9 +605,11 @@ private fun ForwardApp(activity: MainActivity) {
         }
 
         fun completeTask() {
-            currentDone = true
-            messages = messages + ChatMessage(true, "好，高数错题记为完成。接下来留 15 分钟休息，再按今天还剩的时间继续排英语和收益实验。")
-            scope.launch { snackbar.showSnackbar("已完成，计划向前推进") }
+            scope.launch {
+                runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "complete_current_task").put("reason", "用户在移动端点击完成当前任务")) }
+                    .onSuccess { state -> remotePlan = state.plan; remoteMemories = state.memories; currentDone = true; snackbar.showSnackbar("已完成，云端计划已重排") }
+                    .onFailure { snackbar.showSnackbar(it.message ?: "计划更新失败，本次未写入") }
+            }
         }
 
         fun applyActions(actions: List<AssistantAction>) {
@@ -664,9 +710,12 @@ private fun ForwardApp(activity: MainActivity) {
             aiBusy = true
             scope.launch {
                 val result = runCatching {
-                    requestAssistant(text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel)
-                }.getOrElse { error -> AssistantResult(localReply(text), emptyList()).also { scope.launch { snackbar.showSnackbar(error.message ?: "AI 网关未连接，已使用本地规则") } } }
-                applyActions(result.actions)
+                    requestAssistant(activity, text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel, remoteThreadId)
+                }.getOrElse { error -> AssistantResult("这次没有连上服务，内容没有写入任务、计划或记忆。请稍后重试。", emptyList()).also { scope.launch { snackbar.showSnackbar(error.message ?: "AI 服务连接失败") } } }
+                if (result.plan == null) applyActions(result.actions)
+                result.plan?.let { remotePlan = it }
+                result.state?.let { remoteMemories = it.memories; if (it.plan != null) remotePlan = it.plan }
+                result.threadId?.let { remoteThreadId = it }
                 messages = messages + ChatMessage(true, result.reply)
                 aiBusy = false
             }
@@ -705,9 +754,9 @@ private fun ForwardApp(activity: MainActivity) {
             }
         ) { padding ->
             when (tab) {
-                0 -> TodayScreen(padding, now, sleepTime, currentDone, unavailablePeriod, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), ::completeTask, ::sendMessage, input, { input = it }, aiBusy)
+                0 -> TodayScreen(padding, now, sleepTime, currentDone, unavailablePeriod, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), remotePlan, ::completeTask, ::sendMessage, input, { input = it }, aiBusy)
                 1 -> ChatScreen(padding, messages, ::sendMessage, input, { input = it }, aiBusy)
-                2 -> MemoryScreen(padding)
+                2 -> MemoryScreen(padding, remoteMemories)
                 else -> SettingsScreen(
                     padding,
                     activity,
@@ -715,13 +764,14 @@ private fun ForwardApp(activity: MainActivity) {
                     sleepTime,
                     wakeTime,
                     usageSnapshot,
-                    onSleepTime = { time -> sleepTime = time; activity.savePlannerTime("sleep_time", time) },
-                    onWakeTime = { time -> wakeTime = time; activity.savePlannerTime("wake_time", time) },
+                    onSleepTime = { time -> sleepTime = time; activity.savePlannerTime("sleep_time", time); scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_sleep_time").put("time", formatClock(time)).put("reason", "用户在移动端设置睡觉时间")) }.onSuccess { remotePlan = it.plan; remoteMemories = it.memories } } },
+                    onWakeTime = { time -> wakeTime = time; activity.savePlannerTime("wake_time", time); scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_wake_time").put("time", formatClock(time)).put("reason", "用户在移动端设置起床时间")) }.onSuccess { remotePlan = it.plan; remoteMemories = it.memories } } },
                     aiProviders = aiProviders,
                     selectedProviderId = selectedProviderId,
                     selectedModel = selectedModel,
                     onAiSelection = { providerId, model -> selectedProviderId = providerId; selectedModel = model; activity.saveAiSelection(providerId, model) },
-                    onUsageSnapshotChanged = { usageSnapshot = activity.usageSnapshot() }
+                    onUsageSnapshotChanged = { usageSnapshot = activity.usageSnapshot() },
+                    onRemoteState = { state -> remotePlan = state.plan; remoteMemories = state.memories }
                 )
             }
         }
@@ -736,6 +786,7 @@ private fun TodayScreen(
     currentDone: Boolean,
     unavailablePeriod: Boolean,
     plan: List<PlanItem>,
+    remotePlan: RemotePlan?,
     completeTask: () -> Unit,
     sendMessage: () -> Unit,
     input: TextFieldValue,
@@ -743,22 +794,27 @@ private fun TodayScreen(
     aiBusy: Boolean
 ) {
     val clock = formatClock(now.toLocalTime())
-    val scheduledPlan = schedulePlan(plan, now, sleepTime)
-    val availableMinutes = minutesUntilSleep(now, sleepTime)
-    val scheduledMinutes = scheduledPlan.filter { it.start != null && !it.item.done }.sumOf { it.item.minutes }.toLong()
-    val bufferMinutes = (availableMinutes - scheduledMinutes).coerceAtLeast(0)
-    val currentItem = scheduledPlan.firstOrNull { it.start != null && !it.item.isBreak && !it.item.done }
+    val scheduledPlan = remotePlan?.let { remote ->
+        remote.scheduled.map { remoteScheduledItem(it, false) } + remote.deferred.map { remoteScheduledItem(it, true) }
+    } ?: schedulePlan(plan, now, sleepTime)
+    val availableMinutes = remotePlan?.availableMinutes?.toLong() ?: minutesUntilSleep(now, sleepTime)
+    val scheduledMinutes = remotePlan?.scheduledMinutes?.toLong() ?: scheduledPlan.filter { it.start != null && !it.item.done }.sumOf { it.item.minutes }.toLong()
+    val bufferMinutes = remotePlan?.bufferMinutes?.toLong() ?: (availableMinutes - scheduledMinutes).coerceAtLeast(0)
+    val currentItem = remotePlan?.currentTaskId?.let { currentId ->
+        scheduledPlan.getOrNull(remotePlan.scheduled.indexOfFirst { it.id == currentId }.takeIf { it >= 0 } ?: -1)
+    } ?: scheduledPlan.firstOrNull { it.start != null && !it.item.isBreak && !it.item.done }
     LazyColumn(modifier = Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(bottom = 10.dp)) {
         item { Column(Modifier.padding(horizontal = 20.dp, vertical = 18.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) { Box(Modifier.size(7.dp).clip(CircleShape).background(Coral)); Spacer(Modifier.width(7.dp)); Text(dateLabel(now.toLocalDate()), color = Muted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
             Spacer(Modifier.height(10.dp)); Text("今天，先把最重要的事做下去。", color = Green, fontSize = 26.sp, fontWeight = FontWeight.Bold, lineHeight = 34.sp)
-            Spacer(Modifier.height(6.dp)); Text("现在 $clock · 今天排到 ${formatClock(sleepTime)} · 还可用 ${formatDuration(availableMinutes)}", color = Muted, fontSize = 11.sp)
+            Spacer(Modifier.height(6.dp)); Text("现在 $clock · 今天排到 ${remotePlan?.sleepTime ?: formatClock(sleepTime)} · 还可用 ${formatDuration(availableMinutes)}", color = Muted, fontSize = 11.sp)
         } }
         item { CurrentTaskCard(currentItem, currentDone, completeTask) }
         item { SectionTitle("今日动态计划", "现在 $clock") }
         item { BudgetRow(scheduledMinutes, bufferMinutes, availableMinutes) }
         items(scheduledPlan) { item -> PlanRow(item) }
         if (unavailablePeriod) item { AdjustmentCard("有一段不可用时间已加入计划", "我会避开这段时间，并把受影响事项顺延；调整原因会在对话中说明。") }
+        else if (remotePlan?.adjustmentReason?.isNotBlank() == true) item { AdjustmentCard("本次计划调整", remotePlan.adjustmentReason) }
         else if (scheduledPlan.any { it.deferredByCapacity && !it.item.done }) item { AdjustmentCard("今晚时间不够用", "超过 ${formatClock(sleepTime)} 的事项已转为可顺延，不会为了塞完任务压缩你的睡眠。") }
         item { SectionTitle("快速记录", "直接告诉我发生了什么") }
         item { Composer(input, onInput, sendMessage, aiBusy) }
@@ -855,26 +911,27 @@ private fun ChatScreen(padding: PaddingValues, messages: List<ChatMessage>, onSe
 }
 
 @Composable
-private fun MemoryScreen(padding: PaddingValues) {
-    val memories = listOf("9 月 5 日补考", "近期复习进度", "个人长期目标", "今日精力记录")
+private fun MemoryScreen(padding: PaddingValues, remoteMemories: List<RemoteMemory>) {
+    val memories = remoteMemories.filter { it.status != "archived" }.map { it.content }
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(padding),
         contentPadding = PaddingValues(20.dp)
     ) {
         item {
             Text("记忆库", color = Green, fontSize = 25.sp, fontWeight = FontWeight.Bold)
-            Text("电脑端 Obsidian 知识库的同步内容", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp, bottom = 18.dp))
+            Text("与电脑端共用的待确认和已确认记忆", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp, bottom = 18.dp))
             Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = GreenSoft)) {
                 Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Default.Visibility, null, tint = Color(0xFF277267))
                     Spacer(Modifier.width(10.dp))
                     Column {
-                        Text("电脑端桥接已配置", color = Green, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                        Text("手机端将在云端同步接入后读取完整资料", color = Muted, fontSize = 11.sp)
+                        Text("云端记忆已同步", color = Green, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        Text("重要对话会先成为候选，确认后再沉淀", color = Muted, fontSize = 11.sp)
                     }
                 }
             }
         }
+        if (memories.isEmpty()) item { Text("还没有已沉淀的记忆。对话中的重要信息会先作为候选，等你确认后保存。", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 16.dp)) }
         items(memories) { label ->
             Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.Lightbulb, null, tint = Color(0xFFB77D55), modifier = Modifier.size(18.dp))
@@ -901,7 +958,8 @@ private fun SettingsScreen(
     selectedProviderId: String,
     selectedModel: String,
     onAiSelection: (String, String) -> Unit,
-    onUsageSnapshotChanged: () -> Unit
+    onUsageSnapshotChanged: () -> Unit,
+    onRemoteState: (RemoteState) -> Unit
 ) {
     val scope = rememberCoroutineScope()
     var usageAccess by remember { mutableStateOf(activity.hasUsageAccess()) }
@@ -926,7 +984,7 @@ private fun SettingsScreen(
             TimePickerDialog(activity, { _, hour, minute -> onWakeTime(LocalTime.of(hour, minute)) }, wakeTime.hour, wakeTime.minute, true).show()
         }) }
         item { SettingRow(Icons.Default.NotificationsNone, "任务提醒", "安卓通知通道已准备", true) }
-        item { SettingRow(Icons.Default.Refresh, "本地知识库", "电脑端 E: 盘桥接 · 云端同步待接入", false) }
+        item { CloudSyncCard(activity, snackbar, onRemoteState) }
         item {
             AiProviderSettingsCard(
                 providers = aiProviders,
@@ -958,6 +1016,44 @@ private fun SettingsScreen(
                 Icon(Icons.Default.NotificationsNone, null, modifier = Modifier.size(17.dp))
                 Spacer(Modifier.width(7.dp))
                 Text("发送测试提醒")
+            }
+        }
+    }
+}
+
+@Composable
+private fun CloudSyncCard(activity: MainActivity, snackbar: SnackbarHostState, onRemoteState: (RemoteState) -> Unit) {
+    val scope = rememberCoroutineScope()
+    var email by remember { mutableStateOf(AssistantSessionStore.email(activity)) }
+    var password by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf(if (AssistantSessionStore.token(activity).isBlank()) "登录后，手机和电脑会读取同一份任务、计划、对话和记忆。" else "已登录 ${AssistantSessionStore.email(activity)}") }
+    Card(Modifier.fillMaxWidth().padding(top = 14.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF1EC)), shape = RoundedCornerShape(9.dp)) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Refresh, null, tint = Color(0xFF277267), modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(9.dp))
+                Column { Text("云端同步", color = Green, fontSize = 14.sp, fontWeight = FontWeight.Bold); Text(status, color = Muted, fontSize = 10.sp, lineHeight = 14.sp) }
+            }
+            if (AssistantSessionStore.token(activity).isBlank()) {
+                OutlinedTextField(value = email, onValueChange = { email = it }, label = { Text("Supabase 邮箱") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = password, onValueChange = { password = it }, label = { Text("密码") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Button(onClick = {
+                    if (email.isBlank() || password.isBlank() || busy) return@Button
+                    busy = true
+                    scope.launch {
+                        runCatching { supabasePasswordLogin(activity, email, password); gatewayFetchState(activity) }
+                            .onSuccess { state -> onRemoteState(state); status = "已登录 ${AssistantSessionStore.email(activity)}，正在使用云端数据"; snackbar.showSnackbar("云端同步已连接") }
+                            .onFailure { error -> status = error.message ?: "登录失败"; snackbar.showSnackbar(status) }
+                        busy = false
+                    }
+                }, colors = ButtonDefaults.buttonColors(containerColor = Green), modifier = Modifier.fillMaxWidth()) { Text(if (busy) "正在连接…" else "登录并同步") }
+            } else {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { scope.launch { runCatching { gatewayFetchState(activity) }.onSuccess { onRemoteState(it); snackbar.showSnackbar("已刷新云端数据") }.onFailure { snackbar.showSnackbar(it.message ?: "刷新失败") } } }) { Text("刷新云端", color = Green) }
+                    TextButton(onClick = { scope.launch { runCatching { gatewayInitializeCloud(activity) }.onSuccess { onRemoteState(it); snackbar.showSnackbar("已将服务器本机状态初始化到云端") }.onFailure { snackbar.showSnackbar(it.message ?: "云端已有数据或初始化失败") } } }) { Text("首次初始化", color = Green) }
+                    TextButton(onClick = { AssistantSessionStore.clear(activity); status = "已退出登录，本机不会继续读取云端数据" }) { Text("退出", color = Color(0xFF9C4B3B)) }
+                }
             }
         }
     }

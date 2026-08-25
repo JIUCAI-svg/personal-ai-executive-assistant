@@ -9,6 +9,7 @@ import matter from 'gray-matter';
 import { AssistantStateStore } from './state-store.mjs';
 import { SupabaseStateStore } from './supabase-state-store.mjs';
 import { loadAiProviders, providerCatalog, selectAiProvider } from './ai-providers.mjs';
+import { assistantEndpoint, buildAssistantModelRequest, extractAssistantText, upstreamErrorMessage } from './ai-protocol.mjs';
 import {
   ASSISTANT_TOOL_NAMES,
   assistantMcpTools,
@@ -342,6 +343,26 @@ function normalizeAppUsages(value) {
     )) === index);
 }
 
+function normalizeDeviceActivity(value) {
+  if (!value || typeof value !== 'object') return null;
+  const isoValue = (input) => {
+    const result = stringValue(input, 48);
+    return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/.test(result) ? result : '';
+  };
+  const firstActiveAt = isoValue(value.first_active_at);
+  const lastActiveAt = isoValue(value.last_active_at);
+  if (!firstActiveAt && !lastActiveAt) return null;
+  return {
+    date: /^\d{4}-\d{2}-\d{2}$/.test(String(value.date || '')) ? String(value.date) : dateStamp(),
+    first_active_at: firstActiveAt,
+    last_active_at: lastActiveAt,
+    first_foreground_app: stringValue(value.first_foreground_app, 120),
+    last_foreground_app: stringValue(value.last_foreground_app, 120),
+    updated_at: isoValue(value.updated_at) || new Date().toISOString(),
+    source: stringValue(value.source, 48) || 'android-usage-monitor'
+  };
+}
+
 function compactProjectName(value) {
   return stringValue(value, 120).toLocaleLowerCase('zh-CN').replace(/[\s·•，,。.:：-]/g, '');
 }
@@ -601,6 +622,7 @@ ${assistantToolPrompt()}
 - 用户说外出或某段时间不可用时，使用 set_unavailable_period；用户说疲惫时，使用 defer_task 推迟高消耗任务，并使用 replan_today。
 - 用户新增一件事时，使用 create_task；不要直接声称它已经加入计划而没有 action。若未给预计时长，按合理的最小可执行时长估计，并在回复中说明。
 - 上下文中的 app_usage 是手机本地监控提供的真实使用摘要和每日记录，不是可选工具。若 current 或 daily_history 存在，必须把它们视为当前事实；可以根据今日累计时长、连续时长、历史趋势和上限解释提醒或重排计划，但不要推断用户在应用中看了什么，也不要把每一次使用记录自动沉淀为长期记忆。
+- sleep_wake_from_phone 是根据前一日最后一次、当日第一次前台应用活动计算出的“候选作息”，仅用于提醒、复盘和在用户追问时说明；它不是确认后的作息，绝对不要自动调用 set_sleep_time 或 set_wake_time 覆盖用户设置。要明确说明候选、证据边界和置信度。
 - 长期记忆只提取稳定偏好、明确决定、项目里程碑或重要事实；不要把普通闲聊自动写入。
 - 不要编造任务、进度、日期或知识库内容。`;
 }
@@ -613,31 +635,35 @@ async function requestAssistantModel(payload) {
   const provider = payload.provider;
   const requestPayload = { ...payload };
   delete requestPayload.provider;
+  const maxRetries = Number.isInteger(requestPayload.max_retries)
+    ? Math.max(0, Math.min(aiMaxRetries, requestPayload.max_retries))
+    : aiMaxRetries;
+  delete requestPayload.max_retries;
   let lastError = null;
-  for (let retry = 0; retry <= aiMaxRetries; retry += 1) {
+  for (let retry = 0; retry <= maxRetries; retry += 1) {
     if (retry > 0) await waitForAiRetry(retry);
     try {
-      const upstream = await fetch(`${provider.base_url}/chat/completions`, {
+      const upstream = await fetch(assistantEndpoint(provider), {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${provider.api_key}`,
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify(requestPayload),
+        body: JSON.stringify(buildAssistantModelRequest(provider, requestPayload)),
         signal: AbortSignal.timeout(45_000)
       });
       const upstreamBody = await upstream.json().catch(() => null);
       if (!upstream.ok) {
-        throw new Error(`AI 网关返回 HTTP ${upstream.status}`);
+        throw new Error(upstreamErrorMessage(upstreamBody, upstream.status));
       }
-      const content = upstreamBody?.choices?.[0]?.message?.content;
+      const content = extractAssistantText(provider, upstreamBody);
       if (!String(content || '').trim()) {
         throw new Error('AI 返回正文为空。');
       }
       return { result: parseAssistantContent(content), attempts: retry + 1 };
     } catch (error) {
       lastError = error;
-      console.error(`AI attempt ${retry + 1}/${aiMaxRetries + 1} failed`, error?.cause?.code || error?.message || error?.name || 'unknown');
+      console.error(`AI attempt ${retry + 1}/${maxRetries + 1} failed`, error?.cause?.code || error?.message || error?.name || 'unknown');
     }
   }
   throw lastError || new Error('AI 请求失败。');
@@ -665,6 +691,44 @@ app.get('/api/assistant/tools', (request, response) => {
 app.get('/api/assistant/providers', (request, response) => {
   if (!assistantAuthorized(request, response)) return;
   response.json({ ok: true, active: aiProviderRegistry.active, providers: providerCatalog(aiProviderRegistry) });
+});
+
+// This endpoint deliberately uses an isolated JSON-only request. It verifies
+// the selected provider/model/protocol without writing any tasks, memories or
+// conversation records.
+app.post('/api/assistant/providers/:id/test', async (request, response, next) => {
+  try {
+    if (!assistantAuthorized(request, response)) return;
+    const provider = selectAiProvider(
+      aiProviderRegistry,
+      request.params.id,
+      request.body?.model,
+      aiModel,
+      request.body?.reasoning_effort || aiReasoningEffort
+    );
+    const { result, attempts } = await requestAssistantModel({
+      provider,
+      model: provider.model,
+      max_retries: 0,
+      ...(provider.reasoning_effort ? { reasoning_effort: provider.reasoning_effort } : {}),
+      temperature: 0,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: '只输出有效 JSON：{"reply":"连接正常","actions":[],"memory_candidates":[]}' },
+        { role: 'user', content: '请返回连接正常。' }
+      ]
+    });
+    response.json({
+      ok: true,
+      provider: provider.id,
+      provider_name: provider.name,
+      model: provider.model,
+      api_mode: provider.api_mode,
+      reasoning_effort: provider.reasoning_effort || null,
+      attempts,
+      reply: result.reply
+    });
+  } catch (error) { next(error); }
 });
 
 function mcpResponse(id, result) {
@@ -803,6 +867,18 @@ app.get('/api/assistant/state', async (request, response, next) => {
   } catch (error) { next(error); }
 });
 
+app.patch('/api/assistant/preferences', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    const preferences = await store.updateAiPreferences({
+      provider_id: stringValue(request.body?.provider_id, 120),
+      model: stringValue(request.body?.model, 160),
+      reasoning_effort: stringValue(request.body?.reasoning_effort, 20)
+    });
+    response.json({ ok: true, source, preferences, state: await store.bootstrap() });
+  } catch (error) { next(error); }
+});
+
 app.get('/api/assistant/threads', async (request, response, next) => {
   try {
     const { store, source } = await requestStateStore(request);
@@ -858,10 +934,12 @@ app.post('/api/assistant/usage', async (request, response, next) => {
     if (!bridgeAuthorized(request, response)) return;
     const { store, source } = await requestStateStore(request);
     const appUsages = normalizeAppUsages(request.body?.app_usage || request.body);
-    if (!appUsages.length) return response.status(400).json({ error: '需要有效的应用使用摘要。' });
+    const deviceActivity = normalizeDeviceActivity(request.body?.device_activity);
+    if (!appUsages.length && !deviceActivity) return response.status(400).json({ error: '需要有效的应用使用摘要或设备活动摘要。' });
     const records = [];
     for (const appUsage of appUsages) records.push(await store.recordAppUsage(appUsage));
-    response.json({ ok: true, source, record: records[0] || null, records, history: await store.appUsageHistory(30) });
+    const sleepWake = deviceActivity ? await store.recordDeviceActivity(deviceActivity) : null;
+    response.json({ ok: true, source, record: records[0] || null, records, deviceActivity, sleepWake, history: await store.appUsageHistory(30), state: await store.bootstrap() });
   } catch (error) { next(error); }
 });
 
@@ -869,7 +947,20 @@ app.get('/api/assistant/usage', async (request, response, next) => {
   try {
     if (!bridgeAuthorized(request, response)) return;
     const { store, source } = await requestStateStore(request);
-    response.json({ ok: true, source, history: await store.appUsageHistory(request.query.limit) });
+    response.json({ ok: true, source, history: await store.appUsageHistory(request.query.limit), sleepWake: await store.sleepWakeHistory(request.query.limit) });
+  } catch (error) { next(error); }
+});
+
+app.patch('/api/assistant/sleep-wake/:id', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    const status = stringValue(request.body?.status, 20);
+    const event = await store.updateSleepWakeEvent(stringValue(request.params.id, 80), status, {
+      sleep_at: request.body?.sleep_at,
+      wake_at: request.body?.wake_at
+    });
+    if (!event) return response.status(404).json({ error: '未找到这条作息候选。' });
+    response.json({ ok: true, source, event, state: await store.bootstrap() });
   } catch (error) { next(error); }
 });
 
@@ -896,8 +987,21 @@ app.post('/api/assistant/respond', async (request, response, next) => {
     const body = request.body || {};
     const message = stringValue(body.message, 4000);
     if (!message) return response.status(400).json({ error: '需要一条消息。' });
-    const provider = selectAiProvider(aiProviderRegistry, body.provider_id || body.provider, body.model, aiModel);
+    const provider = selectAiProvider(
+      aiProviderRegistry,
+      body.provider_id || body.provider,
+      body.model,
+      aiModel,
+      body.reasoning_effort || aiReasoningEffort
+    );
     if (!provider) return response.status(503).json({ error: '尚未配置可用的 AI 提供商或模型。', code: 'AI_PROVIDER_NOT_CONFIGURED' });
+    if (body.provider_id || body.provider || body.model || body.reasoning_effort) {
+      await store.updateAiPreferences({
+        provider_id: provider.id,
+        model: provider.model,
+        reasoning_effort: provider.reasoning_effort || ''
+      });
+    }
 
     const thread = await resolveConversationThread(store, body);
     const stateBefore = await store.bootstrap();
@@ -920,10 +1024,13 @@ app.post('/api/assistant/respond', async (request, response, next) => {
     });
     const planBefore = stateBefore.plan;
     const appUsages = normalizeAppUsages(context.app_usage);
+    const deviceActivity = normalizeDeviceActivity(context.device_activity);
     for (const appUsage of appUsages) await store.recordAppUsage(appUsage);
+    if (deviceActivity) await store.recordDeviceActivity(deviceActivity);
+    const stateWithUsage = deviceActivity || appUsages.length ? await store.bootstrap() : stateBefore;
     const usageHistory = [
       ...appUsages,
-      ...(Array.isArray(stateBefore.app_usage_daily) ? stateBefore.app_usage_daily : [])
+      ...(Array.isArray(stateWithUsage.app_usage_daily) ? stateWithUsage.app_usage_daily : [])
     ].slice(0, 30);
     const contextText = JSON.stringify({
       now: planBefore.now,
@@ -935,6 +1042,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       current_task: planBefore.current_task,
       deferred_tasks: planBefore.deferred.slice(0, 8),
       app_usage: { current: appUsages, daily_history: usageHistory },
+      sleep_wake_from_phone: stateWithUsage.sleep_wake_summary || null,
       recent_client_context: {
         now: stringValue(context.now, 40),
         note: stringValue(context.note, 500)
@@ -989,7 +1097,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         provider,
         model: provider.model,
         temperature: 0.45,
-        ...(aiReasoningEffort ? { reasoning_effort: aiReasoningEffort } : {}),
+        ...(provider.reasoning_effort ? { reasoning_effort: provider.reasoning_effort } : {}),
         response_format: { type: 'json_object' },
         messages: [
           { role: 'system', content: assistantSystemPrompt() },
@@ -1080,7 +1188,7 @@ app.use((error, _request, response, _next) => {
 const androidApkPath = path.join(appRoot, 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
 app.get('/download/forward.apk', (_request, response) => {
   if (!existsSync(androidApkPath)) return response.status(404).json({ error: 'Android 安装包尚未生成。' });
-  response.download(androidApkPath, 'forward-0.1.0-debug.apk');
+  response.download(androidApkPath, 'forward-0.2.0-debug.apk');
 });
 
 const distPath = path.join(appRoot, 'dist');
