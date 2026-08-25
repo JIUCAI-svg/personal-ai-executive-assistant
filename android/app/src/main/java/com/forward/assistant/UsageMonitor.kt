@@ -44,7 +44,8 @@ data class UsageMonitorSnapshot(
 
 object UsageMonitorStore {
     private const val PREFS = "usage_monitor"
-    private const val DEFAULT_PACKAGE = "com.ss.android.ugc.aweme"
+    // This device has Douyin Lite installed. Users can override the target package in Settings.
+    private const val DEFAULT_PACKAGE = "com.ss.android.ugc.aweme.lite"
     private const val DEFAULT_APP_NAME = "抖音"
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

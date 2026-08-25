@@ -349,6 +349,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         createNotificationChannel()
         setContent { ForwardApp(this) }
+        if (UsageMonitorStore.enabled(this) && UsageMonitorPermissions.hasUsageAccess(this)) {
+            ContextCompat.startForegroundService(this, Intent(this, UsageMonitorService::class.java))
+        }
     }
 
     private fun createNotificationChannel() {
