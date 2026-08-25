@@ -44,7 +44,7 @@ android {
     }
     val aiGatewayUrl = (providers.gradleProperty("aiGatewayUrl").orNull
         ?: localProperties.getProperty("aiGatewayUrl")
-        ?: "").replace("\\", "\\\\").replace("\"", "\\\"")
+        ?: "http://81.69.10.100/forward-assistant/api/assistant/respond").replace("\\", "\\\\").replace("\"", "\\\"")
     val aiGatewayToken = (providers.gradleProperty("aiGatewayToken").orNull
         ?: localProperties.getProperty("aiGatewayToken")
         ?: "").replace("\\", "\\\\").replace("\"", "\\\"")

@@ -20,6 +20,12 @@ cd E:\ACE\personal-ai-executive-assistant\android
 
 产物位置：`app\build\outputs\apk\debug\app-debug.apk`。
 
+默认 AI 网关地址为云端公网 IP：
+`http://81.69.10.100/forward-assistant/api/assistant/respond`
+
+如需本地覆盖地址或令牌，在被 Git 忽略的 `local.properties` 中配置
+`aiGatewayUrl` 和 `aiGatewayToken`。
+
 ## 数据边界
 
 当前版本是离线原生 MVP。电脑上的 Obsidian 桥接仍在 Web 端运行；后续接入 Supabase 后，Android 会读取云端同步的任务、计划、对话和知识库索引。
