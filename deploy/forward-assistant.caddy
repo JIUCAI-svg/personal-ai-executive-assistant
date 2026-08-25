@@ -1,0 +1,15 @@
+forward.81-69-10-100.sslip.io {
+    bind 10.0.0.14
+    encode zstd gzip
+
+    @api path /api/*
+    handle @api {
+        reverse_proxy 127.0.0.1:8787
+    }
+
+    handle {
+        root * /srv/forward-assistant/app/dist
+        try_files {path} /index.html
+        file_server
+    }
+}

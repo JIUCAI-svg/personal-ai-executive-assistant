@@ -9,6 +9,11 @@ import {
 } from 'lucide-react';
 import './styles.css';
 
+const appBasePath = String(import.meta.env.BASE_URL || '/').replace(/\/$/, '');
+function appPath(path) {
+  return `${appBasePath}${path}`;
+}
+
 const modes = [
   { id: 'daily_planning', icon: CalendarDays, label: '每日规划', description: '读取今日任务、时间、进度和复盘', defaultMemory: '今日计划、补考、近期复盘' },
   { id: 'assistant', icon: Sparkles, label: '普通助手', description: '了解你的长期目标和近期动态', defaultMemory: '长期目标与近期记录' },
@@ -129,7 +134,7 @@ function App() {
     if (session?.access_token && includeAuthentication) {
       headers.set('Authorization', `Bearer ${session.access_token}`);
     }
-    return fetch(path, { ...options, headers });
+    return fetch(appPath(path), { ...options, headers });
   }
 
   async function loadAssistantState(forceAuthentication = false) {
@@ -205,7 +210,7 @@ function App() {
     let unsubscribe = () => {};
     async function initializeAuthentication() {
       try {
-        const response = await fetch('/api/auth/config');
+        const response = await fetch(appPath('/api/auth/config'));
         const config = await response.json();
         if (!response.ok || !config.configured) {
           if (active) setSyncStatus({ mode: 'unavailable', detail: 'Supabase 尚未配置，本机模式可继续使用' });
@@ -248,8 +253,8 @@ function App() {
   async function loadVault(includeDocuments = false) {
     try {
       setVaultError('');
-      const requests = [fetch('/api/vault/status')];
-      if (includeDocuments) requests.push(fetch('/api/vault/documents'));
+      const requests = [fetch(appPath('/api/vault/status'))];
+      if (includeDocuments) requests.push(fetch(appPath('/api/vault/documents')));
       const responses = await Promise.all(requests);
       const status = await responses[0].json();
       if (!responses[0].ok) throw new Error(status.error || '知识库未连接');
@@ -267,7 +272,7 @@ function App() {
 
   useEffect(() => {
     loadVault();
-    const events = new EventSource('/api/vault/events');
+    const events = new EventSource(appPath('/api/vault/events'));
     events.addEventListener('vault-change', () => loadVault(showVault));
     events.onerror = () => events.close();
     return () => events.close();
@@ -280,7 +285,7 @@ function App() {
 
   async function openDocument(id) {
     try {
-      const response = await fetch(`/api/vault/documents/${id}`);
+      const response = await fetch(appPath(`/api/vault/documents/${id}`));
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '无法读取文档');
       setSelectedDocument(payload.document);
