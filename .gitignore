@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-ip/
 .env.local
 .playwright-cli/
 .tooling/
