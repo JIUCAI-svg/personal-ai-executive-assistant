@@ -33,6 +33,9 @@ import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
+private const val USAGE_CHECK_INTERVAL_MS = 5 * 60 * 1000L
+private const val USAGE_UPLOAD_INTERVAL_MS = 15 * 60 * 1000L
+
 data class UsageMonitorSnapshot(
     val enabled: Boolean,
     val packageName: String,
@@ -126,7 +129,7 @@ object UsageMonitorStore {
 
     fun shouldUpload(context: Context): Boolean {
         val lastAttempt = prefs(context).getLong("usage_upload_attempt", 0L)
-        return System.currentTimeMillis() - lastAttempt >= 5 * 60 * 1000L
+        return System.currentTimeMillis() - lastAttempt >= USAGE_UPLOAD_INTERVAL_MS
     }
 
     fun markUploadAttempt(context: Context) {
@@ -181,7 +184,7 @@ class UsageMonitorService : Service() {
     private suspend fun monitorLoop() {
         while (serviceScope.isActive) {
             runCatching { updateUsage() }
-            delay(30_000)
+            delay(USAGE_CHECK_INTERVAL_MS)
         }
     }
 
