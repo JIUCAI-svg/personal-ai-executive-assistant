@@ -1,9 +1,9 @@
 package com.forward.assistant
 
+import android.app.AppOpsManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.AppOpsManager
 import android.app.PendingIntent
 import android.app.Service
 import android.app.usage.UsageEvents
@@ -11,6 +11,8 @@ import android.app.usage.UsageStatsManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
 import android.os.Process
@@ -25,6 +27,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -36,24 +39,56 @@ import java.time.format.DateTimeFormatter
 private const val USAGE_CHECK_INTERVAL_MS = 5 * 60 * 1000L
 private const val USAGE_UPLOAD_INTERVAL_MS = 15 * 60 * 1000L
 
-data class UsageMonitorSnapshot(
-    val enabled: Boolean,
-    val packageName: String,
+data class InstalledUsageApp(
     val appName: String,
+    val packageName: String
+)
+
+data class UsagePackageSummary(
+    val appName: String,
+    val packageName: String,
+    val minutes: Int
+)
+
+data class UsageAppSnapshot(
+    val appName: String,
+    val packageName: String,
     val dailyMinutes: Int,
     val currentSessionMinutes: Int,
     val dailyLimitMinutes: Int,
     val sessionLimitMinutes: Int,
     val isInForeground: Boolean,
+    val sessionStartedAt: Long = 0L
+)
+
+data class UsageMonitorSnapshot(
+    val enabled: Boolean,
+    val targetApps: List<UsageAppSnapshot>,
+    val autoTopTen: Boolean,
+    val topApps: List<UsagePackageSummary>,
     val lastEvent: String,
     val updatedAt: String
-)
+) {
+    private val primary get() = targetApps.firstOrNull()
+    val packageName get() = primary?.packageName.orEmpty()
+    val appName get() = primary?.appName ?: "未选择关注应用"
+    val dailyMinutes get() = primary?.dailyMinutes ?: 0
+    val currentSessionMinutes get() = primary?.currentSessionMinutes ?: 0
+    val dailyLimitMinutes get() = primary?.dailyLimitMinutes ?: 0
+    val sessionLimitMinutes get() = primary?.sessionLimitMinutes ?: 0
+    val isInForeground get() = primary?.isInForeground ?: false
+}
 
 object UsageMonitorStore {
     private const val PREFS = "usage_monitor"
-    // This device has Douyin Lite installed. Users can override the target package in Settings.
+    private const val KEY_TARGET_PACKAGES = "target_packages"
+    private const val KEY_TARGET_NAMES = "target_names"
+    private const val KEY_TARGET_USAGE = "target_usage"
+    private const val KEY_TOP_APPS = "top_apps"
+    private const val KEY_AUTO_TOP_TEN = "auto_top_ten"
+    // Existing installs keep this target until the user changes the selection.
     private const val DEFAULT_PACKAGE = "com.ss.android.ugc.aweme.lite"
-    private const val DEFAULT_APP_NAME = "抖音"
+    private const val DEFAULT_APP_NAME = "抖音极速版"
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
@@ -63,15 +98,54 @@ object UsageMonitorStore {
         prefs(context).edit().putBoolean("enabled", enabled).apply()
     }
 
+    fun targetApps(context: Context): List<InstalledUsageApp> {
+        val preferences = prefs(context)
+        if (!preferences.contains(KEY_TARGET_PACKAGES)) {
+            return listOf(InstalledUsageApp(appName(context), packageName(context)))
+        }
+        val names = runCatching { JSONObject(preferences.getString(KEY_TARGET_NAMES, "{}") ?: "{}") }.getOrDefault(JSONObject())
+        return preferences.getStringSet(KEY_TARGET_PACKAGES, emptySet()).orEmpty()
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .map { packageName ->
+                InstalledUsageApp(
+                    names.optString(packageName).trim().ifBlank { packageName },
+                    packageName
+                )
+            }
+            .sortedBy { it.appName.lowercase() }
+    }
+
     fun packageName(context: Context): String = prefs(context).getString("package_name", DEFAULT_PACKAGE).orEmpty()
 
     fun appName(context: Context): String = prefs(context).getString("app_name", DEFAULT_APP_NAME).orEmpty()
 
     fun saveTarget(context: Context, appName: String, packageName: String) {
+        saveTargets(context, listOf(InstalledUsageApp(
+            appName.trim().ifBlank { DEFAULT_APP_NAME },
+            packageName.trim().ifBlank { DEFAULT_PACKAGE }
+        )))
+    }
+
+    fun saveTargets(context: Context, apps: Collection<InstalledUsageApp>) {
+        val cleaned = apps
+            .map { InstalledUsageApp(it.appName.trim().ifBlank { it.packageName }, it.packageName.trim()) }
+            .filter { it.packageName.isNotBlank() }
+            .distinctBy { it.packageName }
+        val names = JSONObject().apply { cleaned.forEach { put(it.packageName, it.appName) } }
+        val first = cleaned.firstOrNull()
         prefs(context).edit()
-            .putString("app_name", appName.trim().ifBlank { DEFAULT_APP_NAME })
-            .putString("package_name", packageName.trim().ifBlank { DEFAULT_PACKAGE })
+            .putStringSet(KEY_TARGET_PACKAGES, cleaned.map { it.packageName }.toSet())
+            .putString(KEY_TARGET_NAMES, names.toString())
+            .putString("app_name", first?.appName ?: DEFAULT_APP_NAME)
+            .putString("package_name", first?.packageName ?: DEFAULT_PACKAGE)
             .apply()
+    }
+
+    fun autoTopTen(context: Context): Boolean = prefs(context).getBoolean(KEY_AUTO_TOP_TEN, true)
+
+    fun saveAutoTopTen(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_AUTO_TOP_TEN, enabled).apply()
     }
 
     fun dailyLimit(context: Context): Int = prefs(context).getInt("daily_limit", 30)
@@ -85,24 +159,58 @@ object UsageMonitorStore {
             .apply()
     }
 
-    fun snapshot(context: Context): UsageMonitorSnapshot = UsageMonitorSnapshot(
-        enabled = enabled(context),
-        packageName = packageName(context),
-        appName = appName(context),
-        dailyMinutes = prefs(context).getInt("daily_minutes", 0),
-        currentSessionMinutes = prefs(context).getInt("session_minutes", 0),
-        dailyLimitMinutes = dailyLimit(context),
-        sessionLimitMinutes = sessionLimit(context),
-        isInForeground = prefs(context).getBoolean("in_foreground", false),
-        lastEvent = prefs(context).getString("last_event", "").orEmpty(),
-        updatedAt = prefs(context).getString("updated_at", "").orEmpty()
-    )
+    fun snapshot(context: Context): UsageMonitorSnapshot {
+        val preferences = prefs(context)
+        val dailyLimit = dailyLimit(context)
+        val sessionLimit = sessionLimit(context)
+        val usageByPackage = readTargetUsage(preferences)
+        val targets = targetApps(context).map { target ->
+            val saved = usageByPackage[target.packageName]
+            UsageAppSnapshot(
+                appName = target.appName,
+                packageName = target.packageName,
+                dailyMinutes = saved?.dailyMinutes ?: 0,
+                currentSessionMinutes = saved?.currentSessionMinutes ?: 0,
+                dailyLimitMinutes = dailyLimit,
+                sessionLimitMinutes = sessionLimit,
+                isInForeground = saved?.isInForeground ?: false
+            )
+        }
+        return UsageMonitorSnapshot(
+            enabled = enabled(context),
+            targetApps = targets,
+            autoTopTen = autoTopTen(context),
+            topApps = readTopApps(preferences),
+            lastEvent = preferences.getString("last_event", "").orEmpty(),
+            updatedAt = preferences.getString("updated_at", "").orEmpty()
+        )
+    }
 
-    fun saveUsage(context: Context, dailyMinutes: Int, sessionMinutes: Int, inForeground: Boolean) {
+    fun saveUsage(context: Context, targetApps: List<UsageAppSnapshot>, topApps: List<UsagePackageSummary>) {
+        val targetUsage = JSONArray().apply {
+            targetApps.forEach { snapshot ->
+                put(JSONObject().apply {
+                    put("app", snapshot.appName)
+                    put("package_name", snapshot.packageName)
+                    put("today_minutes", snapshot.dailyMinutes)
+                    put("current_session_minutes", snapshot.currentSessionMinutes)
+                    put("in_foreground", snapshot.isInForeground)
+                    put("session_started_at", snapshot.sessionStartedAt)
+                })
+            }
+        }
+        val topUsage = JSONArray().apply {
+            topApps.forEach { app ->
+                put(JSONObject().apply {
+                    put("app", app.appName)
+                    put("package_name", app.packageName)
+                    put("today_minutes", app.minutes)
+                })
+            }
+        }
         prefs(context).edit()
-            .putInt("daily_minutes", dailyMinutes)
-            .putInt("session_minutes", sessionMinutes)
-            .putBoolean("in_foreground", inForeground)
+            .putString(KEY_TARGET_USAGE, targetUsage.toString())
+            .putString(KEY_TOP_APPS, topUsage.toString())
             .putString("updated_at", LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
             .apply()
     }
@@ -111,20 +219,20 @@ object UsageMonitorStore {
         prefs(context).edit().putString("last_event", event).apply()
     }
 
-    fun shouldSendDailyReminder(context: Context, date: LocalDate): Boolean {
-        val key = date.toString()
-        return prefs(context).getString("daily_reminder_date", null) != key
+    fun shouldSendDailyReminder(context: Context, date: LocalDate, packageName: String): Boolean {
+        val key = "daily_reminder_$packageName"
+        return prefs(context).getString(key, null) != date.toString()
     }
 
-    fun markDailyReminderSent(context: Context, date: LocalDate) {
-        prefs(context).edit().putString("daily_reminder_date", date.toString()).apply()
+    fun markDailyReminderSent(context: Context, date: LocalDate, packageName: String) {
+        prefs(context).edit().putString("daily_reminder_$packageName", date.toString()).apply()
     }
 
-    fun shouldSendSessionReminder(context: Context, sessionStart: Long): Boolean =
-        prefs(context).getLong("session_reminder_start", 0L) != sessionStart
+    fun shouldSendSessionReminder(context: Context, sessionStart: Long, packageName: String): Boolean =
+        prefs(context).getLong("session_reminder_$packageName", 0L) != sessionStart
 
-    fun markSessionReminderSent(context: Context, sessionStart: Long) {
-        prefs(context).edit().putLong("session_reminder_start", sessionStart).apply()
+    fun markSessionReminderSent(context: Context, sessionStart: Long, packageName: String) {
+        prefs(context).edit().putLong("session_reminder_$packageName", sessionStart).apply()
     }
 
     fun shouldUpload(context: Context): Boolean {
@@ -134,6 +242,41 @@ object UsageMonitorStore {
 
     fun markUploadAttempt(context: Context) {
         prefs(context).edit().putLong("usage_upload_attempt", System.currentTimeMillis()).apply()
+    }
+
+    private fun readTargetUsage(preferences: android.content.SharedPreferences): Map<String, UsageAppSnapshot> {
+        val result = mutableMapOf<String, UsageAppSnapshot>()
+        val array = runCatching { JSONArray(preferences.getString(KEY_TARGET_USAGE, "[]")) }.getOrDefault(JSONArray())
+        for (index in 0 until array.length()) {
+            val item = array.optJSONObject(index) ?: continue
+            val packageName = item.optString("package_name").trim()
+            if (packageName.isBlank()) continue
+            result[packageName] = UsageAppSnapshot(
+                appName = item.optString("app").ifBlank { packageName },
+                packageName = packageName,
+                dailyMinutes = item.optInt("today_minutes").coerceAtLeast(0),
+                currentSessionMinutes = item.optInt("current_session_minutes").coerceAtLeast(0),
+                dailyLimitMinutes = 0,
+                sessionLimitMinutes = 0,
+                isInForeground = item.optBoolean("in_foreground"),
+                sessionStartedAt = item.optLong("session_started_at")
+            )
+        }
+        return result
+    }
+
+    private fun readTopApps(preferences: android.content.SharedPreferences): List<UsagePackageSummary> {
+        val array = runCatching { JSONArray(preferences.getString(KEY_TOP_APPS, "[]")) }.getOrDefault(JSONArray())
+        return (0 until array.length()).mapNotNull { index ->
+            val item = array.optJSONObject(index) ?: return@mapNotNull null
+            val packageName = item.optString("package_name").trim()
+            if (packageName.isBlank()) return@mapNotNull null
+            UsagePackageSummary(
+                appName = item.optString("app").trim().ifBlank { packageName },
+                packageName = packageName,
+                minutes = item.optInt("today_minutes").coerceAtLeast(0)
+            )
+        }
     }
 }
 
@@ -149,6 +292,26 @@ object UsageMonitorPermissions {
     }
 }
 
+fun installedUsageApps(context: Context): List<InstalledUsageApp> {
+    val packageManager = context.packageManager
+    return packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
+        .asSequence()
+        .filter { application ->
+            application.packageName != context.packageName &&
+                application.flags and ApplicationInfo.FLAG_SYSTEM == 0 &&
+                packageManager.getLaunchIntentForPackage(application.packageName) != null
+        }
+        .map { application ->
+            InstalledUsageApp(
+                application.loadLabel(packageManager).toString().trim().ifBlank { application.packageName },
+                application.packageName
+            )
+        }
+        .distinctBy { it.packageName }
+        .sortedBy { it.appName.lowercase() }
+        .toList()
+}
+
 class UsageMonitorBootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
         if (intent?.action != Intent.ACTION_BOOT_COMPLETED) return
@@ -156,6 +319,14 @@ class UsageMonitorBootReceiver : BroadcastReceiver() {
         ContextCompat.startForegroundService(context, Intent(context, UsageMonitorService::class.java))
     }
 }
+
+private data class UsageCalculation(
+    val packageName: String,
+    val appName: String,
+    var sessionStart: Long = 0L,
+    var totalMillis: Long = 0L,
+    var inForeground: Boolean = false
+)
 
 class UsageMonitorService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -170,6 +341,7 @@ class UsageMonitorService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (!UsageMonitorStore.enabled(this)) stopSelf()
+        else startForeground(UsageMonitorNotification.ONGOING_ID, buildOngoingNotification())
         return START_STICKY
     }
 
@@ -189,60 +361,97 @@ class UsageMonitorService : Service() {
     }
 
     private suspend fun updateUsage() {
-        val targetPackage = UsageMonitorStore.packageName(this)
         val now = System.currentTimeMillis()
         val startOfDay = LocalDate.now().atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
         val usageManager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
-        val events = usageManager.queryEvents(startOfDay, now)
+        val targetApps = UsageMonitorStore.targetApps(this)
+        val targetSnapshots = calculateTargetUsage(usageManager, targetApps, startOfDay, now)
+        val topApps = if (UsageMonitorStore.autoTopTen(this)) calculateTopApps(usageManager, startOfDay, now) else emptyList()
+        UsageMonitorStore.saveUsage(this, targetSnapshots, topApps)
+        val snapshot = UsageMonitorStore.snapshot(this)
+        if (UsageMonitorStore.shouldUpload(this)) uploadUsage(snapshot)
+        sendTargetReminders(targetSnapshots)
+    }
+
+    private fun calculateTargetUsage(
+        usageManager: UsageStatsManager,
+        targetApps: List<InstalledUsageApp>,
+        startOfDay: Long,
+        now: Long
+    ): List<UsageAppSnapshot> {
+        if (targetApps.isEmpty()) return emptyList()
+        val calculations = targetApps.associate { it.packageName to UsageCalculation(it.packageName, it.appName) }.toMutableMap()
+        // Read one extra day so an app left open across midnight still has a valid session start.
+        val events = usageManager.queryEvents(startOfDay - 24 * 60 * 60 * 1000L, now)
         val event = UsageEvents.Event()
-        var sessionStart = 0L
-        var totalMillis = 0L
-        var lastSessionStart = 0L
-        var inForeground = false
         while (events.hasNextEvent()) {
             events.getNextEvent(event)
-            if (event.packageName != targetPackage) continue
+            val calculation = calculations[event.packageName] ?: continue
             when (event.eventType) {
-                UsageEvents.Event.MOVE_TO_FOREGROUND -> {
-                    if (!inForeground) {
-                        sessionStart = event.timeStamp
-                        lastSessionStart = sessionStart
-                        inForeground = true
-                    }
+                UsageEvents.Event.MOVE_TO_FOREGROUND -> if (!calculation.inForeground) {
+                    calculation.sessionStart = event.timeStamp
+                    calculation.inForeground = true
                 }
-                UsageEvents.Event.MOVE_TO_BACKGROUND -> {
-                    if (inForeground) {
-                        totalMillis += (event.timeStamp - sessionStart).coerceAtLeast(0L)
-                        inForeground = false
-                    }
+                UsageEvents.Event.MOVE_TO_BACKGROUND -> if (calculation.inForeground) {
+                    calculation.totalMillis += (event.timeStamp - maxOf(calculation.sessionStart, startOfDay)).coerceAtLeast(0L)
+                    calculation.inForeground = false
                 }
             }
         }
-        val currentSessionMillis = if (inForeground) (now - sessionStart).coerceAtLeast(0L) else 0L
-        val dailyMinutes = ((totalMillis + currentSessionMillis) / 60_000L).toInt()
-        val sessionMinutes = (currentSessionMillis / 60_000L).toInt()
-        UsageMonitorStore.saveUsage(this, dailyMinutes, sessionMinutes, inForeground)
-        if (UsageMonitorStore.shouldUpload(this)) uploadUsage(UsageMonitorStore.snapshot(this))
-
         val dailyLimit = UsageMonitorStore.dailyLimit(this)
-        if (dailyMinutes >= dailyLimit && UsageMonitorStore.shouldSendDailyReminder(this, LocalDate.now())) {
-            UsageMonitorStore.markDailyReminderSent(this, LocalDate.now())
-            UsageMonitorStore.saveEvent(this, "${UsageMonitorStore.appName(this)} 今日累计 ${dailyMinutes} 分钟，超过每日上限 ${dailyLimit} 分钟")
-            UsageMonitorNotification.send(
-                this,
-                "${UsageMonitorStore.appName(this)} 使用已超时",
-                "今天已使用约 ${dailyMinutes} 分钟，超过设定的 ${dailyLimit} 分钟。打开向前重新安排剩余计划。"
+        val sessionLimit = UsageMonitorStore.sessionLimit(this)
+        return targetApps.map { target ->
+            val calculation = calculations.getValue(target.packageName)
+            val currentSessionMillis = if (calculation.inForeground) (now - calculation.sessionStart).coerceAtLeast(0L) else 0L
+            UsageAppSnapshot(
+                appName = target.appName,
+                packageName = target.packageName,
+                dailyMinutes = ((calculation.totalMillis + if (calculation.inForeground) (now - maxOf(calculation.sessionStart, startOfDay)).coerceAtLeast(0L) else 0L) / 60_000L).toInt(),
+                currentSessionMinutes = (currentSessionMillis / 60_000L).toInt(),
+                dailyLimitMinutes = dailyLimit,
+                sessionLimitMinutes = sessionLimit,
+                isInForeground = calculation.inForeground,
+                sessionStartedAt = if (calculation.inForeground) calculation.sessionStart else 0L
             )
         }
-        val sessionLimit = UsageMonitorStore.sessionLimit(this)
-        if (inForeground && sessionMinutes >= sessionLimit && UsageMonitorStore.shouldSendSessionReminder(this, lastSessionStart)) {
-            UsageMonitorStore.markSessionReminderSent(this, lastSessionStart)
-            UsageMonitorStore.saveEvent(this, "${UsageMonitorStore.appName(this)} 当前连续使用 ${sessionMinutes} 分钟，超过连续上限 ${sessionLimit} 分钟")
-            UsageMonitorNotification.send(
-                this,
-                "连续使用时间较长",
-                "你已连续使用${UsageMonitorStore.appName(this)}约 ${sessionMinutes} 分钟，建议停下来休息一下。"
-            )
+    }
+
+    private fun calculateTopApps(usageManager: UsageStatsManager, startOfDay: Long, now: Long): List<UsagePackageSummary> {
+        val installed = installedUsageApps(this).associateBy { it.packageName }
+        return usageManager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startOfDay, now)
+            .asSequence()
+            .mapNotNull { stat ->
+                val app = installed[stat.packageName] ?: return@mapNotNull null
+                val minutes = (stat.totalTimeInForeground / 60_000L).toInt()
+                if (minutes <= 0) null else UsagePackageSummary(app.appName, app.packageName, minutes)
+            }
+            .sortedByDescending { it.minutes }
+            .take(10)
+            .toList()
+    }
+
+    private fun sendTargetReminders(targetSnapshots: List<UsageAppSnapshot>) {
+        targetSnapshots.forEach { target ->
+            if (target.dailyLimitMinutes > 0 && target.dailyMinutes >= target.dailyLimitMinutes && UsageMonitorStore.shouldSendDailyReminder(this, LocalDate.now(), target.packageName)) {
+                UsageMonitorStore.markDailyReminderSent(this, LocalDate.now(), target.packageName)
+                UsageMonitorStore.saveEvent(this, "${target.appName} 今日累计 ${target.dailyMinutes} 分钟，超过每日上限 ${target.dailyLimitMinutes} 分钟")
+                UsageMonitorNotification.send(
+                    this,
+                    "${target.appName} 使用已超时",
+                    "今天已使用约 ${target.dailyMinutes} 分钟，超过设定的 ${target.dailyLimitMinutes} 分钟。打开向前重新安排剩余计划。"
+                )
+            }
+            if (target.isInForeground && target.sessionLimitMinutes > 0 && target.currentSessionMinutes >= target.sessionLimitMinutes) {
+                if (UsageMonitorStore.shouldSendSessionReminder(this, target.sessionStartedAt, target.packageName)) {
+                    UsageMonitorStore.markSessionReminderSent(this, target.sessionStartedAt, target.packageName)
+                    UsageMonitorStore.saveEvent(this, "${target.appName} 当前连续使用 ${target.currentSessionMinutes} 分钟，超过连续上限 ${target.sessionLimitMinutes} 分钟")
+                    UsageMonitorNotification.send(
+                        this,
+                        "连续使用时间较长",
+                        "你已连续使用 ${target.appName} 约 ${target.currentSessionMinutes} 分钟，建议停下来休息一下。"
+                    )
+                }
+            }
         }
     }
 
@@ -256,19 +465,40 @@ class UsageMonitorService : Service() {
             configuredUrl.trimEnd('/') + "/api/assistant/usage"
         }
         val payload = JSONObject().apply {
-            put("app_usage", JSONObject().apply {
-                put("enabled", snapshot.enabled)
-                put("app", snapshot.appName)
-                put("package_name", snapshot.packageName)
-                put("today_minutes", snapshot.dailyMinutes)
-                put("current_session_minutes", snapshot.currentSessionMinutes)
-                put("daily_limit_minutes", snapshot.dailyLimitMinutes)
-                put("session_limit_minutes", snapshot.sessionLimitMinutes)
-                put("in_foreground", snapshot.isInForeground)
-                put("last_event", snapshot.lastEvent)
-                put("updated_at", snapshot.updatedAt)
-                put("date", LocalDate.now().toString())
-                put("source", "android-usage-monitor")
+            put("app_usage", JSONArray().apply {
+                snapshot.targetApps.forEach { target ->
+                    put(JSONObject().apply {
+                        put("enabled", snapshot.enabled)
+                        put("app", target.appName)
+                        put("package_name", target.packageName)
+                        put("today_minutes", target.dailyMinutes)
+                        put("current_session_minutes", target.currentSessionMinutes)
+                        put("daily_limit_minutes", target.dailyLimitMinutes)
+                        put("session_limit_minutes", target.sessionLimitMinutes)
+                        put("in_foreground", target.isInForeground)
+                        put("last_event", snapshot.lastEvent)
+                        put("updated_at", snapshot.updatedAt)
+                        put("date", LocalDate.now().toString())
+                        put("source", "android-usage-monitor")
+                    })
+                }
+                if (snapshot.autoTopTen) {
+                    snapshot.topApps.forEach { app ->
+                        put(JSONObject().apply {
+                            put("enabled", snapshot.enabled)
+                            put("app", app.appName)
+                            put("package_name", app.packageName)
+                            put("today_minutes", app.minutes)
+                            put("current_session_minutes", 0)
+                            put("daily_limit_minutes", 0)
+                            put("session_limit_minutes", 0)
+                            put("in_foreground", false)
+                            put("updated_at", snapshot.updatedAt)
+                            put("date", LocalDate.now().toString())
+                            put("source", "android-auto-top-ten")
+                        })
+                    }
+                }
             })
         }.toString().toByteArray(Charsets.UTF_8)
         val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
@@ -284,8 +514,7 @@ class UsageMonitorService : Service() {
         }
         try {
             connection.outputStream.use { output -> output.write(payload) }
-            val responseCode = connection.responseCode
-            if (responseCode !in 200..299) return@withContext
+            connection.responseCode
         } finally {
             connection.disconnect()
         }
@@ -298,22 +527,29 @@ class UsageMonitorService : Service() {
                 UsageMonitorNotification.CHANNEL_ID,
                 "应用使用提醒",
                 NotificationManager.IMPORTANCE_LOW
-            ).apply { description = "监控指定应用的使用时长" })
+            ).apply { description = "记录关注应用和当天使用时长前十的应用" })
             manager.createNotificationChannel(NotificationChannel(
                 "forward-usage-reminders",
                 "应用使用超时提醒",
                 NotificationManager.IMPORTANCE_DEFAULT
-            ).apply { description = "应用使用达到设定时长后的提醒" })
+            ).apply { description = "关注应用使用达到设定时长后的提醒" })
         }
     }
 
     private fun buildOngoingNotification(): Notification {
         val intent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(this, 1002, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val targets = UsageMonitorStore.targetApps(this)
+        val description = when {
+            targets.isEmpty() && UsageMonitorStore.autoTopTen(this) -> "正在记录当天使用时长前 10 的应用"
+            targets.size == 1 && UsageMonitorStore.autoTopTen(this) -> "正在关注 ${targets.first().appName}，并记录当天前 10"
+            targets.size == 1 -> "正在记录 ${targets.first().appName} 的使用时长"
+            else -> "正在关注 ${targets.size} 个应用，并记录当天前 10"
+        }
         return NotificationCompat.Builder(this, UsageMonitorNotification.CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_forward)
             .setContentTitle("向前 · 使用监控已开启")
-            .setContentText("正在记录 ${UsageMonitorStore.appName(this)} 的使用时长")
+            .setContentText(description)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -339,6 +575,6 @@ object UsageMonitorNotification {
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
-        context.getSystemService(NotificationManager::class.java).notify(REMINDER_ID, notification)
+        context.getSystemService(NotificationManager::class.java).notify("$title:$text".hashCode(), notification)
     }
 }

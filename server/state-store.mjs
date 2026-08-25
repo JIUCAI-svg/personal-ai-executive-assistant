@@ -478,16 +478,35 @@ export class AssistantStateStore {
       const index = state.app_usage_daily.findIndex((item) => item.date === date && item.package_name === packageName);
       if (index >= 0) {
         const previous = state.app_usage_daily[index];
-        state.app_usage_daily[index] = {
+        const preserveTargetMonitor = previous.source === 'android-usage-monitor' && usage.source === 'android-auto-top-ten';
+        const merged = {
           ...previous,
           ...usage,
-          max_session_minutes: Math.max(previous.max_session_minutes || 0, usage.max_session_minutes)
+          today_minutes: Math.max(previous.today_minutes || 0, usage.today_minutes),
+          max_session_minutes: Math.max(previous.max_session_minutes || 0, usage.max_session_minutes),
+          ...(preserveTargetMonitor ? {
+            source: previous.source,
+            current_session_minutes: previous.current_session_minutes,
+            daily_limit_minutes: previous.daily_limit_minutes,
+            session_limit_minutes: previous.session_limit_minutes,
+            in_foreground: previous.in_foreground,
+            last_event: previous.last_event,
+            over_daily_limit: previous.over_daily_limit,
+            over_session_limit: previous.over_session_limit
+          } : {})
         };
+        merged.over_daily_limit = merged.daily_limit_minutes > 0 && merged.today_minutes >= merged.daily_limit_minutes;
+        merged.over_session_limit = merged.session_limit_minutes > 0 && merged.max_session_minutes >= merged.session_limit_minutes;
+        state.app_usage_daily[index] = merged;
       }
       else state.app_usage_daily.push(usage);
+      const retentionStart = new Date(`${nowParts().date}T00:00:00.000Z`);
+      retentionStart.setUTCDate(retentionStart.getUTCDate() - 364);
+      const retentionDate = retentionStart.toISOString().slice(0, 10);
       state.app_usage_daily = state.app_usage_daily
+        .filter((item) => item.date >= retentionDate)
         .sort((left, right) => `${right.date} ${right.updated_at}`.localeCompare(`${left.date} ${left.updated_at}`))
-        .slice(0, 365);
+        .slice(0, 8_000);
       return state.app_usage_daily.find((item) => item.date === date && item.package_name === packageName) || usage;
     });
   }

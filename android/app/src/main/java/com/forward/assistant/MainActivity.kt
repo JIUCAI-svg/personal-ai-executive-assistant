@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -62,6 +63,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -289,17 +291,38 @@ private suspend fun requestAssistant(
                     })
                 }
             })
-            put("app_usage", JSONObject().apply {
-                put("enabled", usageSnapshot.enabled)
-                put("app", usageSnapshot.appName)
-                put("package_name", usageSnapshot.packageName)
-                put("today_minutes", usageSnapshot.dailyMinutes)
-                put("current_session_minutes", usageSnapshot.currentSessionMinutes)
-                put("daily_limit_minutes", usageSnapshot.dailyLimitMinutes)
-                put("session_limit_minutes", usageSnapshot.sessionLimitMinutes)
-                put("in_foreground", usageSnapshot.isInForeground)
-                put("last_event", usageSnapshot.lastEvent)
-                put("updated_at", usageSnapshot.updatedAt)
+            put("app_usage", JSONArray().apply {
+                usageSnapshot.targetApps.forEach { target ->
+                    put(JSONObject().apply {
+                        put("enabled", usageSnapshot.enabled)
+                        put("app", target.appName)
+                        put("package_name", target.packageName)
+                        put("today_minutes", target.dailyMinutes)
+                        put("current_session_minutes", target.currentSessionMinutes)
+                        put("daily_limit_minutes", target.dailyLimitMinutes)
+                        put("session_limit_minutes", target.sessionLimitMinutes)
+                        put("in_foreground", target.isInForeground)
+                        put("last_event", usageSnapshot.lastEvent)
+                        put("updated_at", usageSnapshot.updatedAt)
+                        put("source", "android-usage-monitor")
+                    })
+                }
+                if (usageSnapshot.autoTopTen) {
+                    usageSnapshot.topApps.forEach { app ->
+                        put(JSONObject().apply {
+                            put("enabled", usageSnapshot.enabled)
+                            put("app", app.appName)
+                            put("package_name", app.packageName)
+                            put("today_minutes", app.minutes)
+                            put("current_session_minutes", 0)
+                            put("daily_limit_minutes", 0)
+                            put("session_limit_minutes", 0)
+                            put("in_foreground", false)
+                            put("updated_at", usageSnapshot.updatedAt)
+                            put("source", "android-auto-top-ten")
+                        })
+                    }
+                }
             })
         })
     }
@@ -423,8 +446,22 @@ class MainActivity : ComponentActivity() {
 
     fun usageSnapshot(): UsageMonitorSnapshot = UsageMonitorStore.snapshot(this)
 
+    fun installedUsageApps(): List<InstalledUsageApp> = com.forward.assistant.installedUsageApps(this)
+
+    fun usageTargetApps(): List<InstalledUsageApp> = UsageMonitorStore.targetApps(this)
+
     fun saveUsageMonitorTarget(appName: String, packageName: String) {
         UsageMonitorStore.saveTarget(this, appName, packageName)
+    }
+
+    fun saveUsageMonitorTargets(apps: Collection<InstalledUsageApp>) {
+        UsageMonitorStore.saveTargets(this, apps)
+    }
+
+    fun usageAutoTopTen(): Boolean = UsageMonitorStore.autoTopTen(this)
+
+    fun saveUsageAutoTopTen(enabled: Boolean) {
+        UsageMonitorStore.saveAutoTopTen(this, enabled)
     }
 
     fun saveUsageMonitorLimits(daily: Int, session: Int) {
@@ -873,8 +910,11 @@ private fun AppUsageMonitorCard(
 ) {
     val scope = rememberCoroutineScope()
     var enabled by remember(snapshot.enabled) { mutableStateOf(snapshot.enabled) }
-    var appName by remember(snapshot.appName) { mutableStateOf(snapshot.appName) }
-    var packageName by remember(snapshot.packageName) { mutableStateOf(snapshot.packageName) }
+    val installedApps = remember { activity.installedUsageApps() }
+    var selectedPackages by remember(snapshot.targetApps) {
+        mutableStateOf(snapshot.targetApps.map { it.packageName }.toSet())
+    }
+    var autoTopTen by remember(snapshot.autoTopTen) { mutableStateOf(snapshot.autoTopTen) }
     var dailyLimit by remember(snapshot.dailyLimitMinutes) { mutableStateOf(snapshot.dailyLimitMinutes.toString()) }
     var sessionLimit by remember(snapshot.sessionLimitMinutes) { mutableStateOf(snapshot.sessionLimitMinutes.toString()) }
 
@@ -889,7 +929,7 @@ private fun AppUsageMonitorCard(
                 Spacer(Modifier.width(9.dp))
                 Column(Modifier.weight(1f)) {
                     Text("应用使用监控", color = Green, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                    Text("只统计你明确指定的应用，不读取屏幕内容", color = Muted, fontSize = 10.sp)
+                    Text("只读取应用名称和使用时长，不读取屏幕内容或对话", color = Muted, fontSize = 10.sp)
                 }
                 Switch(
                     checked = enabled,
@@ -909,21 +949,42 @@ private fun AppUsageMonitorCard(
                 Text("需要一次性开启 Android 的“使用情况访问权限”，才能识别当前应用和累计时长。", color = Color(0xFF7A5F42), fontSize = 10.sp, lineHeight = 15.sp)
                 TextButton(onClick = { activity.openUsageAccessSettings() }) { Text("去开启权限", color = Green, fontSize = 12.sp) }
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(
-                    value = appName,
-                    onValueChange = { appName = it },
-                    label = { Text("应用名称", fontSize = 11.sp) },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f)
-                )
-                OutlinedTextField(
-                    value = packageName,
-                    onValueChange = { packageName = it },
-                    label = { Text("应用包名", fontSize = 11.sp) },
-                    singleLine = true,
-                    modifier = Modifier.weight(1.35f)
-                )
+            Text("关注应用", color = Green, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Text("勾选后才会按下方阈值提醒。可多选。", color = Muted, fontSize = 10.sp)
+            if (installedApps.isEmpty()) {
+                Text("暂未读取到可启动的第三方应用。", color = Color(0xFF7A5F42), fontSize = 10.sp)
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 228.dp)
+                        .border(1.dp, Color(0xFFD4DED8), RoundedCornerShape(7.dp))
+                        .padding(horizontal = 4.dp)
+                ) {
+                    items(installedApps, key = { it.packageName }) { app ->
+                        val checked = app.packageName in selectedPackages
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    selectedPackages = if (checked) selectedPackages - app.packageName else selectedPackages + app.packageName
+                                }
+                                .padding(vertical = 3.dp, horizontal = 3.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = checked,
+                                onCheckedChange = { isChecked ->
+                                    selectedPackages = if (isChecked) selectedPackages + app.packageName else selectedPackages - app.packageName
+                                }
+                            )
+                            Column(Modifier.weight(1f)) {
+                                Text(app.appName, color = Ink, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(app.packageName, color = Muted, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
@@ -941,23 +1002,48 @@ private fun AppUsageMonitorCard(
                     modifier = Modifier.weight(1f)
                 )
             }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("自动记录当天使用前 10", color = Ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    Text("供 AI 和晚间复盘查看，不会逐个发送超时提醒。", color = Muted, fontSize = 10.sp)
+                }
+                Switch(checked = autoTopTen, onCheckedChange = { autoTopTen = it })
+            }
             Button(
                 onClick = {
-                    activity.saveUsageMonitorTarget(appName, packageName)
-                    activity.saveUsageMonitorLimits(dailyLimit.toIntOrNull() ?: 30, sessionLimit.toIntOrNull() ?: 20)
-                    if (enabled && usageAccess) activity.setUsageMonitorEnabled(true)
-                    onChanged()
-                    scope.launch { snackbar.showSnackbar("应用使用监控设置已保存") }
+                    if (selectedPackages.isEmpty() && !autoTopTen) {
+                        scope.launch { snackbar.showSnackbar("请至少选择关注应用，或开启自动前 10 记录") }
+                    } else {
+                        activity.saveUsageMonitorTargets(installedApps.filter { it.packageName in selectedPackages })
+                        activity.saveUsageAutoTopTen(autoTopTen)
+                        activity.saveUsageMonitorLimits(dailyLimit.toIntOrNull() ?: 30, sessionLimit.toIntOrNull() ?: 20)
+                        if (enabled && usageAccess) activity.setUsageMonitorEnabled(true)
+                        onChanged()
+                        scope.launch { snackbar.showSnackbar("应用使用监控设置已保存") }
+                    }
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = Green),
                 modifier = Modifier.fillMaxWidth()
             ) { Text("保存监控设置", fontSize = 12.sp) }
-            Text(
-                "今日 ${snapshot.appName} ${snapshot.dailyMinutes} 分钟 · 当前连续 ${snapshot.currentSessionMinutes} 分钟" +
-                    if (snapshot.updatedAt.isBlank()) "" else " · 已更新",
-                color = Color(0xFF4C7168),
-                fontSize = 10.sp
-            )
+            if (snapshot.targetApps.isNotEmpty()) {
+                snapshot.targetApps.forEach { target ->
+                    Text(
+                        "关注 · ${target.appName} 今日 ${target.dailyMinutes} 分钟 · 当前连续 ${target.currentSessionMinutes} 分钟" +
+                            if (snapshot.updatedAt.isBlank()) "" else " · 已更新",
+                        color = Color(0xFF4C7168),
+                        fontSize = 10.sp
+                    )
+                }
+            }
+            if (snapshot.autoTopTen) {
+                val preview = snapshot.topApps.take(3).joinToString(" · ") { "${it.appName} ${it.minutes} 分" }
+                Text(
+                    if (preview.isBlank()) "当天前 10 会在首次检查后显示" else "今日使用前 10：$preview",
+                    color = Color(0xFF4C7168),
+                    fontSize = 10.sp,
+                    lineHeight = 15.sp
+                )
+            }
             if (snapshot.lastEvent.isNotBlank()) {
                 Text("最近事件：${snapshot.lastEvent}", color = Color(0xFF7A5F42), fontSize = 10.sp, lineHeight = 15.sp)
             }

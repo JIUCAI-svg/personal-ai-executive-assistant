@@ -315,6 +315,17 @@ function normalizeAppUsage(value) {
   };
 }
 
+function normalizeAppUsages(value) {
+  const values = Array.isArray(value) ? value : [value];
+  return values
+    .slice(0, 20)
+    .map((item) => normalizeAppUsage(item))
+    .filter(Boolean)
+    .filter((item, index, all) => all.findIndex((candidate) => (
+      candidate.date === item.date && candidate.package_name === item.package_name && candidate.source === item.source
+    )) === index);
+}
+
 function compactProjectName(value) {
   return stringValue(value, 120).toLocaleLowerCase('zh-CN').replace(/[\s·•，,。.:：-]/g, '');
 }
@@ -821,10 +832,11 @@ app.post('/api/assistant/usage', async (request, response, next) => {
   try {
     if (!bridgeAuthorized(request, response)) return;
     const { store, source } = await requestStateStore(request);
-    const appUsage = normalizeAppUsage(request.body?.app_usage || request.body);
-    if (!appUsage) return response.status(400).json({ error: '需要有效的应用使用摘要。' });
-    const record = await store.recordAppUsage(appUsage);
-    response.json({ ok: true, source, record, history: await store.appUsageHistory(30) });
+    const appUsages = normalizeAppUsages(request.body?.app_usage || request.body);
+    if (!appUsages.length) return response.status(400).json({ error: '需要有效的应用使用摘要。' });
+    const records = [];
+    for (const appUsage of appUsages) records.push(await store.recordAppUsage(appUsage));
+    response.json({ ok: true, source, record: records[0] || null, records, history: await store.appUsageHistory(30) });
   } catch (error) { next(error); }
 });
 
@@ -880,10 +892,10 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       projectName: hydratedThread.mode === 'project' ? projectName : ''
     });
     const planBefore = stateBefore.plan;
-    const appUsage = normalizeAppUsage(context.app_usage);
-    if (appUsage) await store.recordAppUsage(appUsage);
+    const appUsages = normalizeAppUsages(context.app_usage);
+    for (const appUsage of appUsages) await store.recordAppUsage(appUsage);
     const usageHistory = [
-      ...(appUsage ? [appUsage] : []),
+      ...appUsages,
       ...(Array.isArray(stateBefore.app_usage_daily) ? stateBefore.app_usage_daily : [])
     ].slice(0, 30);
     const contextText = JSON.stringify({
@@ -895,7 +907,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       today_plan: planBefore.scheduled.slice(0, 12),
       current_task: planBefore.current_task,
       deferred_tasks: planBefore.deferred.slice(0, 8),
-      app_usage: { current: appUsage, daily_history: usageHistory },
+      app_usage: { current: appUsages, daily_history: usageHistory },
       recent_client_context: {
         now: stringValue(context.now, 40),
         note: stringValue(context.note, 500)
@@ -939,7 +951,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         actionResults: execution.results,
         toolResults: execution.results,
         memoryCandidates: result.memoryCandidates, pendingMemories, memoryRead: knowledge,
-        appUsage,
+        appUsage: appUsages,
         plan: execution.plan, transcriptPath, messageIds: { user: userMessage?.id || null, assistant: assistantMessage?.id || null },
         state: await store.bootstrap()
       });
