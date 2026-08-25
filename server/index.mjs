@@ -54,6 +54,7 @@ const aiProviderRegistry = loadAiProviders(aiProvidersFile, {
 const supabaseUrl = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const supabaseAnonKey = String(process.env.SUPABASE_ANON_KEY || '');
 const app = express();
+app.set('trust proxy', 'loopback');
 const clients = new Set();
 const stateStore = new AssistantStateStore(vaultPath);
 let revision = Date.now();
