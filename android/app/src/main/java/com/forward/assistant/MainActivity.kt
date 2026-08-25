@@ -299,6 +299,7 @@ private suspend fun requestAssistant(
                 put("session_limit_minutes", usageSnapshot.sessionLimitMinutes)
                 put("in_foreground", usageSnapshot.isInForeground)
                 put("last_event", usageSnapshot.lastEvent)
+                put("updated_at", usageSnapshot.updatedAt)
             })
         })
     }
