@@ -8,6 +8,7 @@
     "dev:api": "node --watch server/index.mjs",
     "dev:web": "vite --host 0.0.0.0 --port 4173",
     "build": "vite build",
+    "test": "node --test test/*.test.mjs",
     "preview": "vite preview --host 0.0.0.0",
     "start": "node server/index.mjs"
   },

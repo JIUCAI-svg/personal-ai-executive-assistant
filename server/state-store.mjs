@@ -124,7 +124,12 @@ export function createDefaultAssistantState() {
     memory_items: [],
     daily_reviews: [],
     action_logs: [],
-    app_usage_daily: []
+    app_usage_daily: [],
+    device_activity_daily: [],
+    ai_preferences: { provider_id: '', model: '', reasoning_effort: '' },
+    // These are inferred bounds from Android UsageStats, never an automatic
+    // replacement for the user's planned sleep/wake schedule.
+    sleep_wake_events: []
   };
 }
 
@@ -143,7 +148,10 @@ export function repairAssistantState(source) {
     memory_items: Array.isArray(state.memory_items) ? state.memory_items : [],
     daily_reviews: Array.isArray(state.daily_reviews) ? state.daily_reviews : [],
     action_logs: Array.isArray(state.action_logs) ? state.action_logs : [],
-    app_usage_daily: Array.isArray(state.app_usage_daily) ? state.app_usage_daily : []
+    app_usage_daily: Array.isArray(state.app_usage_daily) ? state.app_usage_daily : [],
+    device_activity_daily: Array.isArray(state.device_activity_daily) ? state.device_activity_daily : [],
+    ai_preferences: { provider_id: '', model: '', reasoning_effort: '', ...(state.ai_preferences || {}) },
+    sleep_wake_events: Array.isArray(state.sleep_wake_events) ? state.sleep_wake_events : []
   };
 }
 
@@ -286,6 +294,66 @@ function buildPlan(state, current = nowParts()) {
   };
 }
 
+function timestampMillis(value) {
+  const normalized = normalizeText(value, 48);
+  if (!normalized) return Number.NaN;
+  const zoned = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(normalized) ? normalized : `${normalized}+08:00`;
+  return Date.parse(zoned);
+}
+
+function clockFromTimestamp(value) {
+  const match = normalizeText(value, 48).match(/T(\d{2}:\d{2})/);
+  return match?.[1] || '';
+}
+
+function inferSleepWakeCandidate(previousDay, currentDay, timestamp) {
+  if (!previousDay?.last_active_at || !currentDay?.first_active_at) return null;
+  const lastMillis = timestampMillis(previousDay.last_active_at);
+  const firstMillis = timestampMillis(currentDay.first_active_at);
+  const gapMinutes = Math.round((firstMillis - lastMillis) / 60_000);
+  if (!Number.isFinite(gapMinutes) || gapMinutes < 150 || gapMinutes > 16 * 60) return null;
+  const sleepTime = clockFromTimestamp(previousDay.last_active_at);
+  const wakeTime = clockFromTimestamp(currentDay.first_active_at);
+  if (!sleepTime || !wakeTime) return null;
+  const firstHour = Number(wakeTime.slice(0, 2));
+  const lastHour = Number(sleepTime.slice(0, 2));
+  const confidence = gapMinutes >= 270 && gapMinutes <= 13 * 60 && firstHour >= 4 && firstHour <= 13 && (lastHour >= 18 || lastHour <= 4)
+    ? 'medium'
+    : 'low';
+  return {
+    id: id(),
+    date: currentDay.date,
+    kind: 'usage_inference',
+    status: 'candidate',
+    sleep_at: previousDay.last_active_at,
+    wake_at: currentDay.first_active_at,
+    sleep_time: sleepTime,
+    wake_time: wakeTime,
+    gap_minutes: gapMinutes,
+    confidence,
+    evidence: {
+      last_foreground_app: previousDay.last_foreground_app || '',
+      first_foreground_app: currentDay.first_foreground_app || '',
+      source: 'android-usage-monitor'
+    },
+    created_at: timestamp,
+    updated_at: timestamp
+  };
+}
+
+function sleepWakeSummary(state) {
+  const events = (state.sleep_wake_events || [])
+    .filter((item) => item.kind === 'usage_inference' && item.status === 'candidate')
+    .slice(0, 7);
+  return {
+    latest: events[0] || null,
+    recent: events,
+    note: events.length
+      ? '这是根据手机前台应用最后/首次活动推断的候选作息，需要用户确认；不会自动改写计划作息。'
+      : '尚未收集到足够的手机应用活动记录来推断作息。'
+  };
+}
+
 export class AssistantStateStore {
   constructor(vaultPath) {
     this.rootPath = path.join(vaultPath, '.forward-assistant');
@@ -319,7 +387,7 @@ export class AssistantStateStore {
 
   async bootstrap() {
     const state = await this.read();
-    return { ...state, plan: buildPlan(state) };
+    return { ...state, plan: buildPlan(state), sleep_wake_summary: sleepWakeSummary(state) };
   }
 
   async createThread(options = {}) {
@@ -410,6 +478,15 @@ export class AssistantStateStore {
       }
       thread.updated_at = isoAt(nowParts().date, nowParts().time);
       return thread;
+    });
+  }
+
+  async updateAiPreferences(preferences = {}) {
+    return this.mutate((state) => {
+      for (const key of ['provider_id', 'model', 'reasoning_effort']) {
+        if (typeof preferences[key] === 'string') state.ai_preferences[key] = normalizeText(preferences[key], 160);
+      }
+      return state.ai_preferences;
     });
   }
 
@@ -514,6 +591,77 @@ export class AssistantStateStore {
   async appUsageHistory(limit = 30) {
     const state = await this.read();
     return state.app_usage_daily.slice(0, Math.max(1, Math.min(365, Number(limit) || 30)));
+  }
+
+  async recordDeviceActivity(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') return null;
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(snapshot.date || '')) ? String(snapshot.date) : nowParts().date;
+    const firstActiveAt = normalizeText(snapshot.first_active_at, 48);
+    const lastActiveAt = normalizeText(snapshot.last_active_at, 48);
+    if (!firstActiveAt && !lastActiveAt) return null;
+    return this.mutate((state) => {
+      const current = isoAt(nowParts().date, nowParts().time);
+      const previous = state.device_activity_daily?.find((item) => item.date === date) || {};
+      const entries = Array.isArray(state.device_activity_daily) ? state.device_activity_daily : [];
+      const activity = {
+        date,
+        first_active_at: firstActiveAt || previous.first_active_at || '',
+        last_active_at: lastActiveAt || previous.last_active_at || '',
+        first_foreground_app: normalizeText(snapshot.first_foreground_app, 120) || previous.first_foreground_app || '',
+        last_foreground_app: normalizeText(snapshot.last_foreground_app, 120) || previous.last_foreground_app || '',
+        updated_at: normalizeText(snapshot.updated_at, 48) || current,
+        source: normalizeText(snapshot.source, 48) || 'android-usage-monitor'
+      };
+      if (previous.first_active_at && (!activity.first_active_at || previous.first_active_at < activity.first_active_at)) {
+        activity.first_active_at = previous.first_active_at;
+        activity.first_foreground_app = previous.first_foreground_app;
+      }
+      if (previous.last_active_at && (!activity.last_active_at || previous.last_active_at > activity.last_active_at)) {
+        activity.last_active_at = previous.last_active_at;
+        activity.last_foreground_app = previous.last_foreground_app;
+      }
+      const index = entries.findIndex((item) => item.date === date);
+      if (index >= 0) entries[index] = activity;
+      else entries.push(activity);
+      entries.sort((left, right) => right.date.localeCompare(left.date));
+      state.device_activity_daily = entries.filter((item) => item.date >= plusDays(nowParts().date, -365)).slice(0, 366);
+
+      const prior = state.device_activity_daily.find((item) => item.date === plusDays(date, -1));
+      const candidate = inferSleepWakeCandidate(prior, activity, current);
+      if (candidate) {
+        const eventIndex = state.sleep_wake_events.findIndex((item) => item.date === date && item.kind === 'usage_inference' && item.status === 'candidate');
+        if (eventIndex >= 0) state.sleep_wake_events[eventIndex] = { ...state.sleep_wake_events[eventIndex], ...candidate, updated_at: current };
+        else state.sleep_wake_events.push(candidate);
+      }
+      state.sleep_wake_events = state.sleep_wake_events
+        .filter((item) => item.date >= plusDays(nowParts().date, -365))
+        .sort((left, right) => `${right.date} ${right.updated_at || right.created_at || ''}`.localeCompare(`${left.date} ${left.updated_at || left.created_at || ''}`))
+        .slice(0, 730);
+      return candidate || activity;
+    });
+  }
+
+  async sleepWakeHistory(limit = 14) {
+    const state = await this.read();
+    return (state.sleep_wake_events || []).slice(0, Math.max(1, Math.min(365, Number(limit) || 14)));
+  }
+
+  async updateSleepWakeEvent(eventId, status, values = {}) {
+    if (!['candidate', 'confirmed', 'dismissed'].includes(status)) throw new Error('无效的作息候选状态。');
+    return this.mutate((state) => {
+      const event = state.sleep_wake_events.find((item) => item.id === eventId);
+      if (!event) return null;
+      event.status = status;
+      if (status === 'confirmed') {
+        const sleepAt = normalizeText(values.sleep_at, 48);
+        const wakeAt = normalizeText(values.wake_at, 48);
+        if (sleepAt) event.sleep_at = sleepAt;
+        if (wakeAt) event.wake_at = wakeAt;
+        event.confirmed_at = isoAt(nowParts().date, nowParts().time);
+      }
+      event.updated_at = isoAt(nowParts().date, nowParts().time);
+      return event;
+    });
   }
 
   async executeActions(actions, context = {}) {
