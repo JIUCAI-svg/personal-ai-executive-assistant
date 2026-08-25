@@ -278,6 +278,14 @@ function assistantAuthorized(request, response) {
   return true;
 }
 
+function bridgeAuthorized(request, response) {
+  if (aiGatewayToken && !isLoopbackRequest(request) && request.get('x-forward-token') !== aiGatewayToken) {
+    response.status(401).json({ error: '桥接访问令牌不匹配。' });
+    return false;
+  }
+  return true;
+}
+
 function stringValue(value, maxLength = 240) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
 }
@@ -301,7 +309,9 @@ function normalizeAppUsage(value) {
     session_limit_minutes: minutes(value.session_limit_minutes),
     in_foreground: Boolean(value.in_foreground),
     last_event: stringValue(value.last_event, 240),
-    updated_at: stringValue(value.updated_at, 40)
+    updated_at: stringValue(value.updated_at, 40),
+    date: /^\d{4}-\d{2}-\d{2}$/.test(String(value.date || '')) ? String(value.date) : dateStamp(),
+    source: stringValue(value.source, 40) || 'android-usage-monitor'
   };
 }
 
@@ -563,7 +573,7 @@ ${assistantToolPrompt()}
 - 用户说“今天不做、跳过、顺延、明天再做”时，使用 defer_task，该任务保留但移到之后；取消和顺延不能混用。
 - 用户说外出或某段时间不可用时，使用 set_unavailable_period；用户说疲惫时，使用 defer_task 推迟高消耗任务，并使用 replan_today。
 - 用户新增一件事时，使用 create_task；不要直接声称它已经加入计划而没有 action。若未给预计时长，按合理的最小可执行时长估计，并在回复中说明。
-- 上下文中的 app_usage 是手机本地监控提供的真实使用摘要，不是可选工具。若该字段存在，必须把它视为当前事实；可以根据今日累计时长、连续时长和上限解释提醒或重排计划，但不要推断用户在应用中看了什么，也不要把每一次使用记录自动沉淀为长期记忆。
+- 上下文中的 app_usage 是手机本地监控提供的真实使用摘要和每日记录，不是可选工具。若 current 或 daily_history 存在，必须把它们视为当前事实；可以根据今日累计时长、连续时长、历史趋势和上限解释提醒或重排计划，但不要推断用户在应用中看了什么，也不要把每一次使用记录自动沉淀为长期记忆。
 - 长期记忆只提取稳定偏好、明确决定、项目里程碑或重要事实；不要把普通闲聊自动写入。
 - 不要编造任务、进度、日期或知识库内容。`;
 }
@@ -807,6 +817,25 @@ app.post('/api/assistant/actions', async (request, response, next) => {
   } catch (error) { next(error); }
 });
 
+app.post('/api/assistant/usage', async (request, response, next) => {
+  try {
+    if (!bridgeAuthorized(request, response)) return;
+    const { store, source } = await requestStateStore(request);
+    const appUsage = normalizeAppUsage(request.body?.app_usage || request.body);
+    if (!appUsage) return response.status(400).json({ error: '需要有效的应用使用摘要。' });
+    const record = await store.recordAppUsage(appUsage);
+    response.json({ ok: true, source, record, history: await store.appUsageHistory(30) });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/assistant/usage', async (request, response, next) => {
+  try {
+    if (!bridgeAuthorized(request, response)) return;
+    const { store, source } = await requestStateStore(request);
+    response.json({ ok: true, source, history: await store.appUsageHistory(request.query.limit) });
+  } catch (error) { next(error); }
+});
+
 app.patch('/api/assistant/memories/:id', async (request, response, next) => {
   try {
     const { store, source } = await requestStateStore(request);
@@ -852,6 +881,11 @@ app.post('/api/assistant/respond', async (request, response, next) => {
     });
     const planBefore = stateBefore.plan;
     const appUsage = normalizeAppUsage(context.app_usage);
+    if (appUsage) await store.recordAppUsage(appUsage);
+    const usageHistory = [
+      ...(appUsage ? [appUsage] : []),
+      ...(Array.isArray(stateBefore.app_usage_daily) ? stateBefore.app_usage_daily : [])
+    ].slice(0, 30);
     const contextText = JSON.stringify({
       now: planBefore.now,
       conversation_mode: hydratedThread.mode,
@@ -861,7 +895,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       today_plan: planBefore.scheduled.slice(0, 12),
       current_task: planBefore.current_task,
       deferred_tasks: planBefore.deferred.slice(0, 8),
-      app_usage: appUsage,
+      app_usage: { current: appUsage, daily_history: usageHistory },
       recent_client_context: {
         now: stringValue(context.now, 40),
         note: stringValue(context.note, 500)

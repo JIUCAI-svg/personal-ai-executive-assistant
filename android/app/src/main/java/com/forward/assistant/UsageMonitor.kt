@@ -24,6 +24,10 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
@@ -119,6 +123,15 @@ object UsageMonitorStore {
     fun markSessionReminderSent(context: Context, sessionStart: Long) {
         prefs(context).edit().putLong("session_reminder_start", sessionStart).apply()
     }
+
+    fun shouldUpload(context: Context): Boolean {
+        val lastAttempt = prefs(context).getLong("usage_upload_attempt", 0L)
+        return System.currentTimeMillis() - lastAttempt >= 5 * 60 * 1000L
+    }
+
+    fun markUploadAttempt(context: Context) {
+        prefs(context).edit().putLong("usage_upload_attempt", System.currentTimeMillis()).apply()
+    }
 }
 
 object UsageMonitorPermissions {
@@ -172,7 +185,7 @@ class UsageMonitorService : Service() {
         }
     }
 
-    private fun updateUsage() {
+    private suspend fun updateUsage() {
         val targetPackage = UsageMonitorStore.packageName(this)
         val now = System.currentTimeMillis()
         val startOfDay = LocalDate.now().atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
@@ -206,6 +219,7 @@ class UsageMonitorService : Service() {
         val dailyMinutes = ((totalMillis + currentSessionMillis) / 60_000L).toInt()
         val sessionMinutes = (currentSessionMillis / 60_000L).toInt()
         UsageMonitorStore.saveUsage(this, dailyMinutes, sessionMinutes, inForeground)
+        if (UsageMonitorStore.shouldUpload(this)) uploadUsage(UsageMonitorStore.snapshot(this))
 
         val dailyLimit = UsageMonitorStore.dailyLimit(this)
         if (dailyMinutes >= dailyLimit && UsageMonitorStore.shouldSendDailyReminder(this, LocalDate.now())) {
@@ -226,6 +240,51 @@ class UsageMonitorService : Service() {
                 "连续使用时间较长",
                 "你已连续使用${UsageMonitorStore.appName(this)}约 ${sessionMinutes} 分钟，建议停下来休息一下。"
             )
+        }
+    }
+
+    private suspend fun uploadUsage(snapshot: UsageMonitorSnapshot) = withContext(Dispatchers.IO) {
+        UsageMonitorStore.markUploadAttempt(this@UsageMonitorService)
+        val configuredUrl = BuildConfig.AI_GATEWAY_URL.trim()
+        if (configuredUrl.isBlank()) return@withContext
+        val endpoint = if (configuredUrl.endsWith("/api/assistant/respond")) {
+            configuredUrl.removeSuffix("/api/assistant/respond") + "/api/assistant/usage"
+        } else {
+            configuredUrl.trimEnd('/') + "/api/assistant/usage"
+        }
+        val payload = JSONObject().apply {
+            put("app_usage", JSONObject().apply {
+                put("enabled", snapshot.enabled)
+                put("app", snapshot.appName)
+                put("package_name", snapshot.packageName)
+                put("today_minutes", snapshot.dailyMinutes)
+                put("current_session_minutes", snapshot.currentSessionMinutes)
+                put("daily_limit_minutes", snapshot.dailyLimitMinutes)
+                put("session_limit_minutes", snapshot.sessionLimitMinutes)
+                put("in_foreground", snapshot.isInForeground)
+                put("last_event", snapshot.lastEvent)
+                put("updated_at", snapshot.updatedAt)
+                put("date", LocalDate.now().toString())
+                put("source", "android-usage-monitor")
+            })
+        }.toString().toByteArray(Charsets.UTF_8)
+        val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 5_000
+            readTimeout = 8_000
+            doOutput = true
+            useCaches = false
+            setFixedLengthStreamingMode(payload.size)
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            setRequestProperty("Connection", "close")
+            if (BuildConfig.AI_GATEWAY_TOKEN.isNotBlank()) setRequestProperty("x-forward-token", BuildConfig.AI_GATEWAY_TOKEN)
+        }
+        try {
+            connection.outputStream.use { output -> output.write(payload) }
+            val responseCode = connection.responseCode
+            if (responseCode !in 200..299) return@withContext
+        } finally {
+            connection.disconnect()
         }
     }
 

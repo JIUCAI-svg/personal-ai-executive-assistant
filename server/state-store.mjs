@@ -123,7 +123,8 @@ export function createDefaultAssistantState() {
     messages: [],
     memory_items: [],
     daily_reviews: [],
-    action_logs: []
+    action_logs: [],
+    app_usage_daily: []
   };
 }
 
@@ -141,7 +142,8 @@ export function repairAssistantState(source) {
     messages: Array.isArray(state.messages) ? state.messages : [],
     memory_items: Array.isArray(state.memory_items) ? state.memory_items : [],
     daily_reviews: Array.isArray(state.daily_reviews) ? state.daily_reviews : [],
-    action_logs: Array.isArray(state.action_logs) ? state.action_logs : []
+    action_logs: Array.isArray(state.action_logs) ? state.action_logs : [],
+    app_usage_daily: Array.isArray(state.app_usage_daily) ? state.app_usage_daily : []
   };
 }
 
@@ -447,6 +449,52 @@ export class AssistantStateStore {
       state.memory_items.push(...created);
       return created;
     });
+  }
+
+  async recordAppUsage(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object' || !snapshot.app) return null;
+    return this.mutate((state) => {
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(String(snapshot.date || ''))
+        ? String(snapshot.date)
+        : nowParts().date;
+      const packageName = normalizeText(snapshot.package_name, 160);
+      const app = normalizeText(snapshot.app, 120);
+      const usage = {
+        date,
+        app,
+        package_name: packageName,
+        today_minutes: Math.max(0, Math.min(1440, Number(snapshot.today_minutes) || 0)),
+        current_session_minutes: Math.max(0, Math.min(1440, Number(snapshot.current_session_minutes) || 0)),
+        max_session_minutes: Math.max(0, Math.min(1440, Number(snapshot.current_session_minutes) || 0)),
+        daily_limit_minutes: Math.max(0, Math.min(1440, Number(snapshot.daily_limit_minutes) || 0)),
+        session_limit_minutes: Math.max(0, Math.min(1440, Number(snapshot.session_limit_minutes) || 0)),
+        in_foreground: Boolean(snapshot.in_foreground),
+        last_event: normalizeText(snapshot.last_event, 240),
+        updated_at: normalizeText(snapshot.updated_at, 40) || isoAt(nowParts().date, nowParts().time),
+        source: normalizeText(snapshot.source, 40) || 'android-usage-monitor'
+      };
+      usage.over_daily_limit = usage.daily_limit_minutes > 0 && usage.today_minutes >= usage.daily_limit_minutes;
+      usage.over_session_limit = usage.session_limit_minutes > 0 && usage.max_session_minutes >= usage.session_limit_minutes;
+      const index = state.app_usage_daily.findIndex((item) => item.date === date && item.package_name === packageName);
+      if (index >= 0) {
+        const previous = state.app_usage_daily[index];
+        state.app_usage_daily[index] = {
+          ...previous,
+          ...usage,
+          max_session_minutes: Math.max(previous.max_session_minutes || 0, usage.max_session_minutes)
+        };
+      }
+      else state.app_usage_daily.push(usage);
+      state.app_usage_daily = state.app_usage_daily
+        .sort((left, right) => `${right.date} ${right.updated_at}`.localeCompare(`${left.date} ${left.updated_at}`))
+        .slice(0, 365);
+      return state.app_usage_daily.find((item) => item.date === date && item.package_name === packageName) || usage;
+    });
+  }
+
+  async appUsageHistory(limit = 30) {
+    const state = await this.read();
+    return state.app_usage_daily.slice(0, Math.max(1, Math.min(365, Number(limit) || 30)));
   }
 
   async executeActions(actions, context = {}) {
