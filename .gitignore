@@ -2,6 +2,7 @@ node_modules/
 dist/
 dist-ip/
 .env.local
+.ai-providers.json
 .playwright-cli/
 .tooling/
 android/.gradle/

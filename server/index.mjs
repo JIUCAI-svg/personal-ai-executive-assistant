@@ -8,6 +8,7 @@ import express from 'express';
 import matter from 'gray-matter';
 import { AssistantStateStore } from './state-store.mjs';
 import { SupabaseStateStore } from './supabase-state-store.mjs';
+import { loadAiProviders, providerCatalog, selectAiProvider } from './ai-providers.mjs';
 import {
   ASSISTANT_TOOL_NAMES,
   assistantMcpTools,
@@ -41,10 +42,18 @@ const aiReasoningEffort = ['low', 'medium', 'high'].includes(process.env.AI_REAS
   : '';
 const aiMaxRetries = 6;
 const aiGatewayToken = String(process.env.AI_GATEWAY_TOKEN || '');
+const aiProvidersFile = path.resolve(process.env.AI_PROVIDERS_FILE || path.join(appRoot, '.ai-providers.json'));
+const aiProviderRegistry = loadAiProviders(aiProvidersFile, {
+  active_profile: process.env.AI_ACTIVE_PROFILE,
+  base_url: aiBaseUrl,
+  api_key: aiApiKey,
+  model: aiModel,
+  id: 'default',
+  name: '默认 AI 网关'
+});
 const supabaseUrl = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const supabaseAnonKey = String(process.env.SUPABASE_ANON_KEY || '');
 const app = express();
-app.set('trust proxy', 'loopback');
 const clients = new Set();
 const stateStore = new AssistantStateStore(vaultPath);
 let revision = Date.now();
@@ -268,11 +277,16 @@ function isLoopbackRequest(request) {
 }
 
 function assistantAuthorized(request, response) {
-  if (!aiBaseUrl || !aiApiKey || !aiModel) {
+  if (!Object.keys(aiProviderRegistry.profiles).length) {
     response.status(503).json({ error: 'AI 网关尚未配置。' });
     return false;
   }
-  if (aiGatewayToken && !isLoopbackRequest(request) && request.get('x-forward-token') !== aiGatewayToken) {
+  const origin = request.get('origin');
+  const sameOrigin = origin && (() => {
+    try { return new URL(origin).host === request.get('host'); } catch { return false; }
+  })();
+  const browserSameOrigin = sameOrigin || request.get('sec-fetch-site') === 'same-origin';
+  if (aiGatewayToken && !isLoopbackRequest(request) && !browserSameOrigin && request.get('x-forward-token') !== aiGatewayToken) {
     response.status(401).json({ error: 'AI 网关访问令牌不匹配。' });
     return false;
   }
@@ -595,17 +609,20 @@ function waitForAiRetry(attempt) {
 }
 
 async function requestAssistantModel(payload) {
+  const provider = payload.provider;
+  const requestPayload = { ...payload };
+  delete requestPayload.provider;
   let lastError = null;
   for (let retry = 0; retry <= aiMaxRetries; retry += 1) {
     if (retry > 0) await waitForAiRetry(retry);
     try {
-      const upstream = await fetch(`${aiBaseUrl}/chat/completions`, {
+      const upstream = await fetch(`${provider.base_url}/chat/completions`, {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${aiApiKey}`,
+          Authorization: `Bearer ${provider.api_key}`,
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(requestPayload),
         signal: AbortSignal.timeout(45_000)
       });
       const upstreamBody = await upstream.json().catch(() => null);
@@ -629,7 +646,8 @@ app.get('/api/assistant/status', (request, response) => {
   if (!assistantAuthorized(request, response)) return;
   response.json({
     ok: true,
-    model: aiModel,
+    model: aiProviderRegistry.profiles[aiProviderRegistry.active]?.selected_model || aiModel,
+    providers: providerCatalog(aiProviderRegistry),
     provider: 'OpenAI-compatible relay',
     configured: true,
     tools: assistantToolCatalog(),
@@ -641,6 +659,11 @@ app.get('/api/assistant/status', (request, response) => {
 app.get('/api/assistant/tools', (request, response) => {
   if (!assistantAuthorized(request, response)) return;
   response.json({ ok: true, tools: assistantToolCatalog(), skills: assistantSkillCatalog() });
+});
+
+app.get('/api/assistant/providers', (request, response) => {
+  if (!assistantAuthorized(request, response)) return;
+  response.json({ ok: true, active: aiProviderRegistry.active, providers: providerCatalog(aiProviderRegistry) });
 });
 
 function mcpResponse(id, result) {
@@ -872,6 +895,8 @@ app.post('/api/assistant/respond', async (request, response, next) => {
     const body = request.body || {};
     const message = stringValue(body.message, 4000);
     if (!message) return response.status(400).json({ error: '需要一条消息。' });
+    const provider = selectAiProvider(aiProviderRegistry, body.provider_id || body.provider, body.model, aiModel);
+    if (!provider) return response.status(503).json({ error: '尚未配置可用的 AI 提供商或模型。', code: 'AI_PROVIDER_NOT_CONFIGURED' });
 
     const thread = await resolveConversationThread(store, body);
     const stateBefore = await store.bootstrap();
@@ -947,7 +972,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         { role: 'user', content: message }, { role: 'assistant', content: result.reply }
       ]);
       return response.json({
-        ok: true, source, degraded, model: aiModel, thread: hydratedThread, reply: result.reply, actions: result.actions,
+        ok: true, source, degraded, provider: provider.id, provider_name: provider.name, model: provider.model, thread: hydratedThread, reply: result.reply, actions: result.actions,
         toolCalls: result.actions.map((action) => ({ name: action.type, arguments: { ...action } })),
         actionResults: execution.results,
         toolResults: execution.results,
@@ -960,7 +985,8 @@ app.post('/api/assistant/respond', async (request, response, next) => {
 
     try {
       const { result, attempts } = await requestAssistantModel({
-        model: aiModel,
+        provider,
+        model: provider.model,
         temperature: 0.45,
         ...(aiReasoningEffort ? { reasoning_effort: aiReasoningEffort } : {}),
         response_format: { type: 'json_object' },

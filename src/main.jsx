@@ -110,6 +110,10 @@ function App() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [authBusy, setAuthBusy] = useState(false);
+  const [aiProviders, setAiProviders] = useState([]);
+  const [selectedProviderId, setSelectedProviderId] = useState('');
+  const [selectedModel, setSelectedModel] = useState('');
+  const [showAiSettings, setShowAiSettings] = useState(false);
   const endRef = useRef(null);
 
   const mode = modes.find((item) => item.id === conversationMode) || modes[0];
@@ -127,6 +131,7 @@ function App() {
   const planned = plan.filter((item) => !['done', 'deferred', 'cancelled'].includes(item.state));
   const scheduleMinutes = planned.reduce((total, item) => total + item.duration, 0);
   const flexible = plan.filter((item) => item.state === 'flex' || item.state === 'deferred');
+  const selectedProvider = aiProviders.find((item) => item.id === selectedProviderId) || aiProviders[0] || null;
 
   async function apiFetch(path, options = {}, authentication = null) {
     const headers = new Headers(options.headers || {});
@@ -162,6 +167,21 @@ function App() {
       }
     } catch (error) {
       setNotice(error.message || '读取对话历史失败');
+    }
+  }
+
+  async function loadAiProviders() {
+    try {
+      const response = await apiFetch('/api/assistant/providers');
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '读取 AI 提供商失败');
+      const providers = payload.providers || [];
+      setAiProviders(providers);
+      const active = providers.find((item) => item.active) || providers[0];
+      setSelectedProviderId((current) => current || active?.id || '');
+      setSelectedModel((current) => current || active?.selected_model || active?.models?.[0] || '');
+    } catch (error) {
+      setNotice(error.message || 'AI 提供商暂时不可用');
     }
   }
 
@@ -240,6 +260,7 @@ function App() {
   useEffect(() => {
     if (!authReady) return;
     refreshSync(session);
+    loadAiProviders();
   }, [authReady, session]);
 
   useEffect(() => {
@@ -362,7 +383,9 @@ function App() {
             save_full_conversation: saveTranscript,
             allow_memory_distillation: distillMemory
           },
-          context: { current_task_id: current?.id || null }
+          context: { current_task_id: current?.id || null },
+          provider_id: selectedProviderId || undefined,
+          model: selectedModel || undefined
         })
       });
       const payload = await response.json();
@@ -595,7 +618,7 @@ function App() {
             <button className={`notify-button ${notificationStatus === 'granted' ? 'enabled' : ''}`} onClick={notificationStatus === 'granted' ? sendTestNotification : requestNotifications}>
               <Bell size={16} /> <span>{notificationStatus === 'granted' ? '提醒已开启' : '开启提醒'}</span>
             </button>
-            <button className="icon-button"><Settings2 size={19} /></button>
+            <button className="icon-button" onClick={() => setShowAiSettings(true)} aria-label="AI 设置"><Settings2 size={19} /></button>
           </div>
           {showConversationOptions && (
             <section className="conversation-popover">
@@ -686,6 +709,7 @@ function App() {
       {showNewConversation && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="新建对话"><button className="modal-backdrop" onClick={() => setShowNewConversation(false)} aria-label="关闭新建对话" /><section className="new-conversation-modal"><div className="modal-header"><div><span>新建对话</span><p>选择 AI 本次可以了解什么。</p></div><button className="icon-button" onClick={() => setShowNewConversation(false)} aria-label="关闭"><X size={20} /></button></div><div className="new-mode-list">{modes.map((item) => { const Icon = item.icon; return <button key={item.id} onClick={() => selectMode(item.id)}><span className={`new-mode-icon ${item.id}`}><Icon size={20} /></span><span><strong>{item.label}</strong><small>{item.description}</small></span><ChevronRight size={18} /></button>; })}</div></section></div>}
       {showHistory && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="所有对话"><button className="modal-backdrop" onClick={() => setShowHistory(false)} aria-label="关闭对话历史" /><section className="history-modal"><div className="modal-header"><div><span>所有对话</span><p>恢复任一已保存的对话，继续使用原来的上下文。</p></div><button className="icon-button" onClick={() => setShowHistory(false)} aria-label="关闭"><X size={20} /></button></div><div className="history-list">{threads.length ? threads.map((thread) => <button key={thread.id} onClick={() => openThread(thread.id)}><MessageCircle size={17} /><span><strong>{modes.find((item) => item.id === thread.mode)?.label || '对话'}{thread.project_name ? ` · ${thread.project_name}` : ''}</strong><small>{thread.preview || '尚未发送消息'} · {messageTime(thread.updated_at)}</small></span><em>{thread.message_count}</em><ChevronRight size={17} /></button>) : <p className="empty-state">还没有已保存的对话。</p>}</div></section></div>}
       {showVault && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="本地知识库"><button className="modal-backdrop" onClick={() => { setShowVault(false); setSelectedDocument(null); }} aria-label="关闭知识库" /><section className="vault-modal"><div className="modal-header"><div><span>本地知识库</span><p>{vault.connected ? `${vault.documentCount} 篇 Markdown · ${vault.folders.length} 个目录 · 文件改动会自动刷新` : '尚未连接本地桥接服务'}</p></div><button className="icon-button" onClick={() => { setShowVault(false); setSelectedDocument(null); }} aria-label="关闭"><X size={20} /></button></div>{vaultError && <p className="vault-modal-error">{vaultError}</p>}{selectedDocument ? <div className="document-reader"><button className="back-button" onClick={() => setSelectedDocument(null)}>‹ 返回资料列表</button><small>{selectedDocument.relativePath}</small><h2>{selectedDocument.title}</h2><pre>{selectedDocument.content}</pre></div> : <><div className="vault-modal-toolbar"><span className={`connection-status ${vault.connected ? 'online' : ''}`}><span /> {vault.connected ? '已连接到 Obsidian 文件夹' : '等待桥接服务'}</span><button className="icon-button" onClick={() => loadVault(true)} aria-label="刷新知识库"><RefreshCw size={17} /></button></div><div className="vault-document-list">{vaultDocuments.map((document) => <button key={document.id} onClick={() => openDocument(document.id)}><FileText size={18} /><span><strong>{document.title}</strong><small>{document.folder} · {document.preview || '没有正文摘要'}</small></span><ChevronRight size={17} /></button>)}{vault.connected && vaultDocuments.length === 0 && <p className="empty-state">知识库里还没有 Markdown 资料。</p>}</div></>}</section></div>}
+      {showAiSettings && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="AI 提供商设置"><button className="modal-backdrop" onClick={() => setShowAiSettings(false)} aria-label="关闭 AI 设置" /><section className="account-modal"><div className="modal-header"><div><span>AI 提供商与模型</span><p>选择本次助手使用的中转站和模型。密钥只保存在服务器，不会显示在这里。</p></div><button className="icon-button" onClick={() => setShowAiSettings(false)} aria-label="关闭"><X size={20} /></button></div>{aiProviders.length ? <div className="account-form"><label>中转站<select value={selectedProviderId} onChange={(event) => { const id = event.target.value; const provider = aiProviders.find((item) => item.id === id); setSelectedProviderId(id); setSelectedModel(provider?.selected_model || provider?.models?.[0] || ''); }}><option value="">选择中转站</option>{aiProviders.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</select></label><label>模型<select value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)}>{(selectedProvider?.models || []).map((model) => <option value={model} key={model}>{model}</option>)}</select></label><p className="sync-state"><Cloud size={16} /><span>当前：{selectedProvider?.name || '未选择'} · {selectedModel || '未选择模型'}</span></p><button className="primary-command" onClick={() => { setShowAiSettings(false); setNotice(`已切换到 ${selectedProvider?.name || 'AI 提供商'} · ${selectedModel}`); }}>保存本机选择</button></div> : <p className="vault-modal-error">当前没有读取到可用的 AI 提供商。</p>}</section></div>}
       {showAccount && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="云端同步与登录"><button className="modal-backdrop" onClick={() => setShowAccount(false)} aria-label="关闭同步设置" /><section className="account-modal"><div className="modal-header"><div><span>云端同步</span><p>任务、计划、对话、记忆和作息在登录后同步；Obsidian 文件夹继续保留在本机。</p></div><button className="icon-button" onClick={() => setShowAccount(false)} aria-label="关闭"><X size={20} /></button></div>
         {syncStatus.mode === 'cloud' && <div className="sync-state connected"><Cloud size={18} /><div><strong>已连接云端</strong><small>{session?.user?.email || '当前账号'} · {syncStatus.detail}</small></div></div>}
         {syncStatus.mode === 'needs_import' && <div className="sync-state waiting"><Cloud size={18} /><div><strong>云端还没有你的数据</strong><small>本机数据尚未上传，确认后才会同步到此账号。</small></div></div>}
