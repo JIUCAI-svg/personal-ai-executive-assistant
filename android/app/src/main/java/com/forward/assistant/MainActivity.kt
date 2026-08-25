@@ -5,9 +5,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.TimePickerDialog
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -71,6 +73,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -253,7 +256,8 @@ private suspend fun requestAssistant(
     sleepTime: LocalTime,
     wakeTime: LocalTime,
     plan: List<PlanItem>,
-    conversation: List<ChatMessage>
+    conversation: List<ChatMessage>,
+    usageSnapshot: UsageMonitorSnapshot
 ): AssistantResult = withContext(Dispatchers.IO) {
     check(aiGatewayUrl.isNotBlank()) { "AI 网关地址尚未配置" }
     val payload = JSONObject().apply {
@@ -284,6 +288,17 @@ private suspend fun requestAssistant(
                         })
                     })
                 }
+            })
+            put("app_usage", JSONObject().apply {
+                put("enabled", usageSnapshot.enabled)
+                put("app", usageSnapshot.appName)
+                put("package_name", usageSnapshot.packageName)
+                put("today_minutes", usageSnapshot.dailyMinutes)
+                put("current_session_minutes", usageSnapshot.currentSessionMinutes)
+                put("daily_limit_minutes", usageSnapshot.dailyLimitMinutes)
+                put("session_limit_minutes", usageSnapshot.sessionLimitMinutes)
+                put("in_foreground", usageSnapshot.isInForeground)
+                put("last_event", usageSnapshot.lastEvent)
             })
         })
     }
@@ -391,6 +406,35 @@ class MainActivity : ComponentActivity() {
     fun savePlannerFlag(key: String, value: Boolean) {
         getSharedPreferences("planner", Context.MODE_PRIVATE).edit().putBoolean(key, value).apply()
     }
+
+    fun hasUsageAccess(): Boolean {
+        return UsageMonitorPermissions.hasUsageAccess(this)
+    }
+
+    fun openUsageAccessSettings() {
+        startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+    }
+
+    fun usageMonitorEnabled(): Boolean = UsageMonitorStore.enabled(this)
+
+    fun usageSnapshot(): UsageMonitorSnapshot = UsageMonitorStore.snapshot(this)
+
+    fun saveUsageMonitorTarget(appName: String, packageName: String) {
+        UsageMonitorStore.saveTarget(this, appName, packageName)
+    }
+
+    fun saveUsageMonitorLimits(daily: Int, session: Int) {
+        UsageMonitorStore.saveLimits(this, daily, session)
+    }
+
+    fun setUsageMonitorEnabled(enabled: Boolean) {
+        UsageMonitorStore.setEnabled(this, enabled)
+        if (enabled) {
+            ContextCompat.startForegroundService(this, Intent(this, UsageMonitorService::class.java))
+        } else {
+            stopService(Intent(this, UsageMonitorService::class.java))
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -407,10 +451,12 @@ private fun ForwardApp(activity: MainActivity) {
         var input by remember { mutableStateOf(TextFieldValue()) }
         var sleepTime by remember { mutableStateOf(activity.plannerTime("sleep_time", DEFAULT_SLEEP_MINUTES)) }
         var wakeTime by remember { mutableStateOf(activity.plannerTime("wake_time", DEFAULT_WAKE_MINUTES)) }
+        var usageSnapshot by remember { mutableStateOf(activity.usageSnapshot()) }
         var now by remember { mutableStateOf(LocalDateTime.now()) }
         LaunchedEffect(Unit) {
             while (true) {
                 now = LocalDateTime.now()
+                usageSnapshot = activity.usageSnapshot()
                 delay(60_000)
             }
         }
@@ -530,7 +576,7 @@ private fun ForwardApp(activity: MainActivity) {
             aiBusy = true
             scope.launch {
                 val result = runCatching {
-                    requestAssistant(text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation)
+                    requestAssistant(text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot)
                 }.getOrElse { error -> AssistantResult(localReply(text), emptyList()).also { scope.launch { snackbar.showSnackbar(error.message ?: "AI 网关未连接，已使用本地规则") } } }
                 applyActions(result.actions)
                 messages = messages + ChatMessage(true, result.reply)
@@ -580,8 +626,10 @@ private fun ForwardApp(activity: MainActivity) {
                     snackbar,
                     sleepTime,
                     wakeTime,
+                    usageSnapshot,
                     onSleepTime = { time -> sleepTime = time; activity.savePlannerTime("sleep_time", time) },
-                    onWakeTime = { time -> wakeTime = time; activity.savePlannerTime("wake_time", time) }
+                    onWakeTime = { time -> wakeTime = time; activity.savePlannerTime("wake_time", time) },
+                    onUsageSnapshotChanged = { usageSnapshot = activity.usageSnapshot() }
                 )
             }
         }
@@ -754,10 +802,19 @@ private fun SettingsScreen(
     snackbar: SnackbarHostState,
     sleepTime: LocalTime,
     wakeTime: LocalTime,
+    usageSnapshot: UsageMonitorSnapshot,
     onSleepTime: (LocalTime) -> Unit,
-    onWakeTime: (LocalTime) -> Unit
+    onWakeTime: (LocalTime) -> Unit,
+    onUsageSnapshotChanged: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
+    var usageAccess by remember { mutableStateOf(activity.hasUsageAccess()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            usageAccess = activity.hasUsageAccess()
+            delay(1_000)
+        }
+    }
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(padding),
         contentPadding = PaddingValues(20.dp)
@@ -776,6 +833,15 @@ private fun SettingsScreen(
         item { SettingRow(Icons.Default.Refresh, "本地知识库", "电脑端 E: 盘桥接 · 云端同步待接入", false) }
         item { SettingRow(Icons.Default.Bedtime, "免打扰时段", "${formatClock(sleepTime)} - ${formatClock(wakeTime)}", true) }
         item {
+            AppUsageMonitorCard(
+                activity = activity,
+                snackbar = snackbar,
+                snapshot = usageSnapshot,
+                usageAccess = usageAccess,
+                onChanged = onUsageSnapshotChanged
+            )
+        }
+        item {
             Spacer(Modifier.height(18.dp))
             Button(
                 onClick = {
@@ -788,6 +854,108 @@ private fun SettingsScreen(
                 Icon(Icons.Default.NotificationsNone, null, modifier = Modifier.size(17.dp))
                 Spacer(Modifier.width(7.dp))
                 Text("发送测试提醒")
+            }
+        }
+    }
+}
+
+@Composable
+private fun AppUsageMonitorCard(
+    activity: MainActivity,
+    snackbar: SnackbarHostState,
+    snapshot: UsageMonitorSnapshot,
+    usageAccess: Boolean,
+    onChanged: () -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    var enabled by remember(snapshot.enabled) { mutableStateOf(snapshot.enabled) }
+    var appName by remember(snapshot.appName) { mutableStateOf(snapshot.appName) }
+    var packageName by remember(snapshot.packageName) { mutableStateOf(snapshot.packageName) }
+    var dailyLimit by remember(snapshot.dailyLimitMinutes) { mutableStateOf(snapshot.dailyLimitMinutes.toString()) }
+    var sessionLimit by remember(snapshot.sessionLimitMinutes) { mutableStateOf(snapshot.sessionLimitMinutes.toString()) }
+
+    Card(
+        Modifier.fillMaxWidth().padding(top = 14.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF1EC)),
+        shape = RoundedCornerShape(9.dp)
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Visibility, null, tint = Color(0xFF277267), modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(9.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("应用使用监控", color = Green, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                    Text("只统计你明确指定的应用，不读取屏幕内容", color = Muted, fontSize = 10.sp)
+                }
+                Switch(
+                    checked = enabled,
+                    onCheckedChange = { checked ->
+                        if (!usageAccess) {
+                            activity.openUsageAccessSettings()
+                            scope.launch { snackbar.showSnackbar("请先在系统设置中开启使用情况访问权限") }
+                        } else {
+                            enabled = checked
+                            activity.setUsageMonitorEnabled(checked)
+                            onChanged()
+                        }
+                    }
+                )
+            }
+            if (!usageAccess) {
+                Text("需要一次性开启 Android 的“使用情况访问权限”，才能识别当前应用和累计时长。", color = Color(0xFF7A5F42), fontSize = 10.sp, lineHeight = 15.sp)
+                TextButton(onClick = { activity.openUsageAccessSettings() }) { Text("去开启权限", color = Green, fontSize = 12.sp) }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = appName,
+                    onValueChange = { appName = it },
+                    label = { Text("应用名称", fontSize = 11.sp) },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedTextField(
+                    value = packageName,
+                    onValueChange = { packageName = it },
+                    label = { Text("应用包名", fontSize = 11.sp) },
+                    singleLine = true,
+                    modifier = Modifier.weight(1.35f)
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = dailyLimit,
+                    onValueChange = { dailyLimit = it.filter(Char::isDigit).take(4) },
+                    label = { Text("每日上限（分钟）", fontSize = 11.sp) },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedTextField(
+                    value = sessionLimit,
+                    onValueChange = { sessionLimit = it.filter(Char::isDigit).take(4) },
+                    label = { Text("连续上限（分钟）", fontSize = 11.sp) },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            Button(
+                onClick = {
+                    activity.saveUsageMonitorTarget(appName, packageName)
+                    activity.saveUsageMonitorLimits(dailyLimit.toIntOrNull() ?: 30, sessionLimit.toIntOrNull() ?: 20)
+                    if (enabled && usageAccess) activity.setUsageMonitorEnabled(true)
+                    onChanged()
+                    scope.launch { snackbar.showSnackbar("应用使用监控设置已保存") }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Green),
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("保存监控设置", fontSize = 12.sp) }
+            Text(
+                "今日 ${snapshot.appName} ${snapshot.dailyMinutes} 分钟 · 当前连续 ${snapshot.currentSessionMinutes} 分钟" +
+                    if (snapshot.updatedAt.isBlank()) "" else " · 已更新",
+                color = Color(0xFF4C7168),
+                fontSize = 10.sp
+            )
+            if (snapshot.lastEvent.isNotBlank()) {
+                Text("最近事件：${snapshot.lastEvent}", color = Color(0xFF7A5F42), fontSize = 10.sp, lineHeight = 15.sp)
             }
         }
     }
