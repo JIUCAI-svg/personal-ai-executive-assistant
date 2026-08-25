@@ -145,6 +145,7 @@ data class ChatMessage(val fromAssistant: Boolean, val text: String)
 
 data class AssistantAction(val type: String, val time: String? = null, val task: String? = null, val title: String? = null, val start: String? = null, val end: String? = null)
 data class AssistantResult(val reply: String, val actions: List<AssistantAction>)
+data class AiProviderOption(val id: String, val name: String, val models: List<String>, val active: Boolean = false)
 
 private val aiGatewayUrl get() = BuildConfig.AI_GATEWAY_URL
 private val aiGatewayToken get() = BuildConfig.AI_GATEWAY_TOKEN
@@ -259,11 +260,15 @@ private suspend fun requestAssistant(
     wakeTime: LocalTime,
     plan: List<PlanItem>,
     conversation: List<ChatMessage>,
-    usageSnapshot: UsageMonitorSnapshot
+    usageSnapshot: UsageMonitorSnapshot,
+    providerId: String,
+    model: String
 ): AssistantResult = withContext(Dispatchers.IO) {
     check(aiGatewayUrl.isNotBlank()) { "AI 网关地址尚未配置" }
     val payload = JSONObject().apply {
         put("message", message)
+        if (providerId.isNotBlank()) put("provider_id", providerId)
+        if (model.isNotBlank()) put("model", model)
         put("conversation", JSONArray().apply {
             conversation.takeLast(12).forEach { entry ->
                 put(JSONObject().apply {
@@ -368,6 +373,29 @@ private suspend fun requestAssistant(
     }
 }
 
+private suspend fun requestAiProviders(): List<AiProviderOption> = withContext(Dispatchers.IO) {
+    val providersUrl = aiGatewayUrl.removeSuffix("/api/assistant/respond") + "/api/assistant/providers"
+    val connection = (URL(providersUrl).openConnection() as HttpURLConnection).apply {
+        requestMethod = "GET"
+        connectTimeout = 8_000
+        readTimeout = 15_000
+        if (aiGatewayToken.isNotBlank()) setRequestProperty("x-forward-token", aiGatewayToken)
+    }
+    try {
+        val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
+        val body = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+        check(connection.responseCode in 200..299) { JSONObject(body).optString("error", "读取 AI 提供商失败") }
+        val array = JSONObject(body).optJSONArray("providers") ?: return@withContext emptyList()
+        (0 until array.length()).mapNotNull { index ->
+            val item = array.optJSONObject(index) ?: return@mapNotNull null
+            val models = item.optJSONArray("models")?.let { values -> (0 until values.length()).map { values.optString(it) }.filter(String::isNotBlank) }.orEmpty()
+            AiProviderOption(item.optString("id"), item.optString("name"), models, item.optBoolean("active"))
+        }
+    } finally {
+        connection.disconnect()
+    }
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -411,6 +439,13 @@ class MainActivity : ComponentActivity() {
             .edit()
             .putInt(key, time.toMinutesOfDay())
             .apply()
+    }
+
+    fun aiProviderId(): String = getSharedPreferences("ai", Context.MODE_PRIVATE).getString("provider_id", "").orEmpty()
+    fun aiModel(): String = getSharedPreferences("ai", Context.MODE_PRIVATE).getString("model", "").orEmpty()
+    fun saveAiSelection(providerId: String, model: String) {
+        getSharedPreferences("ai", Context.MODE_PRIVATE).edit()
+            .putString("provider_id", providerId).putString("model", model).apply()
     }
 
     fun plannerSet(key: String): Set<String> = getSharedPreferences("planner", Context.MODE_PRIVATE)
@@ -493,8 +528,20 @@ private fun ForwardApp(activity: MainActivity) {
         var sleepTime by remember { mutableStateOf(activity.plannerTime("sleep_time", DEFAULT_SLEEP_MINUTES)) }
         var wakeTime by remember { mutableStateOf(activity.plannerTime("wake_time", DEFAULT_WAKE_MINUTES)) }
         var usageSnapshot by remember { mutableStateOf(activity.usageSnapshot()) }
+        var aiProviders by remember { mutableStateOf(emptyList<AiProviderOption>()) }
+        var selectedProviderId by remember { mutableStateOf(activity.aiProviderId()) }
+        var selectedModel by remember { mutableStateOf(activity.aiModel()) }
         var now by remember { mutableStateOf(LocalDateTime.now()) }
         LaunchedEffect(Unit) {
+            runCatching { requestAiProviders() }.onSuccess { providers ->
+                aiProviders = providers
+                val provider = providers.firstOrNull { it.id == selectedProviderId } ?: providers.firstOrNull { it.active } ?: providers.firstOrNull()
+                if (provider != null) {
+                    if (selectedProviderId.isBlank()) selectedProviderId = provider.id
+                    if (selectedModel.isBlank() || selectedModel !in provider.models) selectedModel = provider.models.firstOrNull().orEmpty()
+                    activity.saveAiSelection(selectedProviderId, selectedModel)
+                }
+            }
             while (true) {
                 now = LocalDateTime.now()
                 usageSnapshot = activity.usageSnapshot()
@@ -617,7 +664,7 @@ private fun ForwardApp(activity: MainActivity) {
             aiBusy = true
             scope.launch {
                 val result = runCatching {
-                    requestAssistant(text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot)
+                    requestAssistant(text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel)
                 }.getOrElse { error -> AssistantResult(localReply(text), emptyList()).also { scope.launch { snackbar.showSnackbar(error.message ?: "AI 网关未连接，已使用本地规则") } } }
                 applyActions(result.actions)
                 messages = messages + ChatMessage(true, result.reply)
@@ -670,6 +717,10 @@ private fun ForwardApp(activity: MainActivity) {
                     usageSnapshot,
                     onSleepTime = { time -> sleepTime = time; activity.savePlannerTime("sleep_time", time) },
                     onWakeTime = { time -> wakeTime = time; activity.savePlannerTime("wake_time", time) },
+                    aiProviders = aiProviders,
+                    selectedProviderId = selectedProviderId,
+                    selectedModel = selectedModel,
+                    onAiSelection = { providerId, model -> selectedProviderId = providerId; selectedModel = model; activity.saveAiSelection(providerId, model) },
                     onUsageSnapshotChanged = { usageSnapshot = activity.usageSnapshot() }
                 )
             }
@@ -846,6 +897,10 @@ private fun SettingsScreen(
     usageSnapshot: UsageMonitorSnapshot,
     onSleepTime: (LocalTime) -> Unit,
     onWakeTime: (LocalTime) -> Unit,
+    aiProviders: List<AiProviderOption>,
+    selectedProviderId: String,
+    selectedModel: String,
+    onAiSelection: (String, String) -> Unit,
     onUsageSnapshotChanged: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
@@ -872,6 +927,14 @@ private fun SettingsScreen(
         }) }
         item { SettingRow(Icons.Default.NotificationsNone, "任务提醒", "安卓通知通道已准备", true) }
         item { SettingRow(Icons.Default.Refresh, "本地知识库", "电脑端 E: 盘桥接 · 云端同步待接入", false) }
+        item {
+            AiProviderSettingsCard(
+                providers = aiProviders,
+                selectedProviderId = selectedProviderId,
+                selectedModel = selectedModel,
+                onSelection = onAiSelection
+            )
+        }
         item { SettingRow(Icons.Default.Bedtime, "免打扰时段", "${formatClock(sleepTime)} - ${formatClock(wakeTime)}", true) }
         item {
             AppUsageMonitorCard(
@@ -895,6 +958,71 @@ private fun SettingsScreen(
                 Icon(Icons.Default.NotificationsNone, null, modifier = Modifier.size(17.dp))
                 Spacer(Modifier.width(7.dp))
                 Text("发送测试提醒")
+            }
+        }
+    }
+}
+
+@Composable
+private fun AiProviderSettingsCard(
+    providers: List<AiProviderOption>,
+    selectedProviderId: String,
+    selectedModel: String,
+    onSelection: (String, String) -> Unit
+) {
+    Card(
+        Modifier.fillMaxWidth().padding(top = 14.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF1EC)),
+        shape = RoundedCornerShape(9.dp)
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.AutoAwesome, null, tint = Color(0xFF277267), modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(9.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("AI 提供商与模型", color = Green, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                    Text("可在多个中转站和模型之间切换", color = Muted, fontSize = 10.sp)
+                }
+            }
+            if (providers.isEmpty()) {
+                Text("正在读取云端提供商列表…", color = Muted, fontSize = 11.sp)
+            } else {
+                Text("中转站", color = Green, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 180.dp)
+                        .border(1.dp, Color(0xFFD4DED8), RoundedCornerShape(7.dp))
+                        .padding(horizontal = 4.dp)
+                ) {
+                    items(providers, key = { it.id }) { provider ->
+                        val selected = provider.id == selectedProviderId
+                        Row(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).clickable {
+                                onSelection(provider.id, provider.models.firstOrNull().orEmpty())
+                            }.background(if (selected) Color(0xFFD7E8DF) else Color.Transparent).padding(horizontal = 8.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(provider.name, color = Ink, fontSize = 12.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+                                Text("${provider.models.size} 个模型", color = Muted, fontSize = 9.sp)
+                            }
+                            if (selected) Icon(Icons.Default.Check, null, tint = Green, modifier = Modifier.size(17.dp))
+                        }
+                    }
+                }
+                val provider = providers.firstOrNull { it.id == selectedProviderId }
+                if (provider != null && provider.models.isNotEmpty()) {
+                    Text("模型", color = Green, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 150.dp)) {
+                        items(provider.models, key = { it }) { model ->
+                            val selected = model == selectedModel
+                            TextButton(onClick = { onSelection(provider.id, model) }, modifier = Modifier.fillMaxWidth()) {
+                                Text(if (selected) "✓ $model" else model, color = if (selected) Green else Ink, fontSize = 11.sp)
+                            }
+                        }
+                    }
+                } else if (provider != null) {
+                    Text("此中转站暂未提供模型目录，可在服务端配置模型 ID。", color = Color(0xFF7A5F42), fontSize = 10.sp)
+                }
             }
         }
     }
