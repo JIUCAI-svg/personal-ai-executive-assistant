@@ -831,7 +831,15 @@ private fun CurrentTaskCard(currentItem: ScheduledPlanItem?, done: Boolean, onDo
     val detail = when {
         done -> "接下来休息 15 分钟"
         currentItem == null -> "剩余事项已留作明天或等待你调整"
-        else -> "${currentItem.item.note} · 至 ${formatClock(currentItem.end!!.toLocalTime())}"
+        else -> {
+            val endLabel = currentItem.end?.let { formatClock(it.toLocalTime()) }
+            when {
+                endLabel != null && currentItem.item.note.isNotBlank() -> "${currentItem.item.note} · 至 $endLabel"
+                endLabel != null -> "至 $endLabel"
+                currentItem.item.note.isNotBlank() -> "${currentItem.item.note} · 等待重新安排时间"
+                else -> "等待重新安排时间"
+            }
+        }
     }
     Card(Modifier.padding(horizontal = 16.dp, vertical = 2.dp).fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = GreenSoft), shape = RoundedCornerShape(10.dp)) {
         Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
