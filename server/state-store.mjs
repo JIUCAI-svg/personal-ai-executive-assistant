@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { applyDailyMemoryResult } from './memory-organizer.mjs';
 
 const SHANGHAI_TIME_ZONE = 'Asia/Shanghai';
 const DEFAULT_SETTINGS = {
@@ -122,11 +123,17 @@ export function createDefaultAssistantState() {
     threads: [],
     messages: [],
     memory_items: [],
+    daily_memory_summaries: [],
+    memory_organizer_runs: [],
     daily_reviews: [],
     action_logs: [],
     app_usage_daily: [],
     device_activity_daily: [],
-    ai_preferences: { provider_id: '', model: '', reasoning_effort: '' },
+    ai_preferences: {
+      provider_id: '', model: '', reasoning_effort: '',
+      memory_provider_id: '', memory_model: '', memory_reasoning_effort: '',
+      memory_auto_daily: true, memory_daily_time: '03:30'
+    },
     // These are inferred bounds from Android UsageStats, never an automatic
     // replacement for the user's planned sleep/wake schedule.
     sleep_wake_events: []
@@ -146,11 +153,18 @@ export function repairAssistantState(source) {
     threads: Array.isArray(state.threads) ? state.threads : [],
     messages: Array.isArray(state.messages) ? state.messages : [],
     memory_items: Array.isArray(state.memory_items) ? state.memory_items : [],
+    daily_memory_summaries: Array.isArray(state.daily_memory_summaries) ? state.daily_memory_summaries : [],
+    memory_organizer_runs: Array.isArray(state.memory_organizer_runs) ? state.memory_organizer_runs : [],
     daily_reviews: Array.isArray(state.daily_reviews) ? state.daily_reviews : [],
     action_logs: Array.isArray(state.action_logs) ? state.action_logs : [],
     app_usage_daily: Array.isArray(state.app_usage_daily) ? state.app_usage_daily : [],
     device_activity_daily: Array.isArray(state.device_activity_daily) ? state.device_activity_daily : [],
-    ai_preferences: { provider_id: '', model: '', reasoning_effort: '', ...(state.ai_preferences || {}) },
+    ai_preferences: {
+      provider_id: '', model: '', reasoning_effort: '',
+      memory_provider_id: '', memory_model: '', memory_reasoning_effort: '',
+      memory_auto_daily: true, memory_daily_time: '03:30',
+      ...(state.ai_preferences || {})
+    },
     sleep_wake_events: Array.isArray(state.sleep_wake_events) ? state.sleep_wake_events : []
   };
 }
@@ -483,11 +497,76 @@ export class AssistantStateStore {
 
   async updateAiPreferences(preferences = {}) {
     return this.mutate((state) => {
-      for (const key of ['provider_id', 'model', 'reasoning_effort']) {
+      for (const key of [
+        'provider_id', 'model', 'reasoning_effort',
+        'memory_provider_id', 'memory_model', 'memory_reasoning_effort', 'memory_daily_time'
+      ]) {
         if (typeof preferences[key] === 'string') state.ai_preferences[key] = normalizeText(preferences[key], 160);
       }
+      if (typeof preferences.memory_auto_daily === 'boolean') state.ai_preferences.memory_auto_daily = preferences.memory_auto_daily;
       return state.ai_preferences;
     });
+  }
+
+  async startMemoryOrganizerRun({ date, provider_id, model, source_message_count = 0 } = {}) {
+    return this.mutate((state) => {
+      const current = isoAt(nowParts().date, nowParts().time);
+      state.memory_organizer_runs = Array.isArray(state.memory_organizer_runs) ? state.memory_organizer_runs : [];
+      const run = {
+        id: id(),
+        date: /^\d{4}-\d{2}-\d{2}$/.test(String(date || '')) ? String(date) : nowParts().date,
+        status: 'running',
+        provider_id: normalizeText(provider_id, 120),
+        model: normalizeText(model, 160),
+        source_message_count: Math.max(0, Math.min(1000, Number(source_message_count) || 0)),
+        created_memory_ids: [],
+        updated_memory_ids: [],
+        duplicate_memory_ids: [],
+        error: '',
+        started_at: current,
+        finished_at: null
+      };
+      state.memory_organizer_runs.push(run);
+      state.memory_organizer_runs = state.memory_organizer_runs.slice(-120);
+      return run;
+    });
+  }
+
+  async finishMemoryOrganizerRun(runId, { date, result, provider_id, model, error = '' } = {}) {
+    return this.mutate((state) => {
+      const current = isoAt(nowParts().date, nowParts().time);
+      state.memory_organizer_runs = Array.isArray(state.memory_organizer_runs) ? state.memory_organizer_runs : [];
+      const run = state.memory_organizer_runs.find((item) => item.id === runId);
+      if (!run) return null;
+      if (error) {
+        run.status = 'failed';
+        run.error = normalizeText(error, 500);
+        run.finished_at = current;
+        return { run, created: [], summary: null };
+      }
+      const applied = applyDailyMemoryResult(state, result || { candidates: [] }, {
+        date: /^\d{4}-\d{2}-\d{2}$/.test(String(date || '')) ? String(date) : run.date,
+        run_id: run.id,
+        provider_id: provider_id || run.provider_id,
+        model: model || run.model,
+        now: current
+      });
+      run.status = 'completed';
+      run.provider_id = normalizeText(provider_id || run.provider_id, 120);
+      run.model = normalizeText(model || run.model, 160);
+      run.created_memory_ids = applied.created.map((item) => item.id);
+      run.duplicate_memory_ids = applied.duplicate_ids;
+      run.updated_memory_ids = [];
+      run.error = '';
+      run.finished_at = current;
+      return { run, ...applied };
+    });
+  }
+
+  async latestMemoryOrganizerRun() {
+    const state = await this.read();
+    return (Array.isArray(state.memory_organizer_runs) ? state.memory_organizer_runs : [])
+      .slice().sort((left, right) => String(right.started_at || '').localeCompare(String(left.started_at || '')))[0] || null;
   }
 
   async updateMemoryStatus(memoryId, status, content) {

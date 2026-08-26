@@ -1,4 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { mkdir, rename, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 
 function text(value, limit = 240) {
   return String(value || '').trim().slice(0, limit);
@@ -37,6 +39,14 @@ function catalogModels(catalog) {
   return uniqueModels(values);
 }
 
+function safeId(value) {
+  return text(value, 120)
+    .toLocaleLowerCase('en-US')
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+}
+
 function normalizeProfile(id, profile = {}) {
   const models = uniqueModels([
     ...(Array.isArray(profile.models) ? profile.models : []),
@@ -54,6 +64,42 @@ function normalizeProfile(id, profile = {}) {
     selected_model: selectedModel,
     models
   };
+}
+
+export function normalizeAiProviderDraft(draft = {}, existing = null) {
+  const name = text(draft.name || existing?.name, 120);
+  const baseUrl = text(draft.base_url || existing?.base_url, 500).replace(/\/$/, '');
+  const apiKey = text(draft.api_key || existing?.api_key, 1000);
+  const requestedId = safeId(draft.id || existing?.id || name);
+  const id = requestedId || `provider-${Date.now().toString(36)}`;
+  const profile = normalizeProfile(id, {
+    name: name || id,
+    base_url: baseUrl,
+    api_key: apiKey,
+    api_mode: draft.api_mode ?? existing?.api_mode,
+    models: draft.models ?? existing?.models,
+    selected_model: draft.selected_model ?? existing?.selected_model,
+    reasoning_efforts: draft.reasoning_efforts ?? existing?.reasoning_efforts
+  });
+  if (!profile.base_url || !/^https?:\/\//i.test(profile.base_url)) {
+    const error = new Error('中转站地址必须是以 http:// 或 https:// 开头的完整地址。');
+    error.status = 400;
+    error.code = 'INVALID_PROVIDER_URL';
+    throw error;
+  }
+  if (!profile.api_key) {
+    const error = new Error('请填写该中转站的 API Key。');
+    error.status = 400;
+    error.code = 'PROVIDER_KEY_REQUIRED';
+    throw error;
+  }
+  if (!profile.selected_model) {
+    const error = new Error('请至少填写并选择一个模型。');
+    error.status = 400;
+    error.code = 'PROVIDER_MODEL_REQUIRED';
+    throw error;
+  }
+  return profile;
 }
 
 export function loadAiProviders(filePath, fallback = {}) {
@@ -98,6 +144,30 @@ export function providerCatalog(registry) {
     models: profile.models,
     active: profile.id === registry.active
   }));
+}
+
+export function providerConfig(registry) {
+  return {
+    version: 1,
+    active_profile: registry.active || '',
+    profiles: Object.fromEntries(Object.entries(registry.profiles).map(([id, profile]) => [id, {
+      name: profile.name,
+      base_url: profile.base_url,
+      api_key: profile.api_key,
+      api_mode: profile.api_mode,
+      reasoning_efforts: profile.reasoning_efforts,
+      selected_model: profile.selected_model,
+      models: profile.models
+    }]))
+  };
+}
+
+export async function saveAiProviders(filePath, registry) {
+  const directory = path.dirname(filePath);
+  await mkdir(directory, { recursive: true });
+  const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(providerConfig(registry), null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  await rename(temporary, filePath);
 }
 
 export function selectAiProvider(registry, providerId, model, fallbackModel = '', reasoningEffort = '') {
