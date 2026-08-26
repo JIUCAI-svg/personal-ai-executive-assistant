@@ -8,8 +8,9 @@ import express from 'express';
 import matter from 'gray-matter';
 import { AssistantStateStore } from './state-store.mjs';
 import { SupabaseStateStore } from './supabase-state-store.mjs';
-import { loadAiProviders, providerCatalog, selectAiProvider } from './ai-providers.mjs';
+import { loadAiProviders, normalizeAiProviderDraft, providerCatalog, saveAiProviders, selectAiProvider } from './ai-providers.mjs';
 import { assistantEndpoint, buildAssistantModelRequest, extractAssistantText, upstreamErrorMessage } from './ai-protocol.mjs';
+import { memoryOrganizerPrompt, parseDailyMemoryResult, rawMessagesForDay, searchMemory } from './memory-organizer.mjs';
 import {
   ASSISTANT_TOOL_NAMES,
   assistantMcpTools,
@@ -44,7 +45,7 @@ const aiReasoningEffort = ['low', 'medium', 'high'].includes(process.env.AI_REAS
 const aiMaxRetries = 6;
 const aiGatewayToken = String(process.env.AI_GATEWAY_TOKEN || '');
 const aiProvidersFile = path.resolve(process.env.AI_PROVIDERS_FILE || path.join(appRoot, '.ai-providers.json'));
-const aiProviderRegistry = loadAiProviders(aiProvidersFile, {
+let aiProviderRegistry = loadAiProviders(aiProvidersFile, {
   active_profile: process.env.AI_ACTIVE_PROFILE,
   base_url: aiBaseUrl,
   api_key: aiApiKey,
@@ -573,17 +574,30 @@ function parseAssistantContent(content) {
   };
 }
 
-async function assistantKnowledgeContext({ enabled = true, projectName = '' } = {}) {
+async function assistantKnowledgeContext({ enabled = true, projectName = '', projectId = '', query = '', state = null } = {}) {
   if (!enabled) return [];
-  if (!existsSync(vaultPath)) return [];
+  const structured = state && query
+    ? searchMemory(state, query, { projectId, limit: 8 }).map((entry) => {
+        if (entry.type === 'memory') return {
+          source: 'memory', title: entry.item.kind || '长期记忆', preview: entry.item.content,
+          tags: entry.item.tags || [], source_message_ids: entry.item.source_message_ids || []
+        };
+        return {
+          source: 'daily_summary', title: `${entry.item.date} 每日摘要`, preview: entry.item.summary,
+          tags: ['每日整理'], source_message_ids: entry.item.source_message_ids || []
+        };
+      })
+    : [];
+  if (!existsSync(vaultPath)) return structured;
   const normalizedProject = normalizeText(projectName, 120).toLocaleLowerCase('zh-CN');
   const documents = await readVaultDocuments();
   const scoped = normalizedProject
     ? documents.filter((document) => `${document.folder}\n${document.title}\n${JSON.stringify(document.frontmatter)}`.toLocaleLowerCase('zh-CN').includes(normalizedProject))
     : documents;
-  return scoped
+  const vaultContext = scoped
     .slice(0, 5)
-    .map((document) => ({ title: document.title, folder: document.folder, preview: document.preview }));
+    .map((document) => ({ source: 'vault', title: document.title, folder: document.folder, preview: document.preview }));
+  return [...structured, ...vaultContext].slice(0, 12);
 }
 
 function assistantSystemPrompt() {
@@ -631,7 +645,7 @@ function waitForAiRetry(attempt) {
   return new Promise((resolve) => setTimeout(resolve, Math.min(2400, 400 * attempt)));
 }
 
-async function requestAssistantModel(payload) {
+async function requestModelText(payload) {
   const provider = payload.provider;
   const requestPayload = { ...payload };
   delete requestPayload.provider;
@@ -660,13 +674,18 @@ async function requestAssistantModel(payload) {
       if (!String(content || '').trim()) {
         throw new Error('AI 返回正文为空。');
       }
-      return { result: parseAssistantContent(content), attempts: retry + 1 };
+      return { content, attempts: retry + 1 };
     } catch (error) {
       lastError = error;
       console.error(`AI attempt ${retry + 1}/${maxRetries + 1} failed`, error?.cause?.code || error?.message || error?.name || 'unknown');
     }
   }
   throw lastError || new Error('AI 请求失败。');
+}
+
+async function requestAssistantModel(payload) {
+  const { content, attempts } = await requestModelText(payload);
+  return { result: parseAssistantContent(content), attempts };
 }
 
 app.get('/api/assistant/status', (request, response) => {
@@ -691,6 +710,61 @@ app.get('/api/assistant/tools', (request, response) => {
 app.get('/api/assistant/providers', (request, response) => {
   if (!assistantAuthorized(request, response)) return;
   response.json({ ok: true, active: aiProviderRegistry.active, providers: providerCatalog(aiProviderRegistry) });
+});
+
+function providerDraftFromRequest(body = {}) {
+  const models = Array.isArray(body.models)
+    ? body.models
+    : String(body.models || '').split(/[\n,，]/g);
+  const reasoningEfforts = Array.isArray(body.reasoning_efforts)
+    ? body.reasoning_efforts
+    : String(body.reasoning_efforts || '').split(/[\n,，]/g);
+  return {
+    id: stringValue(body.id, 120),
+    name: stringValue(body.name, 120),
+    base_url: stringValue(body.base_url, 500),
+    api_key: String(body.api_key || '').trim().slice(0, 1000),
+    api_mode: stringValue(body.api_mode, 40),
+    models,
+    selected_model: stringValue(body.selected_model, 160),
+    reasoning_efforts: reasoningEfforts
+  };
+}
+
+async function persistProviderRegistry(registry) {
+  await saveAiProviders(aiProvidersFile, registry);
+  aiProviderRegistry = registry;
+  return aiProviderRegistry;
+}
+
+app.post('/api/assistant/providers', async (request, response, next) => {
+  try {
+    if (!assistantAuthorized(request, response)) return;
+    const profile = normalizeAiProviderDraft(providerDraftFromRequest(request.body));
+    if (aiProviderRegistry.profiles[profile.id]) {
+      return response.status(409).json({ error: '这个中转站 ID 已存在，请换一个名称。', code: 'PROVIDER_ID_EXISTS' });
+    }
+    const nextRegistry = {
+      active: aiProviderRegistry.active || profile.id,
+      profiles: { ...aiProviderRegistry.profiles, [profile.id]: profile }
+    };
+    await persistProviderRegistry(nextRegistry);
+    response.status(201).json({ ok: true, provider: providerCatalog(aiProviderRegistry).find((item) => item.id === profile.id), providers: providerCatalog(aiProviderRegistry) });
+  } catch (error) { next(error); }
+});
+
+app.patch('/api/assistant/providers/:id', async (request, response, next) => {
+  try {
+    if (!assistantAuthorized(request, response)) return;
+    const current = aiProviderRegistry.profiles[request.params.id];
+    if (!current) return response.status(404).json({ error: '未找到这个中转站。' });
+    const draft = providerDraftFromRequest(request.body);
+    draft.id = current.id;
+    const profile = normalizeAiProviderDraft(draft, current);
+    const nextRegistry = { ...aiProviderRegistry, profiles: { ...aiProviderRegistry.profiles, [current.id]: profile } };
+    await persistProviderRegistry(nextRegistry);
+    response.json({ ok: true, provider: providerCatalog(aiProviderRegistry).find((item) => item.id === profile.id), providers: providerCatalog(aiProviderRegistry) });
+  } catch (error) { next(error); }
 });
 
 // This endpoint deliberately uses an isolated JSON-only request. It verifies
@@ -870,13 +944,141 @@ app.get('/api/assistant/state', async (request, response, next) => {
 app.patch('/api/assistant/preferences', async (request, response, next) => {
   try {
     const { store, source } = await requestStateStore(request);
-    const preferences = await store.updateAiPreferences({
-      provider_id: stringValue(request.body?.provider_id, 120),
-      model: stringValue(request.body?.model, 160),
-      reasoning_effort: stringValue(request.body?.reasoning_effort, 20)
-    });
+    const body = request.body || {};
+    const preferencesInput = {};
+    for (const [key, limit] of Object.entries({
+      provider_id: 120, model: 160, reasoning_effort: 20,
+      memory_provider_id: 120, memory_model: 160, memory_reasoning_effort: 20, memory_daily_time: 20
+    })) {
+      if (typeof body[key] === 'string') preferencesInput[key] = stringValue(body[key], limit);
+    }
+    if (typeof body.memory_auto_daily === 'boolean') preferencesInput.memory_auto_daily = body.memory_auto_daily;
+    const preferences = await store.updateAiPreferences(preferencesInput);
     response.json({ ok: true, source, preferences, state: await store.bootstrap() });
   } catch (error) { next(error); }
+});
+
+app.get('/api/assistant/memory/status', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    const state = await store.bootstrap();
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(request.query.date || '')) ? String(request.query.date) : dateStamp();
+    const latestRun = (state.memory_organizer_runs || []).slice()
+      .sort((left, right) => String(right.started_at || '').localeCompare(String(left.started_at || '')))[0] || null;
+    const summary = (state.daily_memory_summaries || []).find((item) => item.date === date) || null;
+    response.json({
+      ok: true,
+      source,
+      date,
+      raw_message_count: rawMessagesForDay(state, date).length,
+      latest_run: latestRun,
+      summary,
+      memory_counts: {
+        active: (state.memory_items || []).filter((item) => item.status === 'active').length,
+        pending_review: (state.memory_items || []).filter((item) => item.status === 'pending_review').length,
+        archived: (state.memory_items || []).filter((item) => item.status === 'archived').length
+      }
+    });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/assistant/memory/search', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    const query = stringValue(request.query.q, 400);
+    if (!query) return response.status(400).json({ error: '请输入要检索的关键词。' });
+    const state = await store.bootstrap();
+    response.json({ ok: true, source, query, results: searchMemory(state, query, {
+      projectId: stringValue(request.query.project_id, 100), limit: request.query.limit
+    }) });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/assistant/memory/export', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    const state = await store.bootstrap();
+    const messagesByThread = new Map();
+    for (const message of state.messages || []) {
+      if (!messagesByThread.has(message.thread_id)) messagesByThread.set(message.thread_id, []);
+      messagesByThread.get(message.thread_id).push(message);
+    }
+    const rawConversations = (state.threads || [])
+      .filter((thread) => thread.mode !== 'temporary' && thread.save_full_conversation !== false)
+      .map((thread) => ({
+        thread: { ...thread },
+        messages: (messagesByThread.get(thread.id) || []).slice().sort((left, right) => String(left.created_at || '').localeCompare(String(right.created_at || '')))
+      }));
+    response.json({
+      schema_version: 1,
+      exported_at: new Date().toISOString(),
+      source,
+      description: '原始对话不可变来源 + 可重新生成的派生记忆、每日摘要与整理记录。',
+      raw_conversations: rawConversations,
+      memory_items: state.memory_items || [],
+      daily_memory_summaries: state.daily_memory_summaries || [],
+      memory_organizer_runs: state.memory_organizer_runs || []
+    });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/assistant/memory/daily-run', async (request, response, next) => {
+  let store;
+  let run;
+  let source;
+  try {
+    if (!assistantAuthorized(request, response)) return;
+    ({ store, source } = await requestStateStore(request));
+    const state = await store.bootstrap();
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(request.body?.date || '')) ? String(request.body.date) : dateStamp();
+    const preferences = state.ai_preferences || {};
+    const provider = selectAiProvider(
+      aiProviderRegistry,
+      request.body?.provider_id || preferences.memory_provider_id || preferences.provider_id,
+      request.body?.model || preferences.memory_model || preferences.model,
+      aiModel,
+      request.body?.reasoning_effort || preferences.memory_reasoning_effort || preferences.reasoning_effort || aiReasoningEffort
+    );
+    if (!provider) return response.status(503).json({ error: '尚未配置可用的记忆整理模型。', code: 'MEMORY_PROVIDER_NOT_CONFIGURED' });
+    const rawMessages = rawMessagesForDay(state, date);
+    run = await store.startMemoryOrganizerRun({ date, provider_id: provider.id, model: provider.model, source_message_count: rawMessages.length });
+    if (!rawMessages.length) {
+      const finished = await store.finishMemoryOrganizerRun(run.id, { date, provider_id: provider.id, model: provider.model, result: { candidates: [], projectUpdates: [], updateSuggestions: [], summary: '' } });
+      return response.json({ ok: true, source, empty: true, run: finished.run, created: [], summary: null, state: await store.bootstrap() });
+    }
+    const activeMemories = (state.memory_items || []).filter((item) => item.status === 'active').slice(-80).map((item) => ({
+      id: item.id, kind: item.kind, content: item.content, project_id: item.project_id, tags: item.tags || []
+    }));
+    const prompt = memoryOrganizerPrompt({
+      date,
+      messages: rawMessages,
+      projects: (state.projects || []).map((item) => ({ id: item.id, name: item.name, status: item.status })),
+      existingMemories: activeMemories,
+      actionLogs: (state.action_logs || []).filter((item) => String(item.created_at || '').startsWith(date)).slice(-60),
+      usage: (state.app_usage_daily || []).filter((item) => item.date === date).slice(0, 20),
+      sleepWake: state.sleep_wake_summary?.latest || null
+    });
+    const { content, attempts } = await requestModelText({
+      provider,
+      model: provider.model,
+      temperature: 0.1,
+      max_retries: 2,
+      ...(provider.reasoning_effort ? { reasoning_effort: provider.reasoning_effort } : {}),
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: '你负责每天整理个人记忆。必须遵守用户数据来源边界并输出 JSON。' },
+        { role: 'user', content: prompt }
+      ]
+    });
+    const parsed = parseDailyMemoryResult(content, { state, messages: rawMessages });
+    const finished = await store.finishMemoryOrganizerRun(run.id, { date, provider_id: provider.id, model: provider.model, result: parsed });
+    response.json({ ok: true, source, attempts, run: finished.run, created: finished.created, duplicate_ids: finished.duplicate_ids, summary: finished.summary, state: await store.bootstrap() });
+  } catch (error) {
+    if (store && run) {
+      try { await store.finishMemoryOrganizerRun(run.id, { error: error?.message || '每日整理失败。' }); } catch { /* keep the original error */ }
+    }
+    next(error);
+  }
 });
 
 app.get('/api/assistant/threads', async (request, response, next) => {
@@ -1020,7 +1222,10 @@ app.post('/api/assistant/respond', async (request, response, next) => {
     const context = body.context || {};
     const knowledge = await assistantKnowledgeContext({
       enabled: hydratedThread.memory_scope && hydratedThread.mode !== 'temporary',
-      projectName: hydratedThread.mode === 'project' ? projectName : ''
+      projectName: hydratedThread.mode === 'project' ? projectName : '',
+      projectId: hydratedThread.mode === 'project' ? hydratedThread.project_id : '',
+      query: message,
+      state: stateBefore
     });
     const planBefore = stateBefore.plan;
     const appUsages = normalizeAppUsages(context.app_usage);

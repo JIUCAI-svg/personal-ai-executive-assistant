@@ -43,6 +43,12 @@ function dateKicker() {
   return new Intl.DateTimeFormat('zh-CN', { weekday: 'long', month: 'long', day: 'numeric' }).format(new Date());
 }
 
+function isoToday() {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
+  const value = (type) => parts.find((part) => part.type === type)?.value || '';
+  return `${value('year')}-${value('month')}-${value('day')}`;
+}
+
 function dynamicPlanToUi(dynamicPlan) {
   if (!dynamicPlan) return [];
   const scheduled = (dynamicPlan.scheduled || []).map((item, index) => ({
@@ -113,8 +119,18 @@ function App() {
   const [aiProviders, setAiProviders] = useState([]);
   const [selectedProviderId, setSelectedProviderId] = useState(() => window.localStorage.getItem('forward.ai.provider') || '');
   const [selectedModel, setSelectedModel] = useState(() => window.localStorage.getItem('forward.ai.model') || '');
+  const [memoryProviderId, setMemoryProviderId] = useState('');
+  const [memoryModel, setMemoryModel] = useState('');
+  const [memoryReasoningEffort, setMemoryReasoningEffort] = useState('');
+  const [memoryAutoDaily, setMemoryAutoDaily] = useState(true);
+  const [memoryDailyTime, setMemoryDailyTime] = useState('03:30');
+  const [memoryStatus, setMemoryStatus] = useState(null);
+  const [memoryRunBusy, setMemoryRunBusy] = useState(false);
+  const [providerBusy, setProviderBusy] = useState(false);
+  const [providerDraft, setProviderDraft] = useState({ name: '', base_url: '', api_key: '', api_mode: 'chat_completions', models: '', selected_model: '', reasoning_efforts: 'low, medium, high' });
   const [showAiSettings, setShowAiSettings] = useState(false);
   const endRef = useRef(null);
+  const autoMemoryRunDateRef = useRef('');
 
   const mode = modes.find((item) => item.id === conversationMode) || modes[0];
   const projects = assistantState?.projects || [];
@@ -132,6 +148,7 @@ function App() {
   const scheduleMinutes = planned.reduce((total, item) => total + item.duration, 0);
   const flexible = plan.filter((item) => item.state === 'flex' || item.state === 'deferred');
   const selectedProvider = aiProviders.find((item) => item.id === selectedProviderId) || aiProviders[0] || null;
+  const selectedMemoryProvider = aiProviders.find((item) => item.id === memoryProviderId) || selectedProvider || null;
 
   useEffect(() => {
     if (selectedProviderId) window.localStorage.setItem('forward.ai.provider', selectedProviderId);
@@ -156,6 +173,11 @@ function App() {
       const preferences = payload.state?.ai_preferences;
       if (preferences?.provider_id) setSelectedProviderId(preferences.provider_id);
       if (preferences?.model) setSelectedModel(preferences.model);
+      if (preferences?.memory_provider_id) setMemoryProviderId(preferences.memory_provider_id);
+      if (preferences?.memory_model) setMemoryModel(preferences.memory_model);
+      if (preferences?.memory_reasoning_effort !== undefined) setMemoryReasoningEffort(preferences.memory_reasoning_effort || '');
+      if (typeof preferences?.memory_auto_daily === 'boolean') setMemoryAutoDaily(preferences.memory_auto_daily);
+      if (preferences?.memory_daily_time) setMemoryDailyTime(preferences.memory_daily_time);
       const firstProject = payload.state?.projects?.[0];
       if (firstProject && !projectId) setProjectId(firstProject.id);
     } catch (error) {
@@ -188,8 +210,135 @@ function App() {
       const active = providers.find((item) => item.active) || providers[0];
       setSelectedProviderId((current) => current || active?.id || '');
       setSelectedModel((current) => current || active?.selected_model || active?.models?.[0] || '');
+      setMemoryProviderId((current) => current || active?.id || '');
+      setMemoryModel((current) => current || active?.selected_model || active?.models?.[0] || '');
     } catch (error) {
       setNotice(error.message || 'AI 提供商暂时不可用');
+    }
+  }
+
+  async function loadMemoryStatus() {
+    try {
+      const response = await apiFetch('/api/assistant/memory/status');
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '读取记忆整理状态失败');
+      setMemoryStatus(payload);
+      return payload;
+    } catch (error) {
+      setNotice(error.message || '读取记忆整理状态失败');
+      return null;
+    }
+  }
+
+  async function saveAiPreferences(close = false) {
+    const response = await apiFetch('/api/assistant/preferences', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider_id: selectedProviderId, model: selectedModel,
+        memory_provider_id: memoryProviderId || selectedProviderId,
+        memory_model: memoryModel || selectedModel,
+        memory_reasoning_effort: memoryReasoningEffort,
+        memory_auto_daily: memoryAutoDaily,
+        memory_daily_time: memoryDailyTime
+      })
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || '保存失败');
+    if (payload.state) setAssistantState(payload.state);
+    if (close) setShowAiSettings(false);
+    return payload;
+  }
+
+  async function runDailyMemory({ silent = false } = {}) {
+    if (memoryRunBusy) return null;
+    setMemoryRunBusy(true);
+    try {
+      const response = await apiFetch('/api/assistant/memory/daily-run', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider_id: memoryProviderId || selectedProviderId,
+          model: memoryModel || selectedModel,
+          reasoning_effort: memoryReasoningEffort
+        })
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '每日整理失败');
+      if (payload.state) setAssistantState(payload.state);
+      setMemoryStatus((current) => ({ ...(current || {}), latest_run: payload.run, summary: payload.summary || current?.summary || null }));
+      if (!silent) {
+        setNotice(payload.empty ? '今天还没有可整理的已保存对话。' : `已完成今日整理：新增 ${payload.created?.length || 0} 条待确认记忆。`);
+      }
+      return payload;
+    } catch (error) {
+      if (!silent) setNotice(error.message || '每日整理失败');
+      return null;
+    } finally {
+      setMemoryRunBusy(false);
+    }
+  }
+
+  async function addProvider() {
+    setProviderBusy(true);
+    try {
+      const response = await apiFetch('/api/assistant/providers', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...providerDraft,
+          models: providerDraft.models.split(/[\n,，]/g).map((value) => value.trim()).filter(Boolean),
+          reasoning_efforts: providerDraft.reasoning_efforts.split(/[\n,，]/g).map((value) => value.trim()).filter(Boolean)
+        })
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '新增中转站失败');
+      setAiProviders(payload.providers || []);
+      const provider = payload.provider;
+      if (provider) {
+        setSelectedProviderId(provider.id);
+        setSelectedModel(provider.selected_model || provider.models?.[0] || '');
+        setMemoryProviderId(provider.id);
+        setMemoryModel(provider.selected_model || provider.models?.[0] || '');
+      }
+      setProviderDraft({ name: '', base_url: '', api_key: '', api_mode: 'chat_completions', models: '', selected_model: '', reasoning_efforts: 'low, medium, high' });
+      setNotice(`已加入中转站：${provider?.name || '新配置'}。`);
+    } catch (error) {
+      setNotice(error.message || '新增中转站失败');
+    } finally {
+      setProviderBusy(false);
+    }
+  }
+
+  async function testProvider(providerId, model, reasoningEffort = '') {
+    setProviderBusy(true);
+    try {
+      const response = await apiFetch(`/api/assistant/providers/${encodeURIComponent(providerId)}/test`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, reasoning_effort: reasoningEffort })
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '连接测试失败');
+      setNotice(`连接正常：${payload.provider_name} · ${payload.model}`);
+    } catch (error) {
+      setNotice(error.message || '连接测试失败');
+    } finally {
+      setProviderBusy(false);
+    }
+  }
+
+  async function exportMemoryArchive() {
+    try {
+      const response = await apiFetch('/api/assistant/memory/export');
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '导出记忆档案失败');
+      const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], { type: 'application/json;charset=utf-8' });
+      const href = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = href;
+      link.download = `forward-memory-archive-${isoToday()}.json`;
+      link.click();
+      URL.revokeObjectURL(href);
+      setNotice('已导出原始对话与记忆档案，可保存到你的本地备份目录。');
+    } catch (error) {
+      setNotice(error.message || '导出记忆档案失败');
     }
   }
 
@@ -270,6 +419,21 @@ function App() {
     refreshSync(session);
     loadAiProviders();
   }, [authReady, session]);
+
+  useEffect(() => {
+    if (!assistantState || !memoryAutoDaily || memoryRunBusy) return;
+    const today = isoToday();
+    if (autoMemoryRunDateRef.current === today || timeNow() < memoryDailyTime) return;
+    let active = true;
+    async function catchUpDailyMemory() {
+      const status = await loadMemoryStatus();
+      if (!active || !status || status.raw_message_count < 1 || status.summary || status.latest_run?.date === today) return;
+      autoMemoryRunDateRef.current = today;
+      await runDailyMemory({ silent: true });
+    }
+    catchUpDailyMemory();
+    return () => { active = false; };
+  }, [assistantState?.updated_at, memoryAutoDaily, memoryDailyTime, memoryRunBusy]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
@@ -717,8 +881,11 @@ function App() {
       {showNewConversation && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="新建对话"><button className="modal-backdrop" onClick={() => setShowNewConversation(false)} aria-label="关闭新建对话" /><section className="new-conversation-modal"><div className="modal-header"><div><span>新建对话</span><p>选择 AI 本次可以了解什么。</p></div><button className="icon-button" onClick={() => setShowNewConversation(false)} aria-label="关闭"><X size={20} /></button></div><div className="new-mode-list">{modes.map((item) => { const Icon = item.icon; return <button key={item.id} onClick={() => selectMode(item.id)}><span className={`new-mode-icon ${item.id}`}><Icon size={20} /></span><span><strong>{item.label}</strong><small>{item.description}</small></span><ChevronRight size={18} /></button>; })}</div></section></div>}
       {showHistory && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="所有对话"><button className="modal-backdrop" onClick={() => setShowHistory(false)} aria-label="关闭对话历史" /><section className="history-modal"><div className="modal-header"><div><span>所有对话</span><p>恢复任一已保存的对话，继续使用原来的上下文。</p></div><button className="icon-button" onClick={() => setShowHistory(false)} aria-label="关闭"><X size={20} /></button></div><div className="history-list">{threads.length ? threads.map((thread) => <button key={thread.id} onClick={() => openThread(thread.id)}><MessageCircle size={17} /><span><strong>{modes.find((item) => item.id === thread.mode)?.label || '对话'}{thread.project_name ? ` · ${thread.project_name}` : ''}</strong><small>{thread.preview || '尚未发送消息'} · {messageTime(thread.updated_at)}</small></span><em>{thread.message_count}</em><ChevronRight size={17} /></button>) : <p className="empty-state">还没有已保存的对话。</p>}</div></section></div>}
       {showVault && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="本地知识库"><button className="modal-backdrop" onClick={() => { setShowVault(false); setSelectedDocument(null); }} aria-label="关闭知识库" /><section className="vault-modal"><div className="modal-header"><div><span>本地知识库</span><p>{vault.connected ? `${vault.documentCount} 篇 Markdown · ${vault.folders.length} 个目录 · 文件改动会自动刷新` : '尚未连接本地桥接服务'}</p></div><button className="icon-button" onClick={() => { setShowVault(false); setSelectedDocument(null); }} aria-label="关闭"><X size={20} /></button></div>{vaultError && <p className="vault-modal-error">{vaultError}</p>}{selectedDocument ? <div className="document-reader"><button className="back-button" onClick={() => setSelectedDocument(null)}>‹ 返回资料列表</button><small>{selectedDocument.relativePath}</small><h2>{selectedDocument.title}</h2><pre>{selectedDocument.content}</pre></div> : <><div className="vault-modal-toolbar"><span className={`connection-status ${vault.connected ? 'online' : ''}`}><span /> {vault.connected ? '已连接到 Obsidian 文件夹' : '等待桥接服务'}</span><button className="icon-button" onClick={() => loadVault(true)} aria-label="刷新知识库"><RefreshCw size={17} /></button></div><div className="vault-document-list">{vaultDocuments.map((document) => <button key={document.id} onClick={() => openDocument(document.id)}><FileText size={18} /><span><strong>{document.title}</strong><small>{document.folder} · {document.preview || '没有正文摘要'}</small></span><ChevronRight size={17} /></button>)}{vault.connected && vaultDocuments.length === 0 && <p className="empty-state">知识库里还没有 Markdown 资料。</p>}</div></>}</section></div>}
-      {showAiSettings && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="AI 提供商设置"><button className="modal-backdrop" onClick={() => setShowAiSettings(false)} aria-label="关闭 AI 设置" /><section className="account-modal"><div className="modal-header"><div><span>AI 提供商与模型</span><p>选择本次助手使用的中转站和模型。密钥只保存在服务器，不会显示在这里。</p></div><button className="icon-button" onClick={() => setShowAiSettings(false)} aria-label="关闭"><X size={20} /></button></div>{aiProviders.length ? <div className="account-form"><label>中转站<select value={selectedProviderId} onChange={(event) => { const id = event.target.value; const provider = aiProviders.find((item) => item.id === id); setSelectedProviderId(id); setSelectedModel(provider?.selected_model || provider?.models?.[0] || ''); }}><option value="">选择中转站</option>{aiProviders.map((provider) => <option value={provider.id} key={provider.id}>{provider.name} · {provider.models.length} 个模型</option>)}</select></label><label>模型{selectedProvider?.models?.length ? <select value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)}>{selectedProvider.models.map((model) => <option value={model} key={model}>{model}</option>)}</select> : <input value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)} placeholder="此中转站没有目录，请输入模型 ID" />}</label><p className="sync-state"><Cloud size={16} /><span>当前：{selectedProvider?.name || '未选择'} · {selectedModel || '未选择模型'}</span></p><button className="primary-command" onClick={async () => { try { const response = await apiFetch('/api/assistant/preferences', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider_id: selectedProviderId, model: selectedModel }) }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error || '保存失败'); if (payload.state) setAssistantState(payload.state); setShowAiSettings(false); setNotice(`已切换到 ${selectedProvider?.name || 'AI 提供商'} · ${selectedModel}`); } catch (error) { setNotice(error.message || '模型选择保存失败'); } }}>保存选择</button></div> : <p className="vault-modal-error">当前没有读取到可用的 AI 提供商。</p>}</section></div>}
-      {showAccount && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="云端同步与登录"><button className="modal-backdrop" onClick={() => setShowAccount(false)} aria-label="关闭同步设置" /><section className="account-modal"><div className="modal-header"><div><span>云端同步</span><p>任务、计划、对话、记忆和作息在登录后同步；Obsidian 文件夹继续保留在本机。</p></div><button className="icon-button" onClick={() => setShowAccount(false)} aria-label="关闭"><X size={20} /></button></div>
+      {showAiSettings && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="AI 与记忆设置"><button className="modal-backdrop" onClick={() => setShowAiSettings(false)} aria-label="关闭 AI 设置" /><section className="account-modal ai-settings-modal"><div className="modal-header"><div><span>AI 与自增长记忆库</span><p>日常对话和每日整理各自选择模型；原始对话始终保留，整理结果可追溯、可确认。</p></div><button className="icon-button" onClick={() => setShowAiSettings(false)} aria-label="关闭"><X size={20} /></button></div>
+        <section className="ai-settings-section"><div className="settings-section-heading"><strong>日常对话 AI</strong><small>负责对话、计划、任务和作息调整</small></div>{aiProviders.length ? <div className="account-form"><label>中转站<select value={selectedProviderId} onChange={(event) => { const id = event.target.value; const provider = aiProviders.find((item) => item.id === id); setSelectedProviderId(id); setSelectedModel(provider?.selected_model || provider?.models?.[0] || ''); }}><option value="">选择中转站</option>{aiProviders.map((provider) => <option value={provider.id} key={provider.id}>{provider.name} · {provider.models.length} 个模型</option>)}</select></label><label>模型{selectedProvider?.models?.length ? <select value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)}>{selectedProvider.models.map((model) => <option value={model} key={model}>{model}</option>)}</select> : <input value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)} placeholder="输入模型 ID" />}</label><div className="settings-inline-actions"><button className="secondary-command" type="button" disabled={!selectedProviderId || !selectedModel || providerBusy} onClick={() => testProvider(selectedProviderId, selectedModel)}>测试当前连接</button></div></div> : <p className="vault-modal-error">当前没有读取到可用的 AI 提供商。</p>}</section>
+        <section className="ai-settings-section memory-settings-section"><div className="settings-section-heading"><strong>每日记忆整理 AI</strong><small>只读取已保存的非临时对话；输出每日摘要与待确认记忆，不会改写原始对话。</small></div><div className="account-form"><label>整理中转站<select value={memoryProviderId} onChange={(event) => { const id = event.target.value; const provider = aiProviders.find((item) => item.id === id); setMemoryProviderId(id); setMemoryModel(provider?.selected_model || provider?.models?.[0] || ''); setMemoryReasoningEffort(''); }}><option value="">沿用日常对话 AI</option>{aiProviders.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</select></label><label>整理模型{selectedMemoryProvider?.models?.length ? <select value={memoryModel} onChange={(event) => setMemoryModel(event.target.value)}>{selectedMemoryProvider.models.map((model) => <option value={model} key={model}>{model}</option>)}</select> : <input value={memoryModel} onChange={(event) => setMemoryModel(event.target.value)} placeholder="输入模型 ID" />}</label><label>推理等级<select value={memoryReasoningEffort} onChange={(event) => setMemoryReasoningEffort(event.target.value)}><option value="">不指定</option>{(selectedMemoryProvider?.reasoning_efforts || ['minimal', 'low', 'medium', 'high']).map((effort) => <option value={effort} key={effort}>{effort}</option>)}</select></label><label className="setting-row memory-auto-row"><span><strong>每天自动整理</strong><small>到设定时间后，在当天首次打开应用时补跑</small></span><input type="checkbox" checked={memoryAutoDaily} onChange={(event) => setMemoryAutoDaily(event.target.checked)} /></label><label>整理时间<input type="time" value={memoryDailyTime} onChange={(event) => setMemoryDailyTime(event.target.value)} /></label><div className="memory-run-status"><Brain size={16} /><span>{memoryStatus?.latest_run?.status === 'running' ? '正在整理…' : memoryStatus?.summary ? `今日摘要已生成 · ${memoryStatus.raw_message_count || 0} 条原始消息` : memoryStatus ? `今天有 ${memoryStatus.raw_message_count || 0} 条可整理原始消息` : '正在读取整理状态…'}</span></div><div className="settings-inline-actions"><button className="secondary-command" type="button" onClick={() => runDailyMemory()} disabled={memoryRunBusy || !aiProviders.length}><RefreshCw size={15} /> {memoryRunBusy ? '正在整理…' : '立即整理今天'}</button><button className="primary-command" type="button" onClick={async () => { try { await saveAiPreferences(); setNotice('AI 与记忆整理设置已保存。'); await loadMemoryStatus(); } catch (error) { setNotice(error.message || '保存设置失败'); } }}>保存所有选择</button></div><button className="archive-export-button" type="button" onClick={exportMemoryArchive}><FileText size={14} /> 导出原始对话与记忆档案</button></div></section>
+        <section className="ai-settings-section provider-add-section"><div className="settings-section-heading"><strong>新增中转站</strong><small>密钥只写入服务器私有配置，保存后不会再次显示。</small></div><form className="account-form" onSubmit={(event) => { event.preventDefault(); addProvider(); }}><label>名称<input value={providerDraft.name} onChange={(event) => setProviderDraft((draft) => ({ ...draft, name: event.target.value }))} placeholder="例如：我的 GPT 中转站" required /></label><label>Base URL<input value={providerDraft.base_url} onChange={(event) => setProviderDraft((draft) => ({ ...draft, base_url: event.target.value }))} placeholder="https://example.com/v1" required /></label><label>API Key<input type="password" value={providerDraft.api_key} onChange={(event) => setProviderDraft((draft) => ({ ...draft, api_key: event.target.value }))} placeholder="只在保存时发送" autoComplete="new-password" required /></label><div className="provider-grid"><label>API 协议<select value={providerDraft.api_mode} onChange={(event) => setProviderDraft((draft) => ({ ...draft, api_mode: event.target.value }))}><option value="chat_completions">Chat Completions</option><option value="responses">Responses API</option></select></label><label>默认模型<input value={providerDraft.selected_model} onChange={(event) => setProviderDraft((draft) => ({ ...draft, selected_model: event.target.value }))} placeholder="gpt-5.5" required /></label></div><label>可选模型<textarea value={providerDraft.models} onChange={(event) => setProviderDraft((draft) => ({ ...draft, models: event.target.value }))} placeholder="每行一个，或用逗号分隔；至少包含默认模型" rows="2" /></label><label>可用推理等级<textarea value={providerDraft.reasoning_efforts} onChange={(event) => setProviderDraft((draft) => ({ ...draft, reasoning_efforts: event.target.value }))} placeholder="low, medium, high" rows="1" /></label><button className="text-command" type="submit" disabled={providerBusy}>{providerBusy ? '正在保存…' : '保存并加入中转站列表'}</button></form></section>
+      </section></div>}      {showAccount && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="云端同步与登录"><button className="modal-backdrop" onClick={() => setShowAccount(false)} aria-label="关闭同步设置" /><section className="account-modal"><div className="modal-header"><div><span>云端同步</span><p>任务、计划、对话、记忆和作息在登录后同步；Obsidian 文件夹继续保留在本机。</p></div><button className="icon-button" onClick={() => setShowAccount(false)} aria-label="关闭"><X size={20} /></button></div>
         {syncStatus.mode === 'cloud' && <div className="sync-state connected"><Cloud size={18} /><div><strong>已连接云端</strong><small>{session?.user?.email || '当前账号'} · {syncStatus.detail}</small></div></div>}
         {syncStatus.mode === 'needs_import' && <div className="sync-state waiting"><Cloud size={18} /><div><strong>云端还没有你的数据</strong><small>本机数据尚未上传，确认后才会同步到此账号。</small></div></div>}
         {['local', 'unavailable', 'error', 'checking'].includes(syncStatus.mode) && <div className="sync-state"><CloudOff size={18} /><div><strong>{syncStatus.mode === 'checking' ? '正在连接云端' : '当前使用本机数据'}</strong><small>{syncStatus.detail}</small></div></div>}
