@@ -85,6 +85,14 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 .archive-export-button:hover { color: #28675d; border-color: #82a99b; background: #f1f6f1; }
 
 .day-heading-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.side-label-link { padding: 0; color: inherit; background: transparent; border: 0; font: inherit; cursor: pointer; }
+.lead-project-card { width: min(100%, 520px); margin: 14px 0 12px; padding: 11px 12px; display: flex; align-items: center; gap: 10px; color: #4d6d64; background: #edf4ee; border: 1px solid #dce9df; border-radius: 8px; text-align: left; }
+.lead-project-card:hover { background: #e7f0e9; border-color: #c9ded0; }
+.lead-project-card > span:nth-child(2) { flex: 1; min-width: 0; }
+.lead-project-card small, .lead-project-card strong, .lead-project-card em { display: block; }
+.lead-project-card small { color: #789088; font-size: 9px; }.lead-project-card strong { margin: 2px 0; color: #275c52; font-size: 13px; }.lead-project-card em { color: #628077; font-size: 10px; font-style: normal; }
+.modal-header-actions { display: flex; align-items: center; gap: 7px; }
+.project-overview-list { display: grid; gap: 6px; }.project-overview-card { width: 100%; padding: 11px 8px; display: flex; align-items: center; gap: 10px; color: #547169; background: transparent; border: 1px solid transparent; border-radius: 7px; text-align: left; }.project-overview-card:hover { background: #eff4ef; border-color: #dce7dc; }.project-overview-card > span:nth-child(2) { flex: 1; min-width: 0; }.project-overview-card strong, .project-overview-card small { display: block; }.project-overview-card strong { color: #35584f; font-size: 13px; }.project-overview-card small { margin-top: 3px; color: #7d8d87; font-size: 10px; }.project-overview-card em { color: #3e766b; font: 600 11px 'DM Mono', monospace; font-style: normal; }.project-progress { height: 4px; margin-top: 8px; overflow: hidden; background: #dce8df; border-radius: 99px; }.project-progress i { display: block; height: 100%; background: #55a496; border-radius: inherit; }
 .day-heading-row h1 { flex: 1; min-width: 0; }
 .new-task-button { min-height: 33px; display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; margin-bottom: 10px; padding: 7px 10px; color: #28685e; background: #e2f0e9; border: 1px solid #cce3d7; border-radius: 6px; font-size: 11px; font-weight: 650; }
 .new-task-button:hover { background: #d8ece2; border-color: #b9d8ca; }

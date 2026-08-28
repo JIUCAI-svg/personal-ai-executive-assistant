@@ -69,3 +69,17 @@ test('buffer setting accepts zero and is reflected in the plan', async () => {
   assert.equal(result.plan.configured_buffer_minutes, 0);
   assert.equal(result.plan.buffer_minutes, 0);
 });
+
+test('goals and projects support deadlines and task estimates', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'forward-projects-'));
+  const store = new AssistantStateStore(root);
+  await store.bootstrap();
+  const project = await store.createProject({ name: '本周发布计划', kind: 'goal', priority: 5, due_at: '2026-09-05T23:59:00+08:00' });
+  assert.equal(project.kind, 'goal');
+  assert.equal(project.due_at, '2026-09-05T23:59:00+08:00');
+  const task = (await store.executeActions([{ type: 'create_task', title: '准备发布素材', project: project.name, estimated_minutes: 90, due_at: '2026-09-03T18:00:00+08:00' }])).results[0].task;
+  assert.equal(task.project_id, project.id);
+  assert.equal(task.due_at, '2026-09-03T18:00:00+08:00');
+  const updated = await store.updateTask(task.id, { due_at: '2026-09-04T18:00:00+08:00' });
+  assert.equal(updated.due_at, '2026-09-04T18:00:00+08:00');
+});

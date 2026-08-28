@@ -106,11 +106,11 @@ export function createDefaultAssistantState() {
     updated_at: createdAt,
     settings: { ...DEFAULT_SETTINGS },
     projects: [
-      { id: examProject, name: '9 月 5 日补考', description: '两门补考，当前最高优先级。', status: 'active', priority: 5, created_at: createdAt },
-      { id: revenueProject, name: '多手机收益实验', description: '持续记录和复盘收益数据。', status: 'active', priority: 3, created_at: createdAt },
-      { id: dramaProject, name: 'AI 恐怖灵异漫剧', description: '抖音号内容计划。', status: 'active', priority: 3, created_at: createdAt },
-      { id: liveProject, name: '和平精英特色直播', description: '特色玩法与直播计划。', status: 'active', priority: 2, created_at: createdAt },
-      { id: brainProject, name: '第二大脑', description: '个人 AI 执行助手长期项目。', status: 'active', priority: 4, created_at: createdAt }
+      { id: examProject, name: '9 月 5 日补考', description: '两门补考，当前最高优先级。', kind: 'goal', status: 'active', priority: 5, due_at: '2026-09-05T23:59:00+08:00', created_at: createdAt },
+      { id: revenueProject, name: '多手机收益实验', description: '持续记录和复盘收益数据。', kind: 'project', status: 'active', priority: 3, due_at: null, created_at: createdAt },
+      { id: dramaProject, name: 'AI 恐怖灵异漫剧', description: '抖音号内容计划。', kind: 'project', status: 'active', priority: 3, due_at: null, created_at: createdAt },
+      { id: liveProject, name: '和平精英特色直播', description: '特色玩法与直播计划。', kind: 'project', status: 'active', priority: 2, due_at: null, created_at: createdAt },
+      { id: brainProject, name: '第二大脑', description: '个人 AI 执行助手长期项目。', kind: 'goal', status: 'active', priority: 4, due_at: null, created_at: createdAt }
     ],
     tasks: [
       { id: id(), project_id: examProject, title: '高等数学错题回顾', notes: '第 2 章极限与连续', status: 'open', priority: 5, estimated_minutes: 50, actual_minutes: 0, sort_order: 10, due_at: '2026-09-05T23:59:00+08:00', created_at: createdAt, updated_at: createdAt },
@@ -160,7 +160,14 @@ export function repairAssistantState(source) {
     ...base,
     ...state,
     settings: { ...DEFAULT_SETTINGS, ...(state.settings || {}) },
-    projects: Array.isArray(state.projects) ? state.projects : base.projects,
+    projects: (Array.isArray(state.projects) ? state.projects : base.projects).map((project, index) => ({
+      ...project,
+      kind: project.kind === 'goal' ? 'goal' : 'project',
+      status: ['active', 'paused', 'completed', 'archived'].includes(project.status) ? project.status : 'active',
+      priority: taskPriority(project.priority),
+      due_at: typeof project.due_at === 'string' && project.due_at.trim() ? project.due_at.trim() : null,
+      created_at: project.created_at || base.projects[index % base.projects.length]?.created_at
+    })),
     tasks: (Array.isArray(state.tasks) ? state.tasks : base.tasks).map((task, index) => ({
       ...task,
       priority: taskPriority(task.priority),
@@ -653,6 +660,37 @@ export class AssistantStateStore {
       .slice().sort((a, b) => (Number(b.priority) - Number(a.priority)) || (Number(a.sort_order) - Number(b.sort_order)) || String(a.created_at).localeCompare(String(b.created_at)));
   }
 
+  async createProject(values = {}) {
+    return this.mutate((state) => {
+      const name = normalizeText(values.name, 120);
+      if (!name) return null;
+      const current = isoAt(nowParts().date, nowParts().time);
+      const project = {
+        id: id(), name, description: normalizeText(values.description, 500),
+        kind: values.kind === 'goal' ? 'goal' : 'project', status: 'active',
+        priority: taskPriority(values.priority), due_at: normalizeText(values.due_at, 48) || null,
+        created_at: current, updated_at: current
+      };
+      state.projects.push(project);
+      return project;
+    });
+  }
+
+  async updateProject(projectId, values = {}) {
+    return this.mutate((state) => {
+      const project = state.projects.find((item) => item.id === projectId);
+      if (!project) return null;
+      if (values.name !== undefined) project.name = normalizeText(values.name, 120) || project.name;
+      if (values.description !== undefined) project.description = normalizeText(values.description, 500);
+      if (values.kind !== undefined) project.kind = values.kind === 'goal' ? 'goal' : 'project';
+      if (values.priority !== undefined) project.priority = taskPriority(values.priority);
+      if (values.due_at !== undefined) project.due_at = normalizeText(values.due_at, 48) || null;
+      if (['active', 'paused', 'completed', 'archived'].includes(values.status)) project.status = values.status;
+      project.updated_at = isoAt(nowParts().date, nowParts().time);
+      return project;
+    });
+  }
+
   async updateTask(taskId, values = {}) {
     return this.mutate((state) => {
       const task = state.tasks.find((item) => item.id === taskId);
@@ -962,7 +1000,7 @@ export class AssistantStateStore {
             const projectName = normalizeText(action.project, 80);
             let project = state.projects.find((item) => item.name === projectName);
             if (!project && projectName) {
-              project = { id: id(), name: projectName, description: '', status: 'active', priority: 3, created_at: timestamp };
+              project = { id: id(), name: projectName, description: '', kind: 'project', status: 'active', priority: 3, due_at: null, created_at: timestamp, updated_at: timestamp };
               state.projects.push(project);
             }
             const task = {
@@ -987,6 +1025,12 @@ export class AssistantStateStore {
                 if (action.notes !== undefined) task.notes = normalizeText(action.notes, 500);
                 if (action.estimated_minutes !== undefined) task.estimated_minutes = Math.max(5, Math.min(720, Number(action.estimated_minutes) || task.estimated_minutes));
                 if (action.priority !== undefined) task.priority = taskPriority(action.priority);
+                if (action.due_at !== undefined) task.due_at = normalizeText(action.due_at, 48) || null;
+                if (action.project !== undefined) {
+                  const projectName = normalizeText(action.project, 120);
+                  const project = state.projects.find((item) => item.name === projectName);
+                  if (project) task.project_id = project.id;
+                }
                 task.updated_at = timestamp; result = { type, ok: true, task, reason: '任务内容已更新。' };
               } else if (type === 'reopen_task') {
                 task.status = 'open'; delete task.completed_at; task.updated_at = timestamp; result = { type, ok: true, task, reason: '任务已重新打开。' };

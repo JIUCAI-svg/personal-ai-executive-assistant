@@ -92,7 +92,10 @@ function App() {
   const [showConversationOptions, setShowConversationOptions] = useState(false);
   const [showNewConversation, setShowNewConversation] = useState(false);
   const [showNewTask, setShowNewTask] = useState(false);
-  const [newTask, setNewTask] = useState({ title: '', estimated_minutes: '45', priority: '3', project_id: '', notes: '' });
+  const [newTask, setNewTask] = useState({ title: '', estimated_minutes: '45', priority: '3', project_id: '', due_at: '', notes: '' });
+  const [showProjects, setShowProjects] = useState(false);
+  const [showNewProject, setShowNewProject] = useState(false);
+  const [projectDraft, setProjectDraft] = useState({ name: '', description: '', kind: 'project', priority: '3', due_at: '' });
   const [taskBusy, setTaskBusy] = useState(false);
   const [showSidebar, setShowSidebar] = useState(false);
   const [memoryScope, setMemoryScope] = useState(true);
@@ -143,8 +146,12 @@ function App() {
     const tasks = (assistantState?.tasks || []).filter((task) => task.project_id === item.id);
     const done = tasks.filter((task) => task.status === 'done').length;
     const progress = tasks.length ? Math.round((done / tasks.length) * 100) : 0;
-    return { ...item, color: ['coral', 'teal', 'violet', 'blue'][index % 4], progress, detail: `${tasks.filter((task) => ['open', 'in_progress', 'deferred'].includes(task.status)).length} 项待推进` };
+    const remainingMinutes = tasks.filter((task) => !['done', 'cancelled'].includes(task.status)).reduce((total, task) => total + (Number(task.estimated_minutes) || 0), 0);
+    const dueDate = item.due_at ? new Date(item.due_at) : null;
+    const daysLeft = dueDate && !Number.isNaN(dueDate.getTime()) ? Math.ceil((dueDate.getTime() - Date.now()) / 86400000) : null;
+    return { ...item, color: ['coral', 'teal', 'violet', 'blue'][index % 4], progress, remainingMinutes, daysLeft, detail: `${tasks.filter((task) => ['open', 'in_progress', 'deferred'].includes(task.status)).length} 项待推进` };
   }), [assistantState, projects]);
+  const leadProject = projectSummaries.filter((item) => item.status === 'active').sort((a, b) => (b.priority - a.priority) || ((a.daysLeft ?? 9999) - (b.daysLeft ?? 9999)))[0] || null;
   const current = plan.find((item) => item.state === 'current');
   const next = plan.find((item) => item.state === 'next' || item.state === 'planned');
   const planned = plan.filter((item) => !['done', 'deferred', 'cancelled'].includes(item.state));
@@ -562,6 +569,7 @@ function App() {
             estimated_minutes: Number(newTask.estimated_minutes) || 45,
             priority: Number(newTask.priority) || 3,
             project: selectedProject?.name || undefined,
+            due_at: newTask.due_at ? new Date(newTask.due_at).toISOString() : undefined,
             reason: newTask.notes.trim()
           }]
         })
@@ -569,7 +577,7 @@ function App() {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '新建任务失败');
       applyAssistantData(payload);
-      setNewTask({ title: '', estimated_minutes: '45', priority: '3', project_id: '', notes: '' });
+      setNewTask({ title: '', estimated_minutes: '45', priority: '3', project_id: '', due_at: '', notes: '' });
       setShowNewTask(false);
       loadThreads();
     } catch (error) {
@@ -577,6 +585,26 @@ function App() {
     } finally {
       setTaskBusy(false);
     }
+  }
+
+  async function createProjectManually(event) {
+    event.preventDefault();
+    const name = projectDraft.name.trim();
+    if (!name || taskBusy) return;
+    setTaskBusy(true);
+    try {
+      const response = await apiFetch('/api/assistant/projects', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...projectDraft, name, priority: Number(projectDraft.priority) || 3, due_at: projectDraft.due_at ? new Date(projectDraft.due_at).toISOString() : null })
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '新建项目失败');
+      applyAssistantData(payload);
+      setProjectDraft({ name: '', description: '', kind: 'project', priority: '3', due_at: '' });
+      setShowNewProject(false);
+      setNotice('目标或项目已创建。');
+    } catch (error) { setNotice(error.message || '新建项目失败'); }
+    finally { setTaskBusy(false); }
   }
 
   async function handleUserMessage(text) {
@@ -803,7 +831,7 @@ function App() {
           <button className="nav-item" onClick={() => setShowHistory(true)}><ListChecks size={18} /> 计划历史</button>
         </nav>
         <div className="side-section">
-          <div className="side-label">进行中的项目 <button aria-label="添加项目"><Plus size={15} /></button></div>
+          <div className="side-label"><button className="side-label-link" onClick={() => setShowProjects(true)}>目标与项目</button> <button aria-label="添加项目" onClick={() => setShowNewProject(true)}><Plus size={15} /></button></div>
           {projectSummaries.map((item) => (
             <button className="project-link" key={item.id} onClick={() => selectMode('project', item.id)}>
               <span className={`project-dot ${item.color}`} /> <span>{item.name}</span><small>{item.progress}%</small>
@@ -853,6 +881,7 @@ function App() {
           <div className="chat-column">
             <section className="day-intro">
               <div className="date-kicker"><span className="pulse-dot" /> {dateKicker()}</div>
+              {leadProject && <button className="lead-project-card" onClick={() => setShowProjects(true)}><span className={`project-dot ${leadProject.color}`} /><span><small>当前主线 · {leadProject.kind === 'goal' ? '目标' : '项目'}</small><strong>{leadProject.name}</strong><em>{leadProject.daysLeft === null ? '持续推进' : leadProject.daysLeft < 0 ? '已逾期' : `还有 ${leadProject.daysLeft} 天`} · 完成 {leadProject.progress}%</em></span><ChevronRight size={17} /></button>}
               <div className="day-heading-row"><h1>今天，先把最重要的事做下去。</h1><button className="new-task-button" type="button" onClick={() => setShowNewTask(true)}><Plus size={16} /> 新建任务</button></div>
               <p>现在 <strong>{planner?.now?.slice(-5) || now}</strong> · 可自主调整 <strong>{planner ? formatMinutes(planner.free_minutes) : '加载中'}</strong> · 已安排 <strong>{planner ? formatMinutes(planner.scheduled_minutes) : formatMinutes(scheduleMinutes)}</strong></p>
             </section>
@@ -918,7 +947,9 @@ function App() {
       </main>
 
       {showNewConversation && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="新建对话"><button className="modal-backdrop" onClick={() => setShowNewConversation(false)} aria-label="关闭新建对话" /><section className="new-conversation-modal"><div className="modal-header"><div><span>新建对话</span><p>选择 AI 本次可以了解什么。</p></div><button className="icon-button" onClick={() => setShowNewConversation(false)} aria-label="关闭"><X size={20} /></button></div><div className="new-mode-list">{modes.map((item) => { const Icon = item.icon; return <button key={item.id} onClick={() => selectMode(item.id)}><span className={`new-mode-icon ${item.id}`}><Icon size={20} /></span><span><strong>{item.label}</strong><small>{item.description}</small></span><ChevronRight size={18} /></button>; })}</div></section></div>}
-      {showNewTask && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="新建任务"><button className="modal-backdrop" onClick={() => setShowNewTask(false)} aria-label="关闭新建任务" /><section className="task-modal"><div className="modal-header"><div><span>新建任务</span><p>设置完成它所需的时间和优先级。</p></div><button className="icon-button" type="button" onClick={() => setShowNewTask(false)} aria-label="关闭"><X size={20} /></button></div><form className="task-form" onSubmit={createTaskManually}><label>任务内容<input autoFocus value={newTask.title} onChange={(event) => setNewTask((current) => ({ ...current, title: event.target.value }))} placeholder="例如：复习高等数学错题" maxLength={120} required /></label><div className="task-form-grid"><label>预计时长（分钟）<input type="number" min="5" max="720" step="5" value={newTask.estimated_minutes} onChange={(event) => setNewTask((current) => ({ ...current, estimated_minutes: event.target.value }))} /></label><label>所属项目<select value={newTask.project_id} onChange={(event) => setNewTask((current) => ({ ...current, project_id: event.target.value }))}><option value="">不指定项目</option>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label></div><fieldset className="priority-field"><legend>优先级</legend><div className="priority-options">{[{ value: '5', label: '高', tone: 'high', detail: '优先安排' }, { value: '3', label: '中', tone: 'medium', detail: '正常推进' }, { value: '1', label: '低', tone: 'low', detail: '有空再做' }].map((item) => <label className={`priority-option ${item.tone}`} key={item.value}><input type="radio" name="task-priority" value={item.value} checked={newTask.priority === item.value} onChange={(event) => setNewTask((current) => ({ ...current, priority: event.target.value }))} /><span className="priority-swatch" /><span><strong>{item.label}</strong><small>{item.detail}</small></span></label>)}</div></fieldset><label>备注（可选）<textarea rows="3" value={newTask.notes} onChange={(event) => setNewTask((current) => ({ ...current, notes: event.target.value }))} placeholder="补充范围、完成标准或提醒" maxLength={500} /></label><div className="task-form-actions"><button className="text-command" type="button" onClick={() => setShowNewTask(false)}>取消</button><button className="primary-command" type="submit" disabled={taskBusy || !newTask.title.trim()}>{taskBusy ? '正在创建…' : '创建任务'}</button></div></form></section></div>}
+      {showNewTask && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="新建任务"><button className="modal-backdrop" onClick={() => setShowNewTask(false)} aria-label="关闭新建任务" /><section className="task-modal"><div className="modal-header"><div><span>新建任务</span><p>设置完成它所需的时间和优先级。</p></div><button className="icon-button" type="button" onClick={() => setShowNewTask(false)} aria-label="关闭"><X size={20} /></button></div><form className="task-form" onSubmit={createTaskManually}><label>任务内容<input autoFocus value={newTask.title} onChange={(event) => setNewTask((current) => ({ ...current, title: event.target.value }))} placeholder="例如：复习高等数学错题" maxLength={120} required /></label><div className="task-form-grid"><label>预计时长（分钟）<input type="number" min="5" max="720" step="5" value={newTask.estimated_minutes} onChange={(event) => setNewTask((current) => ({ ...current, estimated_minutes: event.target.value }))} /></label><label>所属项目<select value={newTask.project_id} onChange={(event) => setNewTask((current) => ({ ...current, project_id: event.target.value }))}><option value="">不指定项目</option>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label></div><label>截止日期（可选）<input type="datetime-local" value={newTask.due_at} onChange={(event) => setNewTask((current) => ({ ...current, due_at: event.target.value }))} /></label><fieldset className="priority-field"><legend>优先级</legend><div className="priority-options">{[{ value: '5', label: '高', tone: 'high', detail: '优先安排' }, { value: '3', label: '中', tone: 'medium', detail: '正常推进' }, { value: '1', label: '低', tone: 'low', detail: '有空再做' }].map((item) => <label className={`priority-option ${item.tone}`} key={item.value}><input type="radio" name="task-priority" value={item.value} checked={newTask.priority === item.value} onChange={(event) => setNewTask((current) => ({ ...current, priority: event.target.value }))} /><span className="priority-swatch" /><span><strong>{item.label}</strong><small>{item.detail}</small></span></label>)}</div></fieldset><label>备注（可选）<textarea rows="3" value={newTask.notes} onChange={(event) => setNewTask((current) => ({ ...current, notes: event.target.value }))} placeholder="补充范围、完成标准或提醒" maxLength={500} /></label><div className="task-form-actions"><button className="text-command" type="button" onClick={() => setShowNewTask(false)}>取消</button><button className="primary-command" type="submit" disabled={taskBusy || !newTask.title.trim()}>{taskBusy ? '正在创建…' : '创建任务'}</button></div></form></section></div>}
+      {showProjects && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="目标与项目"><button className="modal-backdrop" onClick={() => setShowProjects(false)} aria-label="关闭目标与项目" /><section className="history-modal project-modal"><div className="modal-header"><div><span>目标与项目</span><p>长期目标负责方向，项目和截止任务负责推进。</p></div><div className="modal-header-actions"><button className="secondary-command" onClick={() => setShowNewProject(true)}><Plus size={15} /> 新建</button><button className="icon-button" onClick={() => setShowProjects(false)} aria-label="关闭"><X size={20} /></button></div></div><div className="project-overview-list">{projectSummaries.map((item) => <button className="project-overview-card" key={item.id} onClick={() => { setProjectId(item.id); setShowProjects(false); selectMode('project', item.id); }}><span className={`project-dot ${item.color}`} /><span><strong>{item.name}</strong><small>{item.kind === 'goal' ? '长期目标' : '项目'} · {item.daysLeft === null ? '持续推进' : item.daysLeft < 0 ? '已逾期' : `还有 ${item.daysLeft} 天`} · 剩余约 {formatMinutes(item.remainingMinutes)}</small><div className="project-progress"><i style={{ width: `${item.progress}%` }} /></div></span><em>{item.progress}%</em><ChevronRight size={17} /></button>)}</div></section></div>}
+      {showNewProject && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="新建目标或项目"><button className="modal-backdrop" onClick={() => setShowNewProject(false)} aria-label="关闭新建目标或项目" /><section className="task-modal"><div className="modal-header"><div><span>新建目标或项目</span><p>先确定方向，再把任务拆进今天。</p></div><button className="icon-button" onClick={() => setShowNewProject(false)} aria-label="关闭"><X size={20} /></button></div><form className="task-form" onSubmit={createProjectManually}><label>名称<input autoFocus value={projectDraft.name} onChange={(event) => setProjectDraft((current) => ({ ...current, name: event.target.value }))} placeholder="例如：通过 9 月 5 日补考" required /></label><label>类型<select value={projectDraft.kind} onChange={(event) => setProjectDraft((current) => ({ ...current, kind: event.target.value }))}><option value="goal">长期目标</option><option value="project">项目</option></select></label><label>截止日期（可选）<input type="datetime-local" value={projectDraft.due_at} onChange={(event) => setProjectDraft((current) => ({ ...current, due_at: event.target.value }))} /></label><label>说明（可选）<textarea rows="3" value={projectDraft.description} onChange={(event) => setProjectDraft((current) => ({ ...current, description: event.target.value }))} placeholder="想达成什么，为什么重要" /></label><div className="task-form-actions"><button className="text-command" type="button" onClick={() => setShowNewProject(false)}>取消</button><button className="primary-command" type="submit" disabled={taskBusy || !projectDraft.name.trim()}>{taskBusy ? '正在创建…' : '创建'}</button></div></form></section></div>}
       {showHistory && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="所有对话"><button className="modal-backdrop" onClick={() => setShowHistory(false)} aria-label="关闭对话历史" /><section className="history-modal"><div className="modal-header"><div><span>所有对话</span><p>恢复任一已保存的对话，继续使用原来的上下文。</p></div><button className="icon-button" onClick={() => setShowHistory(false)} aria-label="关闭"><X size={20} /></button></div><div className="history-list">{threads.length ? threads.map((thread) => <button key={thread.id} onClick={() => openThread(thread.id)}><MessageCircle size={17} /><span><strong>{modes.find((item) => item.id === thread.mode)?.label || '对话'}{thread.project_name ? ` · ${thread.project_name}` : ''}</strong><small>{thread.preview || '尚未发送消息'} · {messageTime(thread.updated_at)}</small></span><em>{thread.message_count}</em><ChevronRight size={17} /></button>) : <p className="empty-state">还没有已保存的对话。</p>}</div></section></div>}
       {showVault && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="本地知识库"><button className="modal-backdrop" onClick={() => { setShowVault(false); setSelectedDocument(null); }} aria-label="关闭知识库" /><section className="vault-modal"><div className="modal-header"><div><span>本地知识库</span><p>{vault.connected ? `${vault.documentCount} 篇 Markdown · ${vault.folders.length} 个目录 · 文件改动会自动刷新` : '尚未连接本地桥接服务'}</p></div><button className="icon-button" onClick={() => { setShowVault(false); setSelectedDocument(null); }} aria-label="关闭"><X size={20} /></button></div>{vaultError && <p className="vault-modal-error">{vaultError}</p>}{selectedDocument ? <div className="document-reader"><button className="back-button" onClick={() => setSelectedDocument(null)}>‹ 返回资料列表</button><small>{selectedDocument.relativePath}</small><h2>{selectedDocument.title}</h2><pre>{selectedDocument.content}</pre></div> : <><div className="vault-modal-toolbar"><span className={`connection-status ${vault.connected ? 'online' : ''}`}><span /> {vault.connected ? '已连接到 Obsidian 文件夹' : '等待桥接服务'}</span><button className="icon-button" onClick={() => loadVault(true)} aria-label="刷新知识库"><RefreshCw size={17} /></button></div><div className="vault-document-list">{vaultDocuments.map((document) => <button key={document.id} onClick={() => openDocument(document.id)}><FileText size={18} /><span><strong>{document.title}</strong><small>{document.folder} · {document.preview || '没有正文摘要'}</small></span><ChevronRight size={17} /></button>)}{vault.connected && vaultDocuments.length === 0 && <p className="empty-state">知识库里还没有 Markdown 资料。</p>}</div></>}</section></div>}
       {showAiSettings && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="AI 与记忆设置"><button className="modal-backdrop" onClick={() => setShowAiSettings(false)} aria-label="关闭 AI 设置" /><section className="account-modal ai-settings-modal"><div className="modal-header"><div><span>AI 与自增长记忆库</span><p>日常对话和每日整理各自选择模型；原始对话始终保留，整理结果可追溯、可确认。</p></div><button className="icon-button" onClick={() => setShowAiSettings(false)} aria-label="关闭"><X size={20} /></button></div>
