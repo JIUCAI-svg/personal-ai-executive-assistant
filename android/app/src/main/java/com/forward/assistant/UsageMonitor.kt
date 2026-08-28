@@ -15,6 +15,7 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
+import android.widget.RemoteViews
 import android.os.Process
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -96,10 +97,7 @@ object UsageMonitorStore {
     private const val KEY_TOP_APPS = "top_apps"
     private const val KEY_DEVICE_ACTIVITY = "device_activity"
     private const val KEY_AUTO_TOP_TEN = "auto_top_ten"
-    // Existing installs keep this target until the user changes the selection.
-    private const val DEFAULT_PACKAGE = "com.ss.android.ugc.aweme.lite"
-    private const val DEFAULT_APP_NAME = "抖音极速版"
-
+    private const val KEY_PLAN_SUMMARY = "plan_summary"
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     fun enabled(context: Context): Boolean = prefs(context).getBoolean("enabled", false)
@@ -111,7 +109,9 @@ object UsageMonitorStore {
     fun targetApps(context: Context): List<InstalledUsageApp> {
         val preferences = prefs(context)
         if (!preferences.contains(KEY_TARGET_PACKAGES)) {
-            return listOf(InstalledUsageApp(appName(context), packageName(context)))
+            // An untouched install has no user-selected targets. Do not infer one
+            // from legacy defaults or the app package itself.
+            return emptyList()
         }
         val names = runCatching { JSONObject(preferences.getString(KEY_TARGET_NAMES, "{}") ?: "{}") }.getOrDefault(JSONObject())
         return preferences.getStringSet(KEY_TARGET_PACKAGES, emptySet()).orEmpty()
@@ -126,14 +126,19 @@ object UsageMonitorStore {
             .sortedBy { it.appName.lowercase() }
     }
 
-    fun packageName(context: Context): String = prefs(context).getString("package_name", DEFAULT_PACKAGE).orEmpty()
+    fun packageName(context: Context): String = prefs(context).getString("package_name", "").orEmpty()
 
-    fun appName(context: Context): String = prefs(context).getString("app_name", DEFAULT_APP_NAME).orEmpty()
+    fun appName(context: Context): String = prefs(context).getString("app_name", "").orEmpty()
 
     fun saveTarget(context: Context, appName: String, packageName: String) {
+        val cleanedPackage = packageName.trim()
+        if (cleanedPackage.isBlank()) {
+            saveTargets(context, emptyList())
+            return
+        }
         saveTargets(context, listOf(InstalledUsageApp(
-            appName.trim().ifBlank { DEFAULT_APP_NAME },
-            packageName.trim().ifBlank { DEFAULT_PACKAGE }
+            appName.trim().ifBlank { cleanedPackage },
+            cleanedPackage
         )))
     }
 
@@ -147,8 +152,8 @@ object UsageMonitorStore {
         prefs(context).edit()
             .putStringSet(KEY_TARGET_PACKAGES, cleaned.map { it.packageName }.toSet())
             .putString(KEY_TARGET_NAMES, names.toString())
-            .putString("app_name", first?.appName ?: DEFAULT_APP_NAME)
-            .putString("package_name", first?.packageName ?: DEFAULT_PACKAGE)
+            .putString("app_name", first?.appName.orEmpty())
+            .putString("package_name", first?.packageName.orEmpty())
             .apply()
     }
 
@@ -167,6 +172,26 @@ object UsageMonitorStore {
             .putInt("daily_limit", daily.coerceIn(1, 24 * 60))
             .putInt("session_limit", session.coerceIn(1, 24 * 60))
             .apply()
+    }
+
+    fun savePlanSummary(context: Context, plan: RemotePlan?) {
+        val value = plan?.let {
+            JSONObject().apply {
+                put("available_minutes", it.availableMinutes)
+                put("scheduled_minutes", it.scheduledMinutes)
+                put("buffer_minutes", it.bufferMinutes)
+                put("free_minutes", it.freeMinutes)
+                put("current_task", it.scheduled.firstOrNull { item -> item.id == it.currentTaskId }?.title.orEmpty())
+                put("active_elapsed_seconds", it.activeTimer?.elapsedSeconds ?: 0L)
+                put("updated_at", System.currentTimeMillis())
+            }.toString()
+        }.orEmpty()
+        prefs(context).edit().putString(KEY_PLAN_SUMMARY, value).apply()
+    }
+
+    fun planSummary(context: Context): JSONObject? {
+        val value = prefs(context).getString(KEY_PLAN_SUMMARY, "").orEmpty()
+        return value.takeIf { it.isNotBlank() }?.let { runCatching { JSONObject(it) }.getOrNull() }
     }
 
     fun snapshot(context: Context): UsageMonitorSnapshot {
@@ -395,6 +420,10 @@ class UsageMonitorService : Service() {
         val topApps = if (UsageMonitorStore.autoTopTen(this)) calculateTopApps(usageManager, startOfDay, now, installed) else emptyList()
         val deviceActivity = calculateDeviceActivity(usageManager, startOfDay, now, installed)
         UsageMonitorStore.saveUsage(this, targetSnapshots, topApps, deviceActivity)
+        getSystemService(NotificationManager::class.java).notify(
+            UsageMonitorNotification.ONGOING_ID,
+            buildOngoingNotification()
+        )
         val snapshot = UsageMonitorStore.snapshot(this)
         if (UsageMonitorStore.shouldUpload(this)) uploadUsage(snapshot)
         sendTargetReminders(targetSnapshots)
@@ -596,20 +625,53 @@ class UsageMonitorService : Service() {
         val intent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(this, 1002, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val targets = UsageMonitorStore.targetApps(this)
+        val plan = UsageMonitorStore.planSummary(this)
+        val planText = plan?.let {
+            val available = formatMinutes(it.optInt("available_minutes"))
+            val scheduled = formatMinutes(it.optInt("scheduled_minutes"))
+            Pair("待完成 $scheduled", "剩余可用 $available")
+        }
         val description = when {
             targets.isEmpty() && UsageMonitorStore.autoTopTen(this) -> "正在记录当天使用时长前 10 的应用"
-            targets.size == 1 && UsageMonitorStore.autoTopTen(this) -> "正在关注 ${targets.first().appName}，并记录当天前 10"
+            targets.isEmpty() -> "未设置关注应用"
+            targets.size == 1 && UsageMonitorStore.autoTopTen(this) -> "已关注 ${targets.first().appName}，同时记录当天前 10"
             targets.size == 1 -> "正在记录 ${targets.first().appName} 的使用时长"
-            else -> "正在关注 ${targets.size} 个应用，并记录当天前 10"
+            UsageMonitorStore.autoTopTen(this) -> "已关注 ${targets.size} 个应用，同时记录当天前 10"
+            else -> "已关注 ${targets.size} 个应用"
         }
-        return NotificationCompat.Builder(this, UsageMonitorNotification.CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, UsageMonitorNotification.CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_forward)
-            .setContentTitle("向前 · 使用监控已开启")
-            .setContentText(description)
+            .setContentTitle("向前")
+            .setContentText(planText?.let { "${it.first} · ${it.second}" } ?: description)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
+        if (planText != null) {
+            val compact = RemoteViews(packageName, R.layout.notification_today).apply {
+                setViewVisibility(R.id.notification_title, android.view.View.GONE)
+                setTextViewText(R.id.notification_line_primary, planText.first)
+                setTextViewText(R.id.notification_line_secondary, planText.second)
+                setViewVisibility(R.id.notification_expanded, android.view.View.GONE)
+            }
+            val expanded = RemoteViews(packageName, R.layout.notification_today).apply {
+                setViewVisibility(R.id.notification_title, android.view.View.GONE)
+                setTextViewText(R.id.notification_line_primary, planText.first)
+                setTextViewText(R.id.notification_line_secondary, planText.second)
+            }
+            builder.setCustomContentView(compact).setCustomBigContentView(expanded)
+        }
+        return builder.build()
+    }
+
+    private fun formatMinutes(minutes: Int): String {
+        val safe = minutes.coerceAtLeast(0)
+        val hours = safe / 60
+        val remainder = safe % 60
+        return when {
+            hours > 0 && remainder > 0 -> "${hours}小时${remainder}分"
+            hours > 0 -> "${hours}小时"
+            else -> "${remainder}分"
+        }
     }
 }
 

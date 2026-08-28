@@ -27,6 +27,7 @@ test('responses uses input-text and extracts output_text', () => {
   assert.deepEqual(body.text, { format: { type: 'json_object' } });
   assert.deepEqual(body.reasoning, { effort: 'low' });
   assert.deepEqual(body.input[0], { role: 'developer', content: [{ type: 'input_text', text: '系统指令' }] });
+  assert.deepEqual(body.input[2], { role: 'assistant', content: [{ type: 'output_text', text: '好的' }] });
   assert.equal(extractAssistantText(provider, { output_text: '{"reply":"连接正常"}' }), '{"reply":"连接正常"}');
 });
 

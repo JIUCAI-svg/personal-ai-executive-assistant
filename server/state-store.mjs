@@ -113,12 +113,13 @@ export function createDefaultAssistantState() {
       { id: brainProject, name: '第二大脑', description: '个人 AI 执行助手长期项目。', status: 'active', priority: 4, created_at: createdAt }
     ],
     tasks: [
-      { id: id(), project_id: examProject, title: '高等数学错题回顾', notes: '第 2 章极限与连续', status: 'open', priority: 5, estimated_minutes: 50, actual_minutes: null, due_at: '2026-09-05T23:59:00+08:00', created_at: createdAt, updated_at: createdAt },
-      { id: id(), project_id: examProject, title: '英语阅读一篇并订正', notes: '计时完成后订正', status: 'open', priority: 5, estimated_minutes: 45, actual_minutes: null, due_at: '2026-09-05T23:59:00+08:00', created_at: createdAt, updated_at: createdAt },
-      { id: id(), project_id: revenueProject, title: '汇总今天的收益实验数据', notes: '记录关键数据和异常', status: 'open', priority: 3, estimated_minutes: 40, actual_minutes: null, due_at: null, created_at: createdAt, updated_at: createdAt },
-      { id: id(), project_id: dramaProject, title: '拆解一个热门开场', notes: '可顺延', status: 'open', priority: 2, estimated_minutes: 45, actual_minutes: null, due_at: null, created_at: createdAt, updated_at: createdAt },
-      { id: id(), project_id: liveProject, title: '设计一段特色玩法', notes: '可顺延', status: 'open', priority: 2, estimated_minutes: 45, actual_minutes: null, due_at: null, created_at: createdAt, updated_at: createdAt }
+      { id: id(), project_id: examProject, title: '高等数学错题回顾', notes: '第 2 章极限与连续', status: 'open', priority: 5, estimated_minutes: 50, actual_minutes: 0, sort_order: 10, due_at: '2026-09-05T23:59:00+08:00', created_at: createdAt, updated_at: createdAt },
+      { id: id(), project_id: examProject, title: '英语阅读一篇并订正', notes: '计时完成后订正', status: 'open', priority: 5, estimated_minutes: 45, actual_minutes: 0, sort_order: 20, due_at: '2026-09-05T23:59:00+08:00', created_at: createdAt, updated_at: createdAt },
+      { id: id(), project_id: revenueProject, title: '汇总今天的收益实验数据', notes: '记录关键数据和异常', status: 'open', priority: 3, estimated_minutes: 40, actual_minutes: 0, sort_order: 30, due_at: null, created_at: createdAt, updated_at: createdAt },
+      { id: id(), project_id: dramaProject, title: '拆解一个热门开场', notes: '可顺延', status: 'open', priority: 2, estimated_minutes: 45, actual_minutes: 0, sort_order: 40, due_at: null, created_at: createdAt, updated_at: createdAt },
+      { id: id(), project_id: liveProject, title: '设计一段特色玩法', notes: '可顺延', status: 'open', priority: 2, estimated_minutes: 45, actual_minutes: 0, sort_order: 50, due_at: null, created_at: createdAt, updated_at: createdAt }
     ],
+    time_sessions: [],
     unavailable_blocks: [],
     threads: [],
     messages: [],
@@ -129,10 +130,11 @@ export function createDefaultAssistantState() {
     action_logs: [],
     app_usage_daily: [],
     device_activity_daily: [],
+    alarms: [],
     ai_preferences: {
       provider_id: '', model: '', reasoning_effort: '',
       memory_provider_id: '', memory_model: '', memory_reasoning_effort: '',
-      memory_auto_daily: true, memory_daily_time: '03:30'
+      memory_auto_daily: true, memory_daily_time: '22:00'
     },
     // These are inferred bounds from Android UsageStats, never an automatic
     // replacement for the user's planned sleep/wake schedule.
@@ -143,12 +145,31 @@ export function createDefaultAssistantState() {
 export function repairAssistantState(source) {
   const base = createDefaultAssistantState();
   const state = source && typeof source === 'object' ? source : {};
+  const aiPreferences = {
+    provider_id: '', model: '', reasoning_effort: '',
+    memory_provider_id: '', memory_model: '', memory_reasoning_effort: '',
+    memory_auto_daily: true, memory_daily_time: '22:00',
+    ...(state.ai_preferences || {})
+  };
+  if (typeof aiPreferences.memory_auto_daily !== 'boolean') aiPreferences.memory_auto_daily = true;
+  if (!/^\d{2}:\d{2}$/.test(String(aiPreferences.memory_daily_time || '')) ||
+      Number(aiPreferences.memory_daily_time.slice(0, 2)) > 23 || Number(aiPreferences.memory_daily_time.slice(3, 5)) > 59) {
+    aiPreferences.memory_daily_time = '22:00';
+  }
   return {
     ...base,
     ...state,
     settings: { ...DEFAULT_SETTINGS, ...(state.settings || {}) },
     projects: Array.isArray(state.projects) ? state.projects : base.projects,
-    tasks: Array.isArray(state.tasks) ? state.tasks : base.tasks,
+    tasks: (Array.isArray(state.tasks) ? state.tasks : base.tasks).map((task, index) => ({
+      ...task,
+      priority: taskPriority(task.priority),
+      status: ['open', 'in_progress', 'done', 'cancelled', 'deferred'].includes(task.status) ? task.status : 'open',
+      actual_minutes: Math.max(0, Number(task.actual_minutes) || 0),
+      estimated_minutes: Math.max(5, Math.min(720, Number(task.estimated_minutes) || 45)),
+      sort_order: Number.isFinite(Number(task.sort_order)) ? Number(task.sort_order) : (index + 1) * 10
+    })),
+    time_sessions: Array.isArray(state.time_sessions) ? state.time_sessions : [],
     unavailable_blocks: Array.isArray(state.unavailable_blocks) ? state.unavailable_blocks : [],
     threads: Array.isArray(state.threads) ? state.threads : [],
     messages: Array.isArray(state.messages) ? state.messages : [],
@@ -159,18 +180,22 @@ export function repairAssistantState(source) {
     action_logs: Array.isArray(state.action_logs) ? state.action_logs : [],
     app_usage_daily: Array.isArray(state.app_usage_daily) ? state.app_usage_daily : [],
     device_activity_daily: Array.isArray(state.device_activity_daily) ? state.device_activity_daily : [],
-    ai_preferences: {
-      provider_id: '', model: '', reasoning_effort: '',
-      memory_provider_id: '', memory_model: '', memory_reasoning_effort: '',
-      memory_auto_daily: true, memory_daily_time: '03:30',
-      ...(state.ai_preferences || {})
-    },
+    alarms: Array.isArray(state.alarms) ? state.alarms : [],
+    ai_preferences: aiPreferences,
     sleep_wake_events: Array.isArray(state.sleep_wake_events) ? state.sleep_wake_events : []
   };
 }
 
 function taskProject(task, projects) {
   return projects.find((project) => project.id === task.project_id) || null;
+}
+
+function taskPriority(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 3;
+  if (numeric >= 4) return 5;
+  if (numeric >= 3) return 3;
+  return 1;
 }
 
 function taskMatches(task, query) {
@@ -187,9 +212,11 @@ function todayPlanningWindow(settings, current = nowParts()) {
   const isAfterMidnightBedtime = sleepMinutes < 8 * 60;
   let endDate = current.date;
   let endMinutes = sleepMinutes;
-  if (isAfterMidnightBedtime && currentMinutes >= 8 * 60) endDate = plusDays(current.date, 1);
+  // A bedtime after midnight belongs to the upcoming overnight window. When
+  // the current time has already passed it (for example 03:39 with 00:00),
+  // use the next day's bedtime instead of collapsing availability to zero.
+  if (isAfterMidnightBedtime && currentMinutes >= sleepMinutes) endDate = plusDays(current.date, 1);
   if (!isAfterMidnightBedtime && currentMinutes >= sleepMinutes) endMinutes = currentMinutes;
-  if (isAfterMidnightBedtime && currentMinutes < 8 * 60 && currentMinutes >= sleepMinutes) endMinutes = currentMinutes;
   const dayOffset = endDate === current.date ? 0 : 1;
   const totalUntilEnd = Math.max(0, dayOffset * 1440 + endMinutes - currentMinutes);
   return {
@@ -226,7 +253,7 @@ function buildPlan(state, current = nowParts()) {
   const window = todayPlanningWindow(state.settings, current);
   const taskItems = state.tasks
     .filter((task) => ['open', 'in_progress'].includes(task.status))
-    .sort((left, right) => (right.priority - left.priority) || (dueWeight(left) - dueWeight(right)) || left.created_at.localeCompare(right.created_at));
+    .sort((left, right) => (right.priority - left.priority) || (dueWeight(left) - dueWeight(right)) || ((Number(left.sort_order) || 0) - (Number(right.sort_order) || 0)) || left.created_at.localeCompare(right.created_at));
   const blocks = state.unavailable_blocks
     .filter((block) => block.date === current.date || block.date === window.end_date)
     .map((block) => ({
@@ -244,10 +271,27 @@ function buildPlan(state, current = nowParts()) {
   const totalUnavailable = mergeIntervals(blocks.map((block) => ({ start: block.start_absolute, end: block.end_absolute })))
     .reduce((total, block) => total + block.end - block.start, 0);
   const usableMinutes = Math.max(0, window.available_minutes - totalUnavailable);
-  const bufferMinutes = Math.min(Number(state.settings.buffer_minutes) || 60, Math.floor(usableMinutes * 0.35));
+  const configuredBufferMinutes = Number.isFinite(Number(state.settings.buffer_minutes))
+    ? Math.max(0, Math.min(1440, Number(state.settings.buffer_minutes)))
+    : DEFAULT_SETTINGS.buffer_minutes;
+  const bufferMinutes = Math.min(configuredBufferMinutes, usableMinutes);
   const planningLimit = window.end_absolute_minutes - bufferMinutes;
   let cursor = Math.min(window.end_absolute_minutes, window.current_minutes + 5);
   const scheduled = [];
+  const runningSession = (state.time_sessions || []).find((session) => session.status === 'running');
+  const activeTimer = runningSession ? {
+    task_id: runningSession.task_id,
+    mode: runningSession.mode || 'stopwatch',
+    target_minutes: Number(runningSession.target_minutes) || 0,
+    started_at: runningSession.started_at,
+    elapsed_seconds: Math.max(0, (runningSession.elapsed_seconds || 0) + Math.floor((Date.parse(isoAt(current.date, current.time)) - Date.parse(runningSession.started_at)) / 1000))
+  } : null;
+  const elapsedSecondsForTask = (taskId) => {
+    const sessions = (state.time_sessions || []).filter((session) => session.task_id === taskId);
+    const stored = sessions.reduce((total, session) => total + (Number(session.elapsed_seconds) || 0), 0);
+    if (runningSession?.task_id === taskId && activeTimer) return Math.max(stored, activeTimer.elapsed_seconds);
+    return stored;
+  };
   const deferred = state.tasks
     .filter((task) => task.status === 'deferred')
     .map((task) => ({ ...task, reason: '已按你的要求顺延，等待下次安排' }));
@@ -283,7 +327,9 @@ function buildPlan(state, current = nowParts()) {
       date: plusDays(current.date, dateOffset),
       status: task.status,
       due_at: task.due_at,
-      notes: task.notes || ''
+      notes: task.notes || '',
+      actual_minutes: task.actual_minutes || 0,
+      actual_seconds: elapsedSecondsForTask(task.id)
     });
     cursor = end;
   }
@@ -296,11 +342,17 @@ function buildPlan(state, current = nowParts()) {
     total_remaining_minutes: window.available_minutes,
     scheduled_minutes: scheduled.reduce((total, item) => total + item.estimated_minutes, 0),
     buffer_minutes: bufferMinutes,
+    configured_buffer_minutes: configuredBufferMinutes,
     free_minutes: Math.max(0, usableMinutes - bufferMinutes - scheduled.reduce((total, item) => total + item.estimated_minutes, 0)),
     unavailable_minutes: totalUnavailable,
     current_task: scheduled[0] || null,
     next_task: scheduled[1] || null,
+    active_timer: activeTimer,
     scheduled,
+    completed: state.tasks.filter((task) => task.status === 'done').slice().sort((a, b) => String(b.completed_at || '').localeCompare(String(a.completed_at || ''))).map((task) => ({
+      id: task.id, title: task.title, project: taskProject(task, state.projects)?.name || '未归类', priority: task.priority,
+      estimated_minutes: task.estimated_minutes, actual_minutes: task.actual_minutes || 0, status: task.status, completed_at: task.completed_at || '', notes: task.notes || ''
+    })),
     deferred,
     adjustment_reason: deferred.length
       ? '优先安排截止更近、优先级更高的事项，并为睡眠、不可用时段和缓冲时间留出空间。'
@@ -400,7 +452,12 @@ export class AssistantStateStore {
   }
 
   async bootstrap() {
-    const state = await this.read();
+    // Keep generated default project IDs stable across the first state read and the
+    // first conversation creation. Without this initialization, a fresh vault could
+    // generate a different default project list for each request.
+    const state = existsSync(this.filePath)
+      ? await this.read()
+      : await this.mutate((draft) => draft);
     return { ...state, plan: buildPlan(state), sleep_wake_summary: sleepWakeSummary(state) };
   }
 
@@ -501,14 +558,19 @@ export class AssistantStateStore {
         'provider_id', 'model', 'reasoning_effort',
         'memory_provider_id', 'memory_model', 'memory_reasoning_effort', 'memory_daily_time'
       ]) {
-        if (typeof preferences[key] === 'string') state.ai_preferences[key] = normalizeText(preferences[key], 160);
+        if (typeof preferences[key] === 'string') {
+          const value = normalizeText(preferences[key], 160);
+          if (key !== 'memory_daily_time' || (/^\d{2}:\d{2}$/.test(value) && Number(value.slice(0, 2)) <= 23 && Number(value.slice(3, 5)) <= 59)) {
+            state.ai_preferences[key] = value;
+          }
+        }
       }
       if (typeof preferences.memory_auto_daily === 'boolean') state.ai_preferences.memory_auto_daily = preferences.memory_auto_daily;
       return state.ai_preferences;
     });
   }
 
-  async startMemoryOrganizerRun({ date, provider_id, model, source_message_count = 0 } = {}) {
+  async startMemoryOrganizerRun({ date, provider_id, model, source_message_count = 0, source_message_ids = [] } = {}) {
     return this.mutate((state) => {
       const current = isoAt(nowParts().date, nowParts().time);
       state.memory_organizer_runs = Array.isArray(state.memory_organizer_runs) ? state.memory_organizer_runs : [];
@@ -519,6 +581,8 @@ export class AssistantStateStore {
         provider_id: normalizeText(provider_id, 120),
         model: normalizeText(model, 160),
         source_message_count: Math.max(0, Math.min(1000, Number(source_message_count) || 0)),
+        source_message_ids: [...new Set((Array.isArray(source_message_ids) ? source_message_ids : [])
+          .map((value) => normalizeText(value, 120)).filter(Boolean))].slice(0, 1000),
         created_memory_ids: [],
         updated_memory_ids: [],
         duplicate_memory_ids: [],
@@ -578,6 +642,86 @@ export class AssistantStateStore {
       if (content !== undefined) memory.content = normalizeText(content, 220);
       memory.updated_at = isoAt(nowParts().date, nowParts().time);
       return memory;
+    });
+  }
+
+  async listTasks(options = {}) {
+    const state = await this.read();
+    const includeCompleted = options.includeCompleted !== false;
+    return state.tasks
+      .filter((task) => includeCompleted || !['done', 'cancelled'].includes(task.status))
+      .slice().sort((a, b) => (Number(b.priority) - Number(a.priority)) || (Number(a.sort_order) - Number(b.sort_order)) || String(a.created_at).localeCompare(String(b.created_at)));
+  }
+
+  async updateTask(taskId, values = {}) {
+    return this.mutate((state) => {
+      const task = state.tasks.find((item) => item.id === taskId);
+      if (!task) return null;
+      const textFields = ['title', 'notes', 'due_at'];
+      for (const key of textFields) if (values[key] !== undefined) task[key] = normalizeText(values[key], key === 'notes' ? 500 : 240);
+      if (values.estimated_minutes !== undefined) task.estimated_minutes = Math.max(5, Math.min(720, Number(values.estimated_minutes) || task.estimated_minutes || 45));
+      if (values.priority !== undefined) task.priority = taskPriority(values.priority);
+      if (['open', 'in_progress', 'done', 'cancelled', 'deferred'].includes(values.status)) {
+        task.status = values.status;
+        if (values.status === 'done') task.completed_at ||= isoAt(nowParts().date, nowParts().time);
+        if (values.status !== 'done') delete task.completed_at;
+      }
+      task.updated_at = isoAt(nowParts().date, nowParts().time);
+      return task;
+    });
+  }
+
+  async reorderTasks(taskIds = []) {
+    return this.mutate((state) => {
+      const ids = Array.isArray(taskIds) ? taskIds.map((value) => String(value)) : [];
+      const seen = new Set();
+      ids.forEach((taskId, index) => {
+        const task = state.tasks.find((item) => item.id === taskId);
+        if (task && !seen.has(taskId)) { task.sort_order = (index + 1) * 10; task.updated_at = isoAt(nowParts().date, nowParts().time); seen.add(taskId); }
+      });
+      return state.tasks.slice().sort((a, b) => Number(a.sort_order) - Number(b.sort_order));
+    });
+  }
+
+  async taskTimer(taskId, operation, values = {}) {
+    return this.mutate((state) => {
+      const task = state.tasks.find((item) => item.id === taskId);
+      if (!task) return null;
+      // Timer actions need second precision; minute-only timestamps drop
+      // sub-minute progress when pausing or resuming from the mobile client.
+      const timestamp = new Date().toISOString();
+      state.time_sessions = Array.isArray(state.time_sessions) ? state.time_sessions : [];
+      const active = state.time_sessions.find((session) => session.status === 'running');
+      const nowMs = Date.now();
+      const close = (session, status = 'paused') => {
+        if (!session || session.status !== 'running') return;
+        const elapsed = Math.max(0, Math.floor((nowMs - Date.parse(session.started_at)) / 1000));
+        session.elapsed_seconds = (session.elapsed_seconds || 0) + elapsed;
+        session.ended_at = timestamp; session.status = status;
+        const target = state.tasks.find((item) => item.id === session.task_id);
+        if (target) target.actual_minutes = Math.round(state.time_sessions.filter((s) => s.task_id === target.id).reduce((sum, s) => sum + (s.elapsed_seconds || 0), 0) / 60);
+      };
+      if (operation === 'start') {
+        if (active && active.task_id !== taskId) close(active, 'paused');
+        const existing = state.time_sessions
+          .filter((session) => session.task_id === taskId && session.status === 'paused' && values.resume !== false)
+          .sort((left, right) => Date.parse(String(right.ended_at || '')) - Date.parse(String(left.ended_at || '')))[0];
+        if (existing) { existing.status = 'running'; existing.started_at = timestamp; existing.ended_at = null; }
+        else state.time_sessions.push({ id: id(), task_id: taskId, mode: values.mode === 'countdown' ? 'countdown' : 'stopwatch', target_minutes: Math.max(1, Number(values.target_minutes) || Number(task.estimated_minutes) || 45), started_at: timestamp, ended_at: null, elapsed_seconds: 0, status: 'running', created_at: timestamp });
+        task.status = 'in_progress'; task.updated_at = timestamp;
+      } else if (operation === 'pause' || operation === 'stop') {
+        const session = state.time_sessions.find((item) => item.task_id === taskId && item.status === 'running');
+        if (session) close(session, operation === 'stop' ? 'completed' : 'paused');
+        if (operation === 'stop' && task.status === 'in_progress') task.status = 'open';
+        task.updated_at = timestamp;
+      } else if (operation === 'complete') {
+        const session = state.time_sessions.find((item) => item.task_id === taskId && item.status === 'running');
+        if (session) close(session, 'completed');
+        task.status = 'done'; task.completed_at = timestamp; task.updated_at = timestamp;
+      } else if (operation === 'reopen') {
+        task.status = 'open'; delete task.completed_at; task.updated_at = timestamp;
+      }
+      return { task, sessions: state.time_sessions.filter((item) => item.task_id === taskId), active: state.time_sessions.find((item) => item.task_id === taskId && item.status === 'running') || null };
     });
   }
 
@@ -746,9 +890,11 @@ export class AssistantStateStore {
   async executeActions(actions, context = {}) {
     return this.mutate((state) => {
       const current = nowParts();
-      const timestamp = isoAt(current.date, current.time);
+      // Keep action timestamps precise so the mobile timer retains seconds.
+      const timestamp = new Date().toISOString();
       const results = [];
       const findTask = (query) => state.tasks.find((task) => ['open', 'in_progress', 'deferred'].includes(task.status) && taskMatches(task, query));
+      const findAnyTask = (query) => state.tasks.find((task) => taskMatches(task, query));
       const currentTask = () => buildPlan(state, current).current_task && state.tasks.find((task) => task.id === buildPlan(state, current).current_task.id);
 
       for (const action of Array.isArray(actions) ? actions : []) {
@@ -766,6 +912,50 @@ export class AssistantStateStore {
             state.settings.wake_time = value;
             result = { type, ok: true, value, reason: action.reason || '已更新明天起床时间。' };
           }
+        } else if (type === 'set_buffer_minutes') {
+          const numeric = Number(action.minutes);
+          if (Number.isFinite(numeric) && numeric >= 0 && numeric <= 1440) {
+            state.settings.buffer_minutes = Math.round(numeric);
+            result = { type, ok: true, value: state.settings.buffer_minutes, reason: action.reason || '已更新每日缓冲时间。' };
+          } else {
+            result = { type, ok: false, reason: '缓冲时间必须是 0 到 1440 分钟之间的数字。' };
+          }
+        } else if (type === 'set_alarm') {
+          const value = clock(action.time);
+          const date = /^\d{4}-\d{2}-\d{2}$/.test(String(action.date || '')) ? String(action.date) : null;
+          if (value) {
+            const alarm = {
+              id: id(), time: value, date,
+              label: normalizeText(action.label, 120) || '向前提醒',
+              repeat: action.repeat === 'daily' ? 'daily' : 'none',
+              status: 'pending_device', device_id: null,
+              created_at: timestamp, updated_at: timestamp
+            };
+            state.alarms.push(alarm);
+            state.alarms = state.alarms.slice(-200);
+            result = { type, ok: true, device_required: true, alarm, reason: action.reason || '已生成手机闹钟请求。' };
+          }
+        } else if (type === 'cancel_alarm') {
+          const requestedId = normalizeText(action.alarm_id, 80);
+          const requestedLabel = normalizeText(action.label, 120);
+          const requestedTime = clock(action.time);
+          const requestedDate = /^\d{4}-\d{2}-\d{2}$/.test(String(action.date || '')) ? String(action.date) : null;
+          const alarm = state.alarms
+            .filter((item) => ['pending_device', 'active'].includes(item.status))
+            .reverse()
+            .find((item) => requestedId
+              ? item.id === requestedId
+              : (!requestedLabel || item.label === requestedLabel)
+                && (!requestedTime || item.time === requestedTime)
+                && (!requestedDate || item.date === requestedDate));
+          if (alarm) {
+            alarm.status = 'cancelled'; alarm.updated_at = timestamp;
+            result = { type, ok: true, device_required: true, alarm, reason: action.reason || '手机闹钟已标记为取消。' };
+          } else {
+            result = { type, ok: false, device_required: true, alarm: {
+              id: requestedId || '', time: requestedTime || '', date: requestedDate, label: requestedLabel || ''
+            }, reason: '没有找到匹配的待处理闹钟。' };
+          }
         } else if (type === 'create_task') {
           const title = normalizeText(action.title, 120);
           if (title) {
@@ -777,21 +967,75 @@ export class AssistantStateStore {
             }
             const task = {
               id: id(), project_id: project?.id || context.project_id || null, title,
-              notes: normalizeText(action.reason, 500), status: 'open', priority: Number(action.priority) || 3,
+              notes: normalizeText(action.reason, 500), status: 'open', priority: taskPriority(action.priority),
               estimated_minutes: Math.max(5, Math.min(720, Number(action.estimated_minutes) || 45)),
-              actual_minutes: null, due_at: action.due_at || null, created_at: timestamp, updated_at: timestamp
+              actual_minutes: 0, sort_order: (state.tasks.length + 1) * 10, due_at: action.due_at || null, created_at: timestamp, updated_at: timestamp
             };
             state.tasks.push(task);
             result = { type, ok: true, task, reason: '任务已加入真实任务库。' };
           }
+        } else if (['start_task_timer', 'pause_task_timer', 'stop_task_timer', 'complete_task', 'reopen_task', 'update_task', 'reorder_tasks'].includes(type)) {
+          if (type === 'reorder_tasks') {
+            const ids = Array.isArray(action.task_ids) ? action.task_ids : [];
+            ids.forEach((taskId, index) => { const item = state.tasks.find((entry) => entry.id === taskId); if (item) { item.sort_order = (index + 1) * 10; item.updated_at = timestamp; } });
+            result = { type, ok: true, reason: '任务顺序已更新。' };
+          } else {
+            const task = action.task_id ? state.tasks.find((item) => item.id === action.task_id) : (type === 'reopen_task' || type === 'update_task' ? findAnyTask(action.task || action.title) : findTask(action.task || action.title));
+            if (task) {
+              if (type === 'update_task') {
+                if (action.title) task.title = normalizeText(action.title, 120);
+                if (action.notes !== undefined) task.notes = normalizeText(action.notes, 500);
+                if (action.estimated_minutes !== undefined) task.estimated_minutes = Math.max(5, Math.min(720, Number(action.estimated_minutes) || task.estimated_minutes));
+                if (action.priority !== undefined) task.priority = taskPriority(action.priority);
+                task.updated_at = timestamp; result = { type, ok: true, task, reason: '任务内容已更新。' };
+              } else if (type === 'reopen_task') {
+                task.status = 'open'; delete task.completed_at; task.updated_at = timestamp; result = { type, ok: true, task, reason: '任务已重新打开。' };
+              } else {
+                state.time_sessions ||= [];
+                const active = state.time_sessions.find((session) => session.status === 'running');
+                const closeSession = (session, status = 'paused') => {
+                  if (!session) return;
+                  const elapsed = Math.max(0, Math.floor((Date.parse(timestamp) - Date.parse(session.started_at)) / 1000));
+                  session.elapsed_seconds = (session.elapsed_seconds || 0) + elapsed; session.ended_at = timestamp; session.status = status;
+                  const target = state.tasks.find((item) => item.id === session.task_id);
+                  if (target) target.actual_minutes = Math.round(state.time_sessions.filter((s) => s.task_id === target.id).reduce((sum, s) => sum + (s.elapsed_seconds || 0), 0) / 60);
+                };
+                if (type === 'start_task_timer') {
+                  if (active && active.task_id !== task.id) closeSession(active);
+                  const existing = state.time_sessions
+                    .filter((session) => session.task_id === task.id && session.status === 'paused')
+                    .sort((left, right) => Date.parse(String(right.ended_at || '')) - Date.parse(String(left.ended_at || '')))[0];
+                  if (existing) { existing.status = 'running'; existing.started_at = timestamp; existing.ended_at = null; }
+                  else state.time_sessions.push({ id: id(), task_id: task.id, mode: action.mode === 'countdown' ? 'countdown' : 'stopwatch', target_minutes: Math.max(1, Number(action.target_minutes) || Number(task.estimated_minutes) || 45), started_at: timestamp, ended_at: null, elapsed_seconds: 0, status: 'running', created_at: timestamp });
+                  task.status = 'in_progress'; result = { type, ok: true, task, reason: '已开始计时。' };
+                } else {
+                  const session = state.time_sessions.find((entry) => entry.task_id === task.id && entry.status === 'running');
+                  if (session) closeSession(session, type === 'stop_task_timer' || type === 'complete_task' ? 'completed' : 'paused');
+                  if (type === 'complete_task') { task.status = 'done'; task.completed_at = timestamp; }
+                  else if (type === 'stop_task_timer' && task.status === 'in_progress') task.status = 'open';
+                  task.updated_at = timestamp; result = { type, ok: true, task, sessions: state.time_sessions.filter((entry) => entry.task_id === task.id), reason: type === 'pause_task_timer' ? '已暂停计时。' : type === 'complete_task' ? '任务已完成并保留在历史中。' : '计时已停止。' };
+                }
+              }
+            } else result = { type, ok: false, reason: '没有找到匹配的任务。' };
+          }
         } else if (type === 'complete_current_task') {
           const task = context.task_id ? state.tasks.find((item) => item.id === context.task_id) : currentTask();
           if (task) {
+            const session = (state.time_sessions || []).find((entry) => entry.task_id === task.id && entry.status === 'running');
+            if (session) {
+              const elapsed = Math.max(0, Math.floor((Date.parse(timestamp) - Date.parse(session.started_at)) / 1000));
+              session.elapsed_seconds = (session.elapsed_seconds || 0) + elapsed;
+              session.ended_at = timestamp;
+              session.status = 'completed';
+              task.actual_minutes = Math.round((state.time_sessions || []).filter((entry) => entry.task_id === task.id).reduce((sum, entry) => sum + (entry.elapsed_seconds || 0), 0) / 60);
+            }
             task.status = 'done'; task.completed_at = timestamp; task.updated_at = timestamp;
             result = { type, ok: true, task_id: task.id, title: task.title, reason: '任务已完成。' };
           }
         } else if (type === 'cancel_task' || type === 'defer_task') {
-          const task = findTask(action.task);
+          const task = action.task_id
+            ? state.tasks.find((item) => item.id === action.task_id)
+            : findTask(action.task);
           if (task) {
             task.status = type === 'cancel_task' ? 'cancelled' : 'deferred'; task.updated_at = timestamp;
             result = { type, ok: true, task_id: task.id, title: task.title, reason: type === 'cancel_task' ? '任务已取消。' : '任务已顺延。' };

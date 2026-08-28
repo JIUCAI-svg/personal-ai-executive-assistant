@@ -17,8 +17,12 @@ data class RemotePlanItem(
     val end: String,
     val date: String,
     val status: String,
-    val reason: String = ""
+    val reason: String = "",
+    val actualMinutes: Int = 0,
+    val actualSeconds: Long = 0
 )
+
+data class RemoteActiveTimer(val taskId: String, val mode: String, val targetMinutes: Int, val elapsedSeconds: Long)
 
 data class RemotePlan(
     val now: String,
@@ -27,15 +31,48 @@ data class RemotePlan(
     val availableMinutes: Int,
     val scheduledMinutes: Int,
     val bufferMinutes: Int,
+    val configuredBufferMinutes: Int = 60,
     val freeMinutes: Int,
     val adjustmentReason: String,
     val scheduled: List<RemotePlanItem>,
     val deferred: List<RemotePlanItem>,
-    val currentTaskId: String?
+    val completed: List<RemotePlanItem> = emptyList(),
+    val currentTaskId: String?,
+    val activeTimer: RemoteActiveTimer? = null
 )
 
 data class RemoteMemory(val id: String, val content: String, val status: String)
-data class RemoteState(val plan: RemotePlan?, val memories: List<RemoteMemory>)
+data class RemoteProject(val id: String, val name: String, val status: String)
+data class RemoteState(
+    val plan: RemotePlan?,
+    val memories: List<RemoteMemory>,
+    val projects: List<RemoteProject> = emptyList()
+)
+
+/** Conversation metadata is deliberately independent from the selected mode. */
+data class ConversationOptions(
+    val mode: String,
+    val projectId: String? = null,
+    val memoryScope: Boolean,
+    val saveFullConversation: Boolean,
+    val allowMemoryDistillation: Boolean,
+    val projectName: String? = null
+)
+
+data class ConversationThread(
+    val id: String,
+    val mode: String,
+    val projectId: String?,
+    val projectName: String,
+    val memoryScope: Boolean,
+    val saveFullConversation: Boolean,
+    val allowMemoryDistillation: Boolean,
+    val preview: String,
+    val updatedAt: String,
+    val messageCount: Int
+)
+
+data class RemoteThreadDetail(val thread: ConversationThread, val messages: List<ChatMessage>)
 
 object AssistantSessionStore {
     private const val PREFS = "assistant_session"
@@ -54,7 +91,11 @@ private fun gatewayBaseUrl(): String = BuildConfig.AI_GATEWAY_URL.trim().removeS
 private fun remotePlanItem(item: JSONObject): RemotePlanItem = RemotePlanItem(
     id = item.optString("id"), title = item.optString("title"), project = item.optString("project"), notes = item.optString("notes"),
     priority = item.optInt("priority", 3), minutes = item.optInt("estimated_minutes", 45), start = item.optString("start"), end = item.optString("end"),
-    date = item.optString("date"), status = item.optString("status", "open"), reason = item.optString("reason")
+    date = item.optString("date"), status = item.optString("status", "open"), reason = item.optString("reason"), actualMinutes = item.optInt("actual_minutes", 0), actualSeconds = item.optLong("actual_seconds", item.optInt("actual_minutes", 0) * 60L)
+)
+
+private fun remoteProject(item: JSONObject): RemoteProject = RemoteProject(
+    id = item.optString("id"), name = item.optString("name"), status = item.optString("status", "active")
 )
 
 fun parseRemotePlan(json: JSONObject?): RemotePlan? {
@@ -63,12 +104,13 @@ fun parseRemotePlan(json: JSONObject?): RemotePlan? {
         val array = json.optJSONArray(name) ?: return emptyList()
         return (0 until array.length()).mapNotNull { array.optJSONObject(it)?.let(::remotePlanItem) }
     }
+    val active = json.optJSONObject("active_timer")?.let { timer -> RemoteActiveTimer(timer.optString("task_id"), timer.optString("mode", "stopwatch"), timer.optInt("target_minutes"), timer.optLong("elapsed_seconds")) }
     return RemotePlan(
         now = json.optString("now"), sleepTime = json.optString("sleep_time", "01:00"), wakeTime = json.optString("wake_time", "08:00"),
         availableMinutes = json.optInt("available_minutes"), scheduledMinutes = json.optInt("scheduled_minutes"),
-        bufferMinutes = json.optInt("buffer_minutes"), freeMinutes = json.optInt("free_minutes"),
+        bufferMinutes = json.optInt("buffer_minutes"), configuredBufferMinutes = json.optInt("configured_buffer_minutes", json.optInt("buffer_minutes")), freeMinutes = json.optInt("free_minutes"),
         adjustmentReason = json.optString("adjustment_reason"), scheduled = items("scheduled"), deferred = items("deferred"),
-        currentTaskId = json.optJSONObject("current_task")?.optString("id")?.ifBlank { null }
+        currentTaskId = json.optJSONObject("current_task")?.optString("id")?.ifBlank { null }, completed = items("completed"), activeTimer = active
     )
 }
 
@@ -79,7 +121,31 @@ fun parseRemoteState(json: JSONObject?): RemoteState {
             RemoteMemory(item.optString("id"), item.optString("content"), item.optString("status"))
         } }
     }.orEmpty()
-    return RemoteState(parseRemotePlan(state.optJSONObject("plan")), memories)
+    val projects = state.optJSONArray("projects")?.let { array ->
+        (0 until array.length()).mapNotNull { index -> array.optJSONObject(index)?.let(::remoteProject) }
+    }.orEmpty()
+    return RemoteState(parseRemotePlan(state.optJSONObject("plan")), memories, projects)
+}
+
+private fun remoteThread(item: JSONObject): ConversationThread = ConversationThread(
+    id = item.optString("id"),
+    mode = item.optString("mode", "assistant"),
+    projectId = item.optString("project_id").ifBlank { null },
+    projectName = item.optString("project_name"),
+    memoryScope = item.optBoolean("memory_scope", true),
+    saveFullConversation = item.optBoolean("save_full_conversation", true),
+    allowMemoryDistillation = item.optBoolean("allow_memory_distillation", true),
+    preview = item.optString("preview"),
+    updatedAt = item.optString("updated_at"),
+    messageCount = item.optInt("message_count")
+)
+
+private fun optionsJson(options: ConversationOptions): JSONObject = JSONObject().apply {
+    put("memory_scope", options.memoryScope)
+    put("save_full_conversation", options.saveFullConversation)
+    put("allow_memory_distillation", options.allowMemoryDistillation)
+    options.projectId?.takeIf(String::isNotBlank)?.let { put("project_id", it) }
+    options.projectName?.takeIf(String::isNotBlank)?.let { put("project", it) }
 }
 
 private fun gatewayConnection(context: Context, endpoint: String, method: String, body: ByteArray? = null): HttpURLConnection {
@@ -100,13 +166,114 @@ private fun gatewayConnection(context: Context, endpoint: String, method: String
     return connection
 }
 
+private fun HttpURLConnection.readJsonOrThrow(defaultError: String): JSONObject {
+    val stream = if (responseCode in 200..299) inputStream else errorStream
+    val response = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+    val json = runCatching { JSONObject(response) }.getOrElse { JSONObject().put("error", response) }
+    check(responseCode in 200..299) { json.optString("error", defaultError) }
+    return json
+}
+
 suspend fun gatewayFetchState(context: Context): RemoteState = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
     val connection = gatewayConnection(context, "/api/assistant/state", "GET")
+    try { parseRemoteState(connection.readJsonOrThrow("读取同步数据失败").optJSONObject("state")) } finally { connection.disconnect() }
+}
+
+suspend fun gatewayListThreads(context: Context, limit: Int = 60): List<ConversationThread> = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val connection = gatewayConnection(context, "/api/assistant/threads?limit=${limit.coerceIn(1, 200)}", "GET")
     try {
-        val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
-        val response = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-        check(connection.responseCode in 200..299) { JSONObject(response).optString("error", "读取同步数据失败") }
-        parseRemoteState(JSONObject(response).optJSONObject("state"))
+        val array = connection.readJsonOrThrow("读取历史对话失败").optJSONArray("threads") ?: return@withContext emptyList()
+        (0 until array.length()).mapNotNull { array.optJSONObject(it)?.let(::remoteThread) }
+    } finally { connection.disconnect() }
+}
+
+suspend fun gatewayLoadThread(context: Context, threadId: String, limit: Int = 200): RemoteThreadDetail = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val connection = gatewayConnection(context, "/api/assistant/threads/${threadId.trim()}?limit=${limit.coerceIn(1, 500)}", "GET")
+    try {
+        val json = connection.readJsonOrThrow("读取这段对话失败")
+        val rawThread = json.optJSONObject("thread") ?: error("服务没有返回对话内容")
+        val messages = rawThread.optJSONArray("messages")?.let { array ->
+            (0 until array.length()).mapNotNull { index -> array.optJSONObject(index)?.let { message ->
+                val content = message.optString("content").trim()
+                content.takeIf(String::isNotBlank)?.let { ChatMessage(message.optString("role") == "assistant", it) }
+            } }
+        }.orEmpty()
+        RemoteThreadDetail(remoteThread(rawThread), messages)
+    } finally { connection.disconnect() }
+}
+
+suspend fun gatewayCreateThread(context: Context, options: ConversationOptions): ConversationThread = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val request = JSONObject().apply {
+        put("conversation_mode", options.mode)
+        options.projectId?.takeIf(String::isNotBlank)?.let { put("project_id", it) }
+        options.projectName?.takeIf(String::isNotBlank)?.let { put("project", it) }
+        put("conversation_options", optionsJson(options))
+    }.toString().toByteArray(Charsets.UTF_8)
+    val connection = gatewayConnection(context, "/api/assistant/threads", "POST", request)
+    try {
+        connection.outputStream.use { it.write(request) }
+        val thread = connection.readJsonOrThrow("新建对话失败").optJSONObject("thread") ?: error("服务没有返回新对话")
+        remoteThread(thread)
+    } finally { connection.disconnect() }
+}
+
+suspend fun gatewayUpdateThreadOptions(context: Context, threadId: String, options: ConversationOptions): ConversationThread = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val request = JSONObject().put("conversation_options", optionsJson(options)).toString().toByteArray(Charsets.UTF_8)
+    val connection = gatewayConnection(context, "/api/assistant/threads/${threadId.trim()}", "PATCH", request)
+    try {
+        connection.outputStream.use { it.write(request) }
+        val thread = connection.readJsonOrThrow("保存会话设置失败").optJSONObject("thread") ?: error("服务没有返回会话设置")
+        remoteThread(thread)
+    } finally { connection.disconnect() }
+}
+
+data class MemoryRunStatus(
+    val rawMessageCount: Int,
+    val activeCount: Int,
+    val pendingReviewCount: Int,
+    val archivedCount: Int,
+    val latestStatus: String,
+    val latestDate: String,
+    val summary: String
+)
+
+private fun parseMemoryRunStatus(json: JSONObject): MemoryRunStatus {
+    val counts = json.optJSONObject("memory_counts")
+    val latest = json.optJSONObject("latest_run")
+    val summary = json.optJSONObject("summary")
+    return MemoryRunStatus(
+        rawMessageCount = json.optInt("raw_message_count"),
+        activeCount = counts?.optInt("active") ?: 0,
+        pendingReviewCount = counts?.optInt("pending_review") ?: 0,
+        archivedCount = counts?.optInt("archived") ?: 0,
+        latestStatus = latest?.optString("status").orEmpty(),
+        latestDate = latest?.optString("date").orEmpty(),
+        summary = summary?.optString("summary").orEmpty()
+    )
+}
+
+suspend fun gatewayMemoryStatus(context: Context): MemoryRunStatus = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val connection = gatewayConnection(context, "/api/assistant/memory/status", "GET")
+    try { parseMemoryRunStatus(connection.readJsonOrThrow("读取记忆状态失败")) } finally { connection.disconnect() }
+}
+
+suspend fun gatewayRunDailyMemory(context: Context): RemoteState = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val connection = gatewayConnection(context, "/api/assistant/memory/daily-run", "POST", "{}".toByteArray(Charsets.UTF_8))
+    try {
+        connection.outputStream.use { it.write("{}".toByteArray(Charsets.UTF_8)) }
+        parseRemoteState(connection.readJsonOrThrow("每日记忆整理失败").optJSONObject("state"))
+    } finally { connection.disconnect() }
+}
+
+suspend fun gatewayUpdateMemory(context: Context, memoryId: String, status: String, content: String? = null): RemoteState = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val request = JSONObject().apply {
+        put("status", status)
+        content?.let { put("content", it) }
+    }.toString().toByteArray(Charsets.UTF_8)
+    val connection = gatewayConnection(context, "/api/assistant/memories/${memoryId.trim()}", "PATCH", request)
+    try {
+        connection.outputStream.use { it.write(request) }
+        parseRemoteState(connection.readJsonOrThrow("更新记忆失败").optJSONObject("state"))
     } finally { connection.disconnect() }
 }
 
@@ -119,10 +286,7 @@ suspend fun gatewayExecuteAction(context: Context, threadId: String?, action: JS
     val connection = gatewayConnection(context, "/api/assistant/actions", "POST", request)
     try {
         connection.outputStream.use { it.write(request) }
-        val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
-        val response = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-        check(connection.responseCode in 200..299) { JSONObject(response).optString("error", "计划更新失败") }
-        parseRemoteState(JSONObject(response).optJSONObject("state"))
+        parseRemoteState(connection.readJsonOrThrow("计划更新失败").optJSONObject("state"))
     } finally { connection.disconnect() }
 }
 
@@ -131,8 +295,7 @@ data class SupabaseConfig(val url: String, val anonKey: String)
 suspend fun gatewaySupabaseConfig(context: Context): SupabaseConfig = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
     val connection = gatewayConnection(context, "/api/auth/config", "GET")
     try {
-        val text = connection.inputStream.bufferedReader().use { it.readText() }
-        val json = JSONObject(text)
+        val json = connection.readJsonOrThrow("读取云端同步配置失败")
         check(json.optBoolean("configured")) { "云端同步尚未配置" }
         SupabaseConfig(json.optString("url"), json.optString("anonKey"))
     } finally { connection.disconnect() }
@@ -162,10 +325,6 @@ suspend fun gatewayInitializeCloud(context: Context): RemoteState = kotlinx.coro
     val connection = gatewayConnection(context, "/api/assistant/sync/initialize", "POST", "{}".toByteArray(Charsets.UTF_8))
     try {
         connection.outputStream.use { it.write("{}".toByteArray(Charsets.UTF_8)) }
-        val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
-        val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-        val json = JSONObject(text)
-        check(connection.responseCode in 200..299) { json.optString("error", "初始化云端同步失败") }
-        parseRemoteState(json.optJSONObject("state"))
+        parseRemoteState(connection.readJsonOrThrow("初始化云端同步失败").optJSONObject("state"))
     } finally { connection.disconnect() }
 }

@@ -126,6 +126,20 @@ export function parseDailyMemoryResult(content, { state, messages }) {
   return { summary: text(parsed.summary, 1200), candidates, projectUpdates: updates, updateSuggestions: suggestions };
 }
 
+// A source-based key makes organization idempotent even when the model changes
+// its wording on a later attempt.
+export function memoryDedupeKey(memory) {
+  const sourceIds = [...new Set((Array.isArray(memory?.source_message_ids) ? memory.source_message_ids : [])
+    .map((value) => text(value, 120)).filter(Boolean))].sort();
+  if (!sourceIds.length) return '';
+  const identity = JSON.stringify({
+    kind: text(memory?.kind, 40) || 'fact',
+    project_id: text(memory?.project_id, 120) || null,
+    source_message_ids: sourceIds
+  });
+  return crypto.createHash('sha256').update(identity).digest('hex');
+}
+
 function normalizeForMatch(value) {
   return text(value, 1200).toLocaleLowerCase('zh-CN').replace(/[\s，,。.!！?？：:；;、·“”"'‘’()（）\-+]/g, '');
 }
@@ -148,7 +162,10 @@ export function applyDailyMemoryResult(state, result, metadata = {}) {
   const created = [];
   const duplicates = [];
   for (const candidate of result.candidates || []) {
-    const duplicate = existing.find((item) => isNearDuplicate(item.content, candidate.content));
+    const dedupeKey = memoryDedupeKey(candidate);
+    const duplicate = existing.find((item) => (
+      dedupeKey && memoryDedupeKey(item) === dedupeKey
+    ) || isNearDuplicate(item.content, candidate.content));
     if (duplicate) {
       duplicates.push(duplicate.id);
       continue;
@@ -160,7 +177,8 @@ export function applyDailyMemoryResult(state, result, metadata = {}) {
       created_at: now,
       updated_at: now,
       last_seen_at: now,
-      organizer_run_id: metadata.run_id || null
+      organizer_run_id: metadata.run_id || null,
+      memory_dedupe_key: dedupeKey || null
     };
     existing.push(memory);
     created.push(memory);

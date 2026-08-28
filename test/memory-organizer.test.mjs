@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { applyDailyMemoryResult, parseDailyMemoryResult, rawMessagesForDay, searchMemory } from '../server/memory-organizer.mjs';
+import { applyDailyMemoryResult, memoryDedupeKey, parseDailyMemoryResult, rawMessagesForDay, searchMemory } from '../server/memory-organizer.mjs';
 
 function stateFixture() {
   return {
@@ -49,4 +49,26 @@ test('memory search returns derived memory with its source trace', () => {
   assert.equal(results.length, 1);
   assert.equal(results[0].type, 'memory');
   assert.deepEqual(results[0].item.source_message_ids, ['m1']);
+});
+
+test('source-based memory key is stable across candidate wording and source order', () => {
+  const first = memoryDedupeKey({ kind: 'decision', project_id: 'brain', source_message_ids: ['m2', 'm1'] });
+  const second = memoryDedupeKey({ kind: 'decision', project_id: 'brain', source_message_ids: ['m1', 'm2'] });
+  assert.equal(first, second);
+  assert.notEqual(first, memoryDedupeKey({ kind: 'fact', project_id: 'brain', source_message_ids: ['m1', 'm2'] }));
+});
+
+test('same source identity is rejected even when wording changes', () => {
+  const state = stateFixture();
+  const first = applyDailyMemoryResult(state, {
+    summary: '', projectUpdates: [], updateSuggestions: [],
+    candidates: [{ kind: 'decision', content: '每天晚上十点半复盘。', project_id: 'brain', importance: 4, tags: [], source_message_ids: ['m1'], source_thread_ids: ['normal'] }]
+  }, { date: '2026-08-26', run_id: 'run-1', now: '2026-08-26T23:00:00+08:00' });
+  const second = applyDailyMemoryResult(state, {
+    summary: '', projectUpdates: [], updateSuggestions: [],
+    candidates: [{ kind: 'decision', content: '每日 22:30 进行复盘。', project_id: 'brain', importance: 4, tags: [], source_message_ids: ['m1'], source_thread_ids: ['normal'] }]
+  }, { date: '2026-08-26', run_id: 'run-2', now: '2026-08-26T23:10:00+08:00' });
+  assert.equal(first.created.length, 1);
+  assert.equal(second.created.length, 0);
+  assert.deepEqual(second.duplicate_ids, [first.created[0].id]);
 });
