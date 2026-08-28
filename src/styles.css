@@ -83,3 +83,32 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 @media (max-width: 600px) { .ai-settings-modal { width: min(100%, 560px); max-height: calc(100vh - 24px); padding: 14px; }.provider-grid { grid-template-columns: 1fr; }.settings-inline-actions { display: grid; }.settings-inline-actions .primary-command, .settings-inline-actions .secondary-command { width: 100%; }.ai-settings-section { padding-top: 12px; padding-bottom: 12px; } }
 .archive-export-button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 32px; padding: 6px 9px; color: #55766d; background: transparent; border: 1px dashed #bdd1c5; border-radius: 6px; font-size: 11px; }
 .archive-export-button:hover { color: #28675d; border-color: #82a99b; background: #f1f6f1; }
+
+.day-heading-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.day-heading-row h1 { flex: 1; min-width: 0; }
+.new-task-button { min-height: 33px; display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; margin-bottom: 10px; padding: 7px 10px; color: #28685e; background: #e2f0e9; border: 1px solid #cce3d7; border-radius: 6px; font-size: 11px; font-weight: 650; }
+.new-task-button:hover { background: #d8ece2; border-color: #b9d8ca; }
+.plan-add-button { display: inline-flex; align-items: center; gap: 3px; }
+.task-modal { position: relative; z-index: 1; width: min(500px, 100%); max-height: min(760px, calc(100vh - 40px)); padding: 18px; overflow: auto; background: #fffefa; border-radius: 8px; box-shadow: 0 24px 70px rgba(12, 37, 32, .28); }
+.task-form { display: grid; gap: 14px; }
+.task-form label { display: grid; gap: 5px; color: #5d716a; font-size: 11px; font-weight: 600; }
+.task-form input, .task-form select, .task-form textarea { width: 100%; color: #304942; border: 1px solid #cfdacf; border-radius: 5px; outline: 0; background: #fffefa; font: 12px/1.5 'Noto Sans SC', system-ui, sans-serif; }
+.task-form input, .task-form select { height: 37px; padding: 0 9px; }
+.task-form textarea { padding: 8px 9px; resize: vertical; }
+.task-form input:focus, .task-form select:focus, .task-form textarea:focus { border-color: #77a599; box-shadow: 0 0 0 3px rgba(79, 141, 126, .12); }
+.task-form-grid { display: grid; grid-template-columns: 1fr 1.35fr; gap: 10px; }
+.priority-field { margin: 0; padding: 0; border: 0; }
+.priority-field legend { margin-bottom: 6px; color: #5d716a; font-size: 11px; font-weight: 600; }
+.priority-options { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
+.priority-option { min-height: 53px; display: flex !important; grid-template-columns: auto 1fr; align-items: center; gap: 7px; padding: 8px 9px; border: 1px solid #dbe4db; border-radius: 6px; background: #f7f9f5; cursor: pointer; }
+.priority-option input { position: absolute; opacity: 0; pointer-events: none; }
+.priority-option:has(input:checked) { border-color: #8eb8a7; background: #edf6f0; box-shadow: 0 0 0 2px rgba(96, 157, 135, .12); }
+.priority-swatch { width: 9px; height: 9px; flex: 0 0 auto; border-radius: 50%; background: #9a91cc; }
+.priority-option.high .priority-swatch { background: #df815f; box-shadow: 0 0 0 4px rgba(223, 129, 95, .13); }
+.priority-option.medium .priority-swatch { background: #54a496; box-shadow: 0 0 0 4px rgba(84, 164, 150, .13); }
+.priority-option.low .priority-swatch { background: #958acb; box-shadow: 0 0 0 4px rgba(149, 138, 203, .13); }
+.priority-option strong, .priority-option small { display: block; }
+.priority-option strong { color: #3b5750; font-size: 12px; }
+.priority-option small { margin-top: 2px; color: #82918a; font-size: 9px; font-weight: 400; }
+.task-form-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 2px; }
+@media (max-width: 600px) { .day-heading-row { display: block; }.day-heading-row h1 { margin-bottom: 12px; }.new-task-button { margin-bottom: 0; }.task-form-grid { grid-template-columns: 1fr; }.priority-options { gap: 5px; }.priority-option { padding: 8px 6px; }.priority-option small { font-size: 8px; } }

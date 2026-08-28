@@ -13,6 +13,21 @@ export const ASSISTANT_TOOLS = Object.freeze([
     parameters: { time: 'HH:mm', reason: '调整原因' }
   },
   {
+    name: 'set_buffer_minutes',
+    description: '设置每天计划保留的缓冲时间，允许设置为 0 分钟。',
+    parameters: { minutes: '缓冲分钟数，0-1440', reason: '调整原因' }
+  },
+  {
+    name: 'set_alarm',
+    description: '在用户的安卓手机上设置一个闹钟或提醒。需要明确的时间。',
+    parameters: { time: 'HH:mm', date: '可选 YYYY-MM-DD', label: '闹钟标签', repeat: '可选 none 或 daily', reason: '设置原因' }
+  },
+  {
+    name: 'cancel_alarm',
+    description: '取消手机上的一个闹钟。优先使用 alarm_id；也可以用标签和时间匹配。',
+    parameters: { alarm_id: '可选闹钟 ID', time: '可选 HH:mm', date: '可选 YYYY-MM-DD', label: '可选闹钟标签', reason: '取消原因' }
+  },
+  {
     name: 'complete_current_task',
     description: '将当前正在执行的任务标记为完成。',
     parameters: { reason: '完成说明' }
@@ -40,6 +55,13 @@ export const ASSISTANT_TOOLS = Object.freeze([
       project: '可选项目名', due_at: '可选 ISO 时间', date: '可选 YYYY-MM-DD', reason: '创建原因'
     }
   },
+  { name: 'start_task_timer', description: '开始一项任务的正计时或倒计时；同一时间只运行一个任务。', parameters: { task: '任务名称', task_id: '可选任务 ID', mode: '可选 stopwatch 或 countdown', target_minutes: '倒计时分钟数' } },
+  { name: 'pause_task_timer', description: '暂停任务计时并累计已用时间。', parameters: { task: '任务名称', task_id: '可选任务 ID' } },
+  { name: 'stop_task_timer', description: '停止任务计时并保存本次时间。', parameters: { task: '任务名称', task_id: '可选任务 ID' } },
+  { name: 'complete_task', description: '完成指定任务，保留任务和计时历史。', parameters: { task: '任务名称', task_id: '可选任务 ID' } },
+  { name: 'reopen_task', description: '重新打开已完成或已取消的任务。', parameters: { task: '任务名称', task_id: '可选任务 ID' } },
+  { name: 'update_task', description: '修改任务标题、备注、预计时长或优先级。', parameters: { task: '任务名称', task_id: '可选任务 ID', title: '新标题', notes: '新备注', estimated_minutes: '预计分钟数', priority: '1-5' } },
+  { name: 'reorder_tasks', description: '按给定任务 ID 顺序调整待办排序。', parameters: { task_ids: '任务 ID 数组' } },
   {
     name: 'set_unavailable_period',
     description: '记录一段不可用时间，并触发计划重排。',
@@ -59,10 +81,12 @@ export const ASSISTANT_TOOLS = Object.freeze([
 
 export const ASSISTANT_TOOL_NAMES = new Set(ASSISTANT_TOOLS.map((tool) => tool.name));
 
-const NUMBER_PARAMETERS = new Set(['estimated_minutes', 'priority']);
+const NUMBER_PARAMETERS = new Set(['estimated_minutes', 'priority', 'target_minutes', 'minutes']);
 const REQUIRED_PARAMETERS = {
   set_sleep_time: ['time'],
   set_wake_time: ['time'],
+  set_buffer_minutes: ['minutes'],
+  set_alarm: ['time'],
   cancel_task: ['task'],
   defer_task: ['task'],
   create_task: ['title'],
@@ -78,13 +102,13 @@ export const ASSISTANT_SKILLS = Object.freeze([
   },
   {
     name: 'task_management',
-    description: '创建、完成、取消和顺延任务。',
-    tools: ['create_task', 'complete_current_task', 'cancel_task', 'cancel_all_tasks', 'defer_task']
+    description: '创建、编辑、排序、计时、完成、取消和顺延任务。',
+    tools: ['create_task', 'update_task', 'reorder_tasks', 'start_task_timer', 'pause_task_timer', 'stop_task_timer', 'complete_task', 'reopen_task', 'complete_current_task', 'cancel_task', 'cancel_all_tasks', 'defer_task']
   },
   {
     name: 'dynamic_planning',
     description: '根据作息、剩余时间、任务优先级和临时事件重排计划。',
-    tools: ['set_sleep_time', 'set_wake_time', 'set_unavailable_period', 'replan_today']
+    tools: ['set_sleep_time', 'set_wake_time', 'set_buffer_minutes', 'set_unavailable_period', 'replan_today']
   },
   {
     name: 'knowledge_memory',

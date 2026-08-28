@@ -7,6 +7,7 @@ import android.app.TimePickerDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -18,6 +19,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -40,6 +42,10 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowForward
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Bolt
@@ -59,6 +65,7 @@ import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.Spa
 import androidx.compose.material.icons.filled.TaskAlt
 import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -67,6 +74,7 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -91,6 +99,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
@@ -112,6 +122,7 @@ import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.temporal.ChronoUnit
 import java.time.format.DateTimeFormatter
+import kotlin.math.abs
 
 private val Ink = Color(0xFF20312F)
 private val Green = Color(0xFF173D39)
@@ -131,7 +142,11 @@ data class PlanItem(
     val done: Boolean = false,
     val deferred: Boolean = false,
     val cancelled: Boolean = false,
-    val isBreak: Boolean = false
+    val isBreak: Boolean = false,
+    val id: String = "",
+    val priority: Int = 3,
+    val actualMinutes: Int = 0,
+    val actualSeconds: Long = 0
 )
 
 data class ScheduledPlanItem(
@@ -143,15 +158,72 @@ data class ScheduledPlanItem(
 
 data class ChatMessage(val fromAssistant: Boolean, val text: String)
 
-data class AssistantAction(val type: String, val time: String? = null, val task: String? = null, val title: String? = null, val start: String? = null, val end: String? = null)
+data class BreakTimerState(
+    val remainingSeconds: Long = 15 * 60L,
+    val running: Boolean = true
+)
+
+data class AssistantAction(
+    val type: String,
+    val minutes: Int? = null,
+    val time: String? = null,
+    val task: String? = null,
+    val title: String? = null,
+    val start: String? = null,
+    val end: String? = null,
+    val date: String? = null,
+    val label: String? = null,
+    val repeat: String? = null,
+    val alarmId: String? = null
+)
+data class DeviceActionResult(val action: AssistantAction, val result: AlarmOperationResult)
 data class AssistantResult(
     val reply: String,
     val actions: List<AssistantAction>,
+    val deviceActions: List<AssistantAction> = emptyList(),
     val plan: RemotePlan? = null,
     val state: RemoteState? = null,
     val threadId: String? = null
 )
 data class AiProviderOption(val id: String, val name: String, val models: List<String>, val active: Boolean = false)
+
+private fun defaultConversationOptions(mode: String, projectId: String? = null): ConversationOptions {
+    val temporary = mode == "temporary"
+    return ConversationOptions(
+        mode = mode,
+        projectId = projectId,
+        memoryScope = !temporary,
+        saveFullConversation = !temporary,
+        allowMemoryDistillation = !temporary
+    )
+}
+
+private fun ConversationThread.toConversationOptions() = ConversationOptions(
+    mode = mode,
+    projectId = projectId,
+    memoryScope = memoryScope,
+    saveFullConversation = saveFullConversation,
+    allowMemoryDistillation = allowMemoryDistillation,
+    projectName = projectName
+)
+
+private fun conversationModeLabel(mode: String): String = when (mode) {
+    "temporary" -> "临时聊天"
+    "project" -> "项目对话"
+    "daily_planning" -> "每日规划"
+    else -> "普通助手"
+}
+
+private fun conversationScopeLabel(options: ConversationOptions): String = buildList {
+    add(if (options.memoryScope) "读记忆" else "不读记忆")
+    add(if (options.saveFullConversation) "存原对话" else "不存原对话")
+    add(if (options.allowMemoryDistillation) "可沉淀" else "不沉淀")
+}.joinToString(" · ")
+
+private fun formatThreadTime(value: String): String = value
+    .replace("T", " ")
+    .replace(Regex("""\.\d+Z?$"""), "")
+    .take(16)
 
 private val aiGatewayUrl get() = BuildConfig.AI_GATEWAY_URL
 private val aiGatewayToken get() = BuildConfig.AI_GATEWAY_TOKEN
@@ -164,6 +236,11 @@ private fun LocalTime.toMinutesOfDay() = hour * 60 + minute
 private fun localTimeFromMinutes(minutes: Int) = LocalTime.of((minutes / 60) % 24, minutes % 60)
 
 private fun formatClock(time: LocalTime) = time.format(DateTimeFormatter.ofPattern("HH:mm"))
+
+private fun formatElapsed(seconds: Long): String {
+    val total = seconds.coerceAtLeast(0)
+    return "%02d:%02d:%02d".format(total / 3600, (total / 60) % 60, total % 60)
+}
 
 private fun formatDuration(totalMinutes: Long): String {
     val minutes = totalMinutes.coerceAtLeast(0)
@@ -254,7 +331,7 @@ private fun remoteTone(priority: Int): Color = when {
 }
 
 private fun remoteScheduledItem(item: RemotePlanItem, deferred: Boolean): ScheduledPlanItem {
-    val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), flexible = deferred, deferred = deferred)
+    val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), flexible = deferred, deferred = deferred, id = item.id, priority = item.priority, actualMinutes = item.actualMinutes, actualSeconds = item.actualSeconds)
     if (deferred || item.start.isBlank() || item.end.isBlank()) return ScheduledPlanItem(planItem, deferredByCapacity = true)
     val date = runCatching { LocalDate.parse(item.date) }.getOrDefault(LocalDate.now())
     val start = parseClock(item.start) ?: return ScheduledPlanItem(planItem, deferredByCapacity = true)
@@ -262,8 +339,29 @@ private fun remoteScheduledItem(item: RemotePlanItem, deferred: Boolean): Schedu
     return ScheduledPlanItem(planItem, date.atTime(start), date.atTime(end))
 }
 
+private fun normalizeRemotePlanItems(remote: RemotePlan, now: LocalDateTime): List<ScheduledPlanItem> {
+    val source = remote.scheduled + remote.deferred
+    val hasMissingTimes = remote.scheduled.any { it.start.isBlank() || it.end.isBlank() } ||
+        (remote.scheduled.isEmpty() && remote.deferred.isNotEmpty())
+    // If the gateway gives task totals but no actual slots, the slots are stale
+    // regardless of the cached capacity number. Rebuild them for the live view.
+    if (!hasMissingTimes) {
+        return remote.scheduled.map { remoteScheduledItem(it, false) } + remote.deferred.map { remoteScheduledItem(it, true) }
+    }
+    // A stale snapshot can contain the right totals but blank schedule fields.
+    // Keep the server order and rebuild only the visual time slots locally.
+    var cursor = now.withSecond(0).withNano(0).plusMinutes(5)
+    return source.filter { it.status != "done" }.map { item ->
+        val start = cursor
+        val end = cursor.plusMinutes(item.minutes.toLong())
+        cursor = end
+        val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), id = item.id, priority = item.priority, actualMinutes = item.actualMinutes, actualSeconds = item.actualSeconds)
+        ScheduledPlanItem(planItem, start, end)
+    }
+}
+
 private fun parseClock(text: String): LocalTime? {
-    val match = Regex("""(?<!\\d)([01]?\\d|2[0-3])\\s*(?:点|:|：)\\s*([0-5]?\\d)?(?:分)?""").find(text) ?: return null
+    val match = Regex("""(?<!\d)([01]?\d|2[0-3])\s*(?:点|:|：)\s*([0-5]?\d)?(?:分)?""").find(text) ?: return null
     var hour = match.groupValues[1].toInt()
     val minute = when {
         text.drop(match.range.last + 1).startsWith("半") -> 30
@@ -285,13 +383,23 @@ private suspend fun requestAssistant(
     usageSnapshot: UsageMonitorSnapshot,
     providerId: String,
     model: String,
-    threadId: String?
+    threadId: String?,
+    conversationOptions: ConversationOptions
 ): AssistantResult = withContext(Dispatchers.IO) {
     check(aiGatewayUrl.isNotBlank()) { "AI 网关地址尚未配置" }
     val payload = JSONObject().apply {
         put("message", message)
         if (!threadId.isNullOrBlank()) put("thread_id", threadId)
-        put("conversation_mode", "daily_planning")
+        put("conversation_mode", conversationOptions.mode)
+        conversationOptions.projectId?.takeIf { it.isNotBlank() }?.let { put("project_id", it) }
+        conversationOptions.projectName?.takeIf { it.isNotBlank() }?.let { put("project", it) }
+        put("conversation_options", JSONObject().apply {
+            put("memory_scope", conversationOptions.memoryScope)
+            put("save_full_conversation", conversationOptions.saveFullConversation)
+            put("allow_memory_distillation", conversationOptions.allowMemoryDistillation)
+            conversationOptions.projectId?.takeIf { it.isNotBlank() }?.let { put("project_id", it) }
+            conversationOptions.projectName?.takeIf { it.isNotBlank() }?.let { put("project", it) }
+        })
         if (providerId.isNotBlank()) put("provider_id", providerId)
         if (model.isNotBlank()) put("model", model)
         put("conversation", JSONArray().apply {
@@ -387,11 +495,30 @@ private suspend fun requestAssistant(
                     val action = array.optJSONObject(index) ?: return@mapNotNull null
                     AssistantAction(
                         type = action.optString("type"),
+                        minutes = if (action.has("minutes")) action.optInt("minutes") else null,
                         time = action.optString("time").ifBlank { null },
                         task = action.optString("task").ifBlank { null },
                         title = action.optString("title").ifBlank { null },
                         start = action.optString("start").ifBlank { null },
-                        end = action.optString("end").ifBlank { null }
+                        end = action.optString("end").ifBlank { null },
+                        date = action.optString("date").ifBlank { null },
+                        label = action.optString("label").ifBlank { null },
+                        repeat = action.optString("repeat").ifBlank { null },
+                        alarmId = action.optString("alarm_id").ifBlank { null }
+                    )
+                }
+            }.orEmpty(),
+            deviceActions = json.optJSONArray("deviceActions")?.let { array ->
+                (0 until array.length()).mapNotNull { index ->
+                    val action = array.optJSONObject(index) ?: return@mapNotNull null
+                    AssistantAction(
+                        type = action.optString("type"),
+                        minutes = if (action.has("minutes")) action.optInt("minutes") else null,
+                        time = action.optString("time").ifBlank { null },
+                        date = action.optString("date").ifBlank { null },
+                        label = action.optString("label").ifBlank { null },
+                        repeat = action.optString("repeat").ifBlank { null },
+                        alarmId = action.optString("id").ifBlank { action.optString("alarm_id").ifBlank { null } }
                     )
                 }
             }.orEmpty(),
@@ -512,6 +639,12 @@ class MainActivity : ComponentActivity() {
         startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
     }
 
+    fun openExactAlarmSettings() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:$packageName")))
+        }
+    }
+
     fun usageMonitorEnabled(): Boolean = UsageMonitorStore.enabled(this)
 
     fun usageSnapshot(): UsageMonitorSnapshot = UsageMonitorStore.snapshot(this)
@@ -555,6 +688,7 @@ private fun ForwardApp(activity: MainActivity) {
         var tab by remember { mutableStateOf(0) }
         var currentDone by remember { mutableStateOf(false) }
         var unavailablePeriod by remember { mutableStateOf(false) }
+        var breakTimer by remember { mutableStateOf<BreakTimerState?>(null) }
         var deferredTasks by remember { mutableStateOf(activity.plannerSet("deferred_tasks")) }
         var cancelledTasks by remember { mutableStateOf(activity.plannerSet("cancelled_tasks")) }
         var cancelAllTasks by remember { mutableStateOf(activity.plannerFlag("cancel_all_tasks")) }
@@ -568,35 +702,139 @@ private fun ForwardApp(activity: MainActivity) {
         var selectedModel by remember { mutableStateOf(activity.aiModel()) }
         var remotePlan by remember { mutableStateOf<RemotePlan?>(null) }
         var remoteMemories by remember { mutableStateOf(emptyList<RemoteMemory>()) }
+        var memoryStatus by remember { mutableStateOf<MemoryRunStatus?>(null) }
+        var remoteProjects by remember { mutableStateOf(emptyList<RemoteProject>()) }
         var remoteThreadId by remember { mutableStateOf<String?>(null) }
+        var conversationOptions by remember { mutableStateOf(defaultConversationOptions("assistant")) }
+        var threads by remember { mutableStateOf(emptyList<ConversationThread>()) }
+        var threadLoading by remember { mutableStateOf(false) }
         var now by remember { mutableStateOf(LocalDateTime.now()) }
+        var messages by remember { mutableStateOf(emptyList<ChatMessage>()) }
+        LaunchedEffect(breakTimer?.running) {
+            while (breakTimer?.running == true) {
+                delay(1000)
+                val current = breakTimer ?: break
+                if (current.remainingSeconds <= 1L) {
+                    breakTimer = null
+                    currentDone = false
+                    break
+                }
+                breakTimer = current.copy(remainingSeconds = current.remainingSeconds - 1L)
+            }
+        }
+        LaunchedEffect(remotePlan) {
+            UsageMonitorStore.savePlanSummary(activity, remotePlan)
+        }
         LaunchedEffect(Unit) {
             runCatching { gatewayFetchState(activity) }.onSuccess { state ->
                 remotePlan = state.plan
                 remoteMemories = state.memories
+                remoteProjects = state.projects
+                runCatching { gatewayMemoryStatus(activity) }.onSuccess { memoryStatus = it }
                 parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
                 parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
+            }
+            runCatching { gatewayListThreads(activity) }.onSuccess { loadedThreads ->
+                threads = loadedThreads
+                val resume = loadedThreads.firstOrNull { it.mode != "temporary" } ?: loadedThreads.firstOrNull()
+                if (resume != null) {
+                    threadLoading = true
+                    runCatching { gatewayLoadThread(activity, resume.id) }.onSuccess { detail ->
+                        remoteThreadId = detail.thread.id
+                        conversationOptions = detail.thread.toConversationOptions()
+                        messages = detail.messages
+                    }
+                    threadLoading = false
+                }
             }
             runCatching { requestAiProviders(activity) }.onSuccess { providers ->
                 aiProviders = providers
                 val provider = providers.firstOrNull { it.id == selectedProviderId } ?: providers.firstOrNull { it.active } ?: providers.firstOrNull()
                 if (provider != null) {
-                    if (selectedProviderId.isBlank()) selectedProviderId = provider.id
-                    if (selectedModel.isBlank() || selectedModel !in provider.models) selectedModel = provider.models.firstOrNull().orEmpty()
+                    if (selectedProviderId.isBlank() || providers.none { it.id == selectedProviderId }) selectedProviderId = provider.id
+                    val selectedProvider = providers.firstOrNull { it.id == selectedProviderId } ?: provider
+                    if (selectedModel.isBlank() || selectedModel !in selectedProvider.models) selectedModel = selectedProvider.models.firstOrNull().orEmpty()
                     activity.saveAiSelection(selectedProviderId, selectedModel)
                 }
             }
             while (true) {
                 now = LocalDateTime.now()
                 usageSnapshot = activity.usageSnapshot()
+                // The plan contains a server-side planning window. Refresh it as the
+                // clock advances so midnight and sleep-time boundaries do not leave
+                // yesterday's "tomorrow/deferred" labels on screen.
+                if (!aiBusy && !threadLoading) {
+                    runCatching { gatewayFetchState(activity) }.onSuccess { state ->
+                        remotePlan = state.plan
+                        remoteMemories = state.memories
+                        remoteProjects = state.projects
+                        parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
+                        parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
+                    }
+                }
                 delay(60_000)
             }
         }
-        var messages by remember { mutableStateOf(listOf(
-            ChatMessage(true, "你好，我在。今晚大概几点睡？我按这个把今天剩下的时间和任务排清楚。")
-        )) }
         val snackbar = remember { SnackbarHostState() }
         val scope = rememberCoroutineScope()
+
+        fun applyLoadedThread(detail: RemoteThreadDetail) {
+            remoteThreadId = detail.thread.id
+            conversationOptions = detail.thread.toConversationOptions()
+            messages = detail.messages
+            input = TextFieldValue()
+        }
+
+        fun loadThread(thread: ConversationThread) {
+            if (aiBusy || threadLoading) return
+            scope.launch {
+                threadLoading = true
+                runCatching { gatewayLoadThread(activity, thread.id) }
+                    .onSuccess { detail -> applyLoadedThread(detail); tab = 1 }
+                    .onFailure { snackbar.showSnackbar(it.message ?: "读取历史对话失败") }
+                threadLoading = false
+            }
+        }
+
+        fun startConversation(options: ConversationOptions) {
+            if (aiBusy || threadLoading) return
+            scope.launch {
+                threadLoading = true
+                runCatching { gatewayCreateThread(activity, options) }
+                    .onSuccess { thread ->
+                        remoteThreadId = thread.id
+                        conversationOptions = thread.toConversationOptions()
+                        messages = emptyList()
+                        input = TextFieldValue()
+                        if (thread.saveFullConversation) {
+                            threads = listOf(thread) + threads.filterNot { it.id == thread.id }
+                        }
+                        tab = 1
+                    }
+                    .onFailure { snackbar.showSnackbar(it.message ?: "新建对话失败") }
+                threadLoading = false
+            }
+        }
+
+        fun updateConversationOptions(updated: ConversationOptions) {
+            conversationOptions = updated
+            val threadId = remoteThreadId
+            val existsRemotely = threadId != null && threads.any { it.id == threadId }
+            if (!existsRemotely) {
+                scope.launch { snackbar.showSnackbar("会话设置已更新，将从下一条消息起生效") }
+                return
+            }
+            scope.launch {
+                runCatching { gatewayUpdateThreadOptions(activity, threadId!!, updated) }
+                    .onSuccess { saved ->
+                        conversationOptions = saved.toConversationOptions()
+                        threads = threads.map { if (it.id == saved.id) saved else it }
+                        snackbar.showSnackbar("会话设置已保存")
+                    }
+                    .onFailure { snackbar.showSnackbar(it.message ?: "会话设置没有保存成功") }
+            }
+        }
+
         val notificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted || Build.VERSION.SDK_INT < 33) {
                 activity.showReminder()
@@ -604,12 +842,68 @@ private fun ForwardApp(activity: MainActivity) {
             } else scope.launch { snackbar.showSnackbar("通知权限未开启，应用内计划仍可使用") }
         }
 
+        fun beginBreak() {
+            breakTimer = BreakTimerState()
+        }
+
         fun completeTask() {
             scope.launch {
                 runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "complete_current_task").put("reason", "用户在移动端点击完成当前任务")) }
-                    .onSuccess { state -> remotePlan = state.plan; remoteMemories = state.memories; currentDone = true; snackbar.showSnackbar("已完成，云端计划已重排") }
+                    .onSuccess { state -> remotePlan = state.plan?.copy(activeTimer = null); remoteMemories = state.memories; currentDone = false; beginBreak() }
                     .onFailure { snackbar.showSnackbar(it.message ?: "计划更新失败，本次未写入") }
             }
+        }
+
+        fun startCurrentTimer() {
+            val task = remotePlan?.currentTaskId ?: return
+            scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "start_task_timer").put("task_id", task).put("mode", "stopwatch")) }
+                .onSuccess { state -> remotePlan = state.plan }
+                .onFailure { snackbar.showSnackbar(it.message ?: "开始计时失败") } }
+        }
+
+        fun pauseCurrentTimer() {
+            val task = remotePlan?.activeTimer?.taskId ?: return
+            scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "pause_task_timer").put("task_id", task)) }
+                .onSuccess { state -> remotePlan = state.plan }
+                .onFailure { snackbar.showSnackbar(it.message ?: "暂停计时失败") } }
+        }
+
+        fun reopenTask(taskId: String) {
+            scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "reopen_task").put("task_id", taskId)) }
+                .onSuccess { state -> remotePlan = state.plan; snackbar.showSnackbar("任务已重新打开") }
+                .onFailure { snackbar.showSnackbar(it.message ?: "重新打开失败") } }
+        }
+
+        fun editTask(item: RemotePlanItem) {
+            scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "update_task").put("task_id", item.id).put("title", item.title).put("estimated_minutes", item.minutes).put("priority", item.priority)) }
+                .onSuccess { state -> remotePlan = state.plan; snackbar.showSnackbar("任务已保存") }
+                .onFailure { snackbar.showSnackbar(it.message ?: "保存任务失败") } }
+        }
+
+        fun removeTask(item: RemotePlanItem) {
+            scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "cancel_task").put("task_id", item.id).put("reason", "用户在移动端手动移除任务")) }
+                .onSuccess { state -> remotePlan = state.plan }
+                .onFailure { snackbar.showSnackbar(it.message ?: "移除任务失败") } }
+        }
+
+        fun createTask(title: String, minutes: Int, priority: Int) {
+            scope.launch { runCatching {
+                gatewayExecuteAction(activity, remoteThreadId, JSONObject()
+                    .put("type", "create_task")
+                    .put("title", title)
+                    .put("estimated_minutes", minutes)
+                    .put("priority", priority)
+                    .put("reason", "用户在移动端手动新建任务"))
+            }.onSuccess { state -> remotePlan = state.plan }
+                .onFailure { snackbar.showSnackbar(it.message ?: "新建任务失败") } }
+        }
+
+        fun reorderTasks(taskIds: List<String>) {
+            val ids = taskIds.filter(String::isNotBlank)
+            if (ids.size < 2) return
+            scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "reorder_tasks").put("task_ids", JSONArray(ids)))}
+                .onSuccess { state -> remotePlan = state.plan }
+                .onFailure { snackbar.showSnackbar(it.message ?: "排序失败") } }
         }
 
         fun applyActions(actions: List<AssistantAction>) {
@@ -623,7 +917,17 @@ private fun ForwardApp(activity: MainActivity) {
                         wakeTime = it
                         activity.savePlannerTime("wake_time", it)
                     }
-                    "complete_current_task" -> currentDone = true
+                    "set_buffer_minutes" -> action.minutes?.coerceIn(0, 1440)?.let { minutes ->
+                        scope.launch {
+                            runCatching {
+                                gatewayExecuteAction(activity, remoteThreadId, JSONObject()
+                                    .put("type", "set_buffer_minutes")
+                                    .put("minutes", minutes)
+                                    .put("reason", "用户在移动端设置缓冲时间"))
+                            }.onSuccess { state -> remotePlan = state.plan }
+                        }
+                    }
+                    "complete_current_task" -> { currentDone = false; beginBreak() }
                     "defer_task" -> action.task?.takeIf { it.isNotBlank() }?.let {
                         val updated = deferredTasks + it
                         deferredTasks = updated
@@ -651,6 +955,19 @@ private fun ForwardApp(activity: MainActivity) {
                     }
                     "set_unavailable_period" -> unavailablePeriod = true
                 }
+            }
+        }
+
+        fun applyDeviceActions(actions: List<AssistantAction>): List<AlarmOperationResult> {
+            return actions.filter { it.type == "set_alarm" || it.type == "cancel_alarm" }.map { action ->
+                if (action.type == "set_alarm" && Build.VERSION.SDK_INT >= 33 &&
+                    ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
+                val outcome = AlarmScheduler.apply(activity, action)
+                scope.launch { snackbar.showSnackbar(outcome.message) }
+                if (outcome.needsExactPermission) activity.openExactAlarmSettings()
+                outcome
             }
         }
 
@@ -691,6 +1008,7 @@ private fun ForwardApp(activity: MainActivity) {
                 }
                 text.contains("完成") || text.contains("做完") -> {
                     currentDone = true
+                    beginBreak()
                     "好，高数错题记为完成。接下来留 15 分钟休息，再按今天还剩的时间继续排英语和收益实验。"
                 }
                 text.contains("外出") || text.contains("出门") || text.contains("累") || text.contains("疲惫") -> {
@@ -710,13 +1028,25 @@ private fun ForwardApp(activity: MainActivity) {
             aiBusy = true
             scope.launch {
                 val result = runCatching {
-                    requestAssistant(activity, text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel, remoteThreadId)
+                    requestAssistant(activity, text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel, remoteThreadId, conversationOptions)
                 }.getOrElse { error -> AssistantResult("这次没有连上服务，内容没有写入任务、计划或记忆。请稍后重试。", emptyList()).also { scope.launch { snackbar.showSnackbar(error.message ?: "AI 服务连接失败") } } }
                 if (result.plan == null) applyActions(result.actions)
+                val deviceResults = applyDeviceActions(result.deviceActions.ifEmpty { result.actions })
                 result.plan?.let { remotePlan = it }
                 result.state?.let { remoteMemories = it.memories; if (it.plan != null) remotePlan = it.plan }
-                result.threadId?.let { remoteThreadId = it }
-                messages = messages + ChatMessage(true, result.reply)
+                result.threadId?.let { id ->
+                    remoteThreadId = id
+                    if (conversationOptions.saveFullConversation) {
+                        runCatching { gatewayListThreads(activity) }.onSuccess { threads = it }
+                    }
+                }
+                val deviceFailure = deviceResults.firstOrNull { !it.ok }
+                val displayReply = if (deviceFailure != null) {
+                    "手机端闹钟操作需要进一步处理：${deviceFailure.message}"
+                } else if (deviceResults.isNotEmpty()) {
+                    result.reply + "\n\n" + deviceResults.joinToString("\n") { it.message }
+                } else result.reply
+                messages = messages + ChatMessage(true, displayReply)
                 aiBusy = false
             }
         }
@@ -754,24 +1084,69 @@ private fun ForwardApp(activity: MainActivity) {
             }
         ) { padding ->
             when (tab) {
-                0 -> TodayScreen(padding, now, sleepTime, currentDone, unavailablePeriod, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), remotePlan, ::completeTask, ::sendMessage, input, { input = it }, aiBusy)
-                1 -> ChatScreen(padding, messages, ::sendMessage, input, { input = it }, aiBusy)
-                2 -> MemoryScreen(padding, remoteMemories)
+                0 -> TodayScreen(padding, now, sleepTime, currentDone, unavailablePeriod, breakTimer, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), remotePlan, ::completeTask, ::startCurrentTimer, ::pauseCurrentTimer, { breakTimer = breakTimer?.copy(running = !breakTimer!!.running) }, { breakTimer = null; currentDone = false }, ::reopenTask, ::editTask, ::removeTask, ::createTask, ::reorderTasks, ::sendMessage, input, { value -> input = value }, aiBusy)
+                1 -> ChatScreen(
+                    padding = padding,
+                    messages = messages,
+                    input = input,
+                    onInput = { input = it },
+                    onSend = ::sendMessage,
+                    aiBusy = aiBusy,
+                    threadLoading = threadLoading,
+                    conversationOptions = conversationOptions,
+                    projects = remoteProjects,
+                    threads = threads,
+                    onLoadThread = ::loadThread,
+                    onStartConversation = ::startConversation,
+                    onUpdateConversationOptions = ::updateConversationOptions
+                )
+                2 -> MemoryScreen(
+                    padding = padding,
+                    activity = activity,
+                    memories = remoteMemories,
+                    status = memoryStatus,
+                    onStateChanged = { state ->
+                        remoteMemories = state.memories
+                        remotePlan = state.plan ?: remotePlan
+                        remoteProjects = state.projects
+                        scope.launch { runCatching { gatewayMemoryStatus(activity) }.onSuccess { memoryStatus = it } }
+                    },
+                    onStatusChanged = { memoryStatus = it }
+                )
                 else -> SettingsScreen(
                     padding,
                     activity,
                     snackbar,
                     sleepTime,
                     wakeTime,
-                    usageSnapshot,
+                    bufferMinutes = remotePlan?.configuredBufferMinutes ?: 60,
+                    usageSnapshot = usageSnapshot,
                     onSleepTime = { time -> sleepTime = time; activity.savePlannerTime("sleep_time", time); scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_sleep_time").put("time", formatClock(time)).put("reason", "用户在移动端设置睡觉时间")) }.onSuccess { remotePlan = it.plan; remoteMemories = it.memories } } },
                     onWakeTime = { time -> wakeTime = time; activity.savePlannerTime("wake_time", time); scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_wake_time").put("time", formatClock(time)).put("reason", "用户在移动端设置起床时间")) }.onSuccess { remotePlan = it.plan; remoteMemories = it.memories } } },
+                    onBufferMinutes = { minutes -> scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_buffer_minutes").put("minutes", minutes).put("reason", "用户在移动端设置缓冲时间")) }.onSuccess { state -> remotePlan = state.plan; remoteMemories = state.memories }.onFailure { snackbar.showSnackbar(it.message ?: "缓冲时间保存失败") } } },
                     aiProviders = aiProviders,
                     selectedProviderId = selectedProviderId,
                     selectedModel = selectedModel,
                     onAiSelection = { providerId, model -> selectedProviderId = providerId; selectedModel = model; activity.saveAiSelection(providerId, model) },
                     onUsageSnapshotChanged = { usageSnapshot = activity.usageSnapshot() },
-                    onRemoteState = { state -> remotePlan = state.plan; remoteMemories = state.memories }
+                    onRemoteState = { state -> remotePlan = state.plan; remoteMemories = state.memories; remoteProjects = state.projects },
+                    onThreadsRefresh = {
+                        scope.launch {
+                            runCatching { gatewayListThreads(activity) }
+                                .onSuccess { loaded ->
+                                    threads = loaded
+                                    val stillAvailable = remoteThreadId?.let { id -> loaded.any { it.id == id } } == true
+                                    if (!stillAvailable) {
+                                        val resume = loaded.firstOrNull { it.mode != "temporary" } ?: loaded.firstOrNull()
+                                        if (resume != null) loadThread(resume) else {
+                                            remoteThreadId = null
+                                            messages = emptyList()
+                                            conversationOptions = defaultConversationOptions("assistant")
+                                        }
+                                    }
+                                }
+                        }
+                    }
                 )
             }
         }
@@ -785,50 +1160,250 @@ private fun TodayScreen(
     sleepTime: LocalTime,
     currentDone: Boolean,
     unavailablePeriod: Boolean,
+    breakTimer: BreakTimerState?,
     plan: List<PlanItem>,
     remotePlan: RemotePlan?,
     completeTask: () -> Unit,
+    startTimer: () -> Unit,
+    pauseTimer: () -> Unit,
+    toggleBreak: () -> Unit,
+    skipBreak: () -> Unit,
+    reopenTask: (String) -> Unit,
+    editTask: (RemotePlanItem) -> Unit,
+    removeTask: (RemotePlanItem) -> Unit,
+    createTask: (String, Int, Int) -> Unit,
+    reorderTasks: (List<String>) -> Unit,
     sendMessage: () -> Unit,
     input: TextFieldValue,
     onInput: (TextFieldValue) -> Unit,
     aiBusy: Boolean
 ) {
+    var editingTask by remember { mutableStateOf<RemotePlanItem?>(null) }
+    var creatingTask by remember { mutableStateOf(false) }
+    var createTitle by remember { mutableStateOf("") }
+    var createMinutes by remember { mutableStateOf("45") }
+    var createPriority by remember { mutableStateOf("3") }
+    var editTitle by remember { mutableStateOf("") }
+    var editMinutes by remember { mutableStateOf("") }
+    var editPriority by remember { mutableStateOf("") }
+    // Keep the local ticker alive while the same task is running. The plan is
+    // refreshed periodically, but its server elapsed value must not reset the
+    // visible seconds on every refresh.
+    var timerSeconds by remember(remotePlan?.activeTimer?.taskId) { mutableStateOf(remotePlan?.activeTimer?.elapsedSeconds ?: 0L) }
+    LaunchedEffect(remotePlan?.activeTimer?.elapsedSeconds) {
+        val serverElapsed = remotePlan?.activeTimer?.elapsedSeconds ?: return@LaunchedEffect
+        if (serverElapsed > timerSeconds) timerSeconds = serverElapsed
+    }
+    LaunchedEffect(remotePlan?.activeTimer?.taskId) {
+        while (remotePlan?.activeTimer != null) { delay(1000); timerSeconds += 1 }
+    }
     val clock = formatClock(now.toLocalTime())
-    val scheduledPlan = remotePlan?.let { remote ->
-        remote.scheduled.map { remoteScheduledItem(it, false) } + remote.deferred.map { remoteScheduledItem(it, true) }
+    val serverPlan = remotePlan?.let { remote ->
+        normalizeRemotePlanItems(remote, now)
     } ?: schedulePlan(plan, now, sleepTime)
+    var draggingTaskId by remember { mutableStateOf<String?>(null) }
+    var dragOffset by remember { mutableStateOf(0f) }
+    var lastDragMoveAt by remember { mutableStateOf(0L) }
+    var displayPlan by remember { mutableStateOf(serverPlan) }
+    val listState = rememberLazyListState()
+    LaunchedEffect(serverPlan.map { "${it.item.id}:${it.start}:${it.end}:${it.deferredByCapacity}" }.joinToString("|")) {
+        if (draggingTaskId == null) displayPlan = serverPlan
+    }
+    fun moveDraggedTask(targetId: String) {
+        val sourceId = draggingTaskId ?: return
+        val sourceIndex = displayPlan.indexOfFirst { it.item.id == sourceId }
+        val targetIndex = displayPlan.indexOfFirst { it.item.id == targetId }
+        if (sourceIndex < 0 || targetIndex < 0 || sourceIndex == targetIndex) return
+        displayPlan = displayPlan.toMutableList().apply { add(targetIndex, removeAt(sourceIndex)) }
+        // Require another deliberate movement before the next swap. This prevents
+        // one fast swipe from carrying a task across the entire list.
+        dragOffset = 0f
+        lastDragMoveAt = System.currentTimeMillis()
+    }
+    fun finishDragging() {
+        val dragged = draggingTaskId
+        draggingTaskId = null
+        dragOffset = 0f
+        if (dragged != null) reorderTasks(displayPlan.map { it.item.id })
+    }
+    val scheduledPlan = displayPlan
     val availableMinutes = remotePlan?.availableMinutes?.toLong() ?: minutesUntilSleep(now, sleepTime)
     val scheduledMinutes = remotePlan?.scheduledMinutes?.toLong() ?: scheduledPlan.filter { it.start != null && !it.item.done }.sumOf { it.item.minutes }.toLong()
     val bufferMinutes = remotePlan?.bufferMinutes?.toLong() ?: (availableMinutes - scheduledMinutes).coerceAtLeast(0)
+    val freeMinutes = remotePlan?.freeMinutes?.toLong() ?: 0L
     val currentItem = remotePlan?.currentTaskId?.let { currentId ->
         scheduledPlan.getOrNull(remotePlan.scheduled.indexOfFirst { it.id == currentId }.takeIf { it >= 0 } ?: -1)
     } ?: scheduledPlan.firstOrNull { it.start != null && !it.item.isBreak && !it.item.done }
-    LazyColumn(modifier = Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(bottom = 10.dp)) {
+    LazyColumn(state = listState, modifier = Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(bottom = 10.dp)) {
         item { Column(Modifier.padding(horizontal = 20.dp, vertical = 18.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) { Box(Modifier.size(7.dp).clip(CircleShape).background(Coral)); Spacer(Modifier.width(7.dp)); Text(dateLabel(now.toLocalDate()), color = Muted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
             Spacer(Modifier.height(10.dp)); Text("今天，先把最重要的事做下去。", color = Green, fontSize = 26.sp, fontWeight = FontWeight.Bold, lineHeight = 34.sp)
             Spacer(Modifier.height(6.dp)); Text("现在 $clock · 今天排到 ${remotePlan?.sleepTime ?: formatClock(sleepTime)} · 还可用 ${formatDuration(availableMinutes)}", color = Muted, fontSize = 11.sp)
         } }
-        item { CurrentTaskCard(currentItem, currentDone, completeTask) }
-        item { SectionTitle("今日动态计划", "现在 $clock") }
-        item { BudgetRow(scheduledMinutes, bufferMinutes, availableMinutes) }
-        items(scheduledPlan) { item -> PlanRow(item) }
+        item { CurrentTaskCard(currentItem, currentDone, breakTimer, remotePlan?.completed?.firstOrNull()?.title, remotePlan?.activeTimer, timerSeconds, completeTask, startTimer, pauseTimer, toggleBreak, skipBreak) }
+        item { Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 15.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text("今日动态计划", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.Bold); Row(verticalAlignment = Alignment.CenterVertically) { Text("现在 $clock", color = Muted, fontSize = 10.sp); TextButton(onClick = { creatingTask = true; createTitle = ""; createMinutes = "45"; createPriority = "3" }, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)) { Icon(Icons.Default.Add, null, tint = Green, modifier = Modifier.size(16.dp)); Text("新建", color = Green, fontSize = 11.sp) } } } }
+        item { BudgetRow(scheduledMinutes, bufferMinutes, freeMinutes) }
+        // Some legacy/local tasks may not have an id yet; keep LazyColumn keys unique
+        // so the app can still open and the task can be edited normally.
+        items(scheduledPlan, key = { it.item.id.ifBlank { "task-${it.item.title}-${it.start ?: "unscheduled"}" } }) { item ->
+            PlanRow(
+                scheduled = item,
+                editTask = { task -> editingTask = task; editTitle = task.title; editMinutes = task.minutes.toString(); editPriority = task.priority.toString() },
+                removeTask = removeTask,
+                isDragging = draggingTaskId == item.item.id,
+                dragOffset = if (draggingTaskId == item.item.id) dragOffset else 0f,
+                onDragStart = { if (item.item.id.isNotBlank() && !item.item.done) { draggingTaskId = item.item.id; dragOffset = 0f; lastDragMoveAt = 0L } },
+                onDrag = { delta ->
+                    if (draggingTaskId == item.item.id) {
+                        dragOffset += delta
+                        val draggedInfo = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == item.item.id }
+                        if (draggedInfo != null) {
+                            val center = draggedInfo.offset + dragOffset + draggedInfo.size / 2
+                            val sourceIndex = displayPlan.indexOfFirst { it.item.id == item.item.id }
+                            val direction = if (dragOffset > 0f) 1 else -1
+                            val targetItem = displayPlan.getOrNull(sourceIndex + direction)
+                            val target = targetItem?.let { targetValue ->
+                                listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == targetValue.item.id }
+                            }
+                            val crossed = target != null && if (direction > 0) {
+                                center > target.offset + target.size * 0.72f
+                            } else {
+                                center < target.offset + target.size * 0.28f
+                            }
+                            if (crossed && System.currentTimeMillis() - lastDragMoveAt > 180L) {
+                                target?.key?.toString()?.takeIf { it.isNotBlank() }?.let(::moveDraggedTask)
+                            }
+                        }
+                    }
+                },
+                onDragEnd = ::finishDragging
+            )
+        }
+        if (remotePlan?.completed?.isNotEmpty() == true) {
+            item { SectionTitle("已完成", "保留历史，可重新打开") }
+            items(remotePlan.completed) { item -> CompletedTaskRow(item, onReopen = { reopenTask(item.id) }) }
+        }
         if (unavailablePeriod) item { AdjustmentCard("有一段不可用时间已加入计划", "我会避开这段时间，并把受影响事项顺延；调整原因会在对话中说明。") }
         else if (remotePlan?.adjustmentReason?.isNotBlank() == true) item { AdjustmentCard("本次计划调整", remotePlan.adjustmentReason) }
         else if (scheduledPlan.any { it.deferredByCapacity && !it.item.done }) item { AdjustmentCard("今晚时间不够用", "超过 ${formatClock(sleepTime)} 的事项已转为可顺延，不会为了塞完任务压缩你的睡眠。") }
         item { SectionTitle("快速记录", "直接告诉我发生了什么") }
         item { Composer(input, onInput, sendMessage, aiBusy) }
     }
+    editingTask?.let { task ->
+        val selectedPriority = (editPriority.toIntOrNull() ?: task.priority).let { value ->
+            when {
+                value >= 4 -> 5
+                value >= 3 -> 3
+                else -> 1
+            }
+        }
+        val priorityChoices = listOf(
+            Triple(5, "高", Color(0xFFE17E5D)),
+            Triple(3, "中", Color(0xFF55A496)),
+            Triple(1, "低", Color(0xFF968BD0))
+        )
+        AlertDialog(
+            onDismissRequest = { editingTask = null },
+            shape = RoundedCornerShape(22.dp),
+            containerColor = Color(0xFFFFFEFA),
+            tonalElevation = 0.dp,
+            title = { Text("编辑任务", color = Green, fontSize = 21.sp, fontWeight = FontWeight.SemiBold) },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(editTitle, { editTitle = it }, label = { Text("任务名称") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(editMinutes, { editMinutes = it.filter(Char::isDigit) }, label = { Text("预计分钟") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("优先级", color = Muted, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                    Row(horizontalArrangement = Arrangement.spacedBy(7.dp), modifier = Modifier.fillMaxWidth()) {
+                        priorityChoices.forEach { (value, label, color) ->
+                            val selected = selectedPriority == value
+                            Column(
+                                Modifier.weight(1f).clip(RoundedCornerShape(9.dp))
+                                    .background(if (selected) color.copy(alpha = .13f) else Color(0xFFF5F6F2))
+                                    .border(1.dp, if (selected) color else Color(0xFFDCE4DC), RoundedCornerShape(9.dp))
+                                    .clickable { editPriority = value.toString() }
+                                    .padding(vertical = 9.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Box(Modifier.size(9.dp).clip(CircleShape).background(color))
+                                Spacer(Modifier.height(4.dp))
+                                Text(label, color = if (selected) Green else Muted, fontSize = 12.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+                            }
+                        }
+                    }
+                }
+            } },
+            confirmButton = { Button(onClick = { editTask(task.copy(title = editTitle.trim().ifBlank { task.title }, minutes = editMinutes.toIntOrNull() ?: task.minutes, priority = selectedPriority)); editingTask = null }, colors = ButtonDefaults.buttonColors(containerColor = Green), shape = RoundedCornerShape(8.dp)) { Text("保存") } },
+            dismissButton = { Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) { TextButton(onClick = { removeTask(task); editingTask = null }) { Text("从计划移除", color = Color(0xFFB04F42)) }; TextButton(onClick = { editingTask = null }) { Text("取消", color = Muted) } } }
+        )
+    }
+    if (creatingTask) {
+        val selectedPriority = (createPriority.toIntOrNull() ?: 3).let { value -> when { value >= 4 -> 5; value >= 3 -> 3; else -> 1 } }
+        val priorityChoices = listOf(
+            Triple(5, "高", Color(0xFFE17E5D)),
+            Triple(3, "中", Color(0xFF55A496)),
+            Triple(1, "低", Color(0xFF968BD0))
+        )
+        AlertDialog(
+            onDismissRequest = { creatingTask = false },
+            shape = RoundedCornerShape(22.dp),
+            containerColor = Color(0xFFFFFEFA),
+            tonalElevation = 0.dp,
+            title = { Text("新建任务", color = Green, fontSize = 21.sp, fontWeight = FontWeight.SemiBold) },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(createTitle, { createTitle = it }, label = { Text("任务名称") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(createMinutes, { createMinutes = it.filter(Char::isDigit) }, label = { Text("预计分钟") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("优先级", color = Muted, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                    Row(horizontalArrangement = Arrangement.spacedBy(7.dp), modifier = Modifier.fillMaxWidth()) {
+                        priorityChoices.forEach { (value, label, color) ->
+                            val selected = selectedPriority == value
+                            Column(Modifier.weight(1f).clip(RoundedCornerShape(9.dp)).background(if (selected) color.copy(alpha = .13f) else Color(0xFFF5F6F2)).border(1.dp, if (selected) color else Color(0xFFDCE4DC), RoundedCornerShape(9.dp)).clickable { createPriority = value.toString() }.padding(vertical = 9.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Box(Modifier.size(9.dp).clip(CircleShape).background(color)); Spacer(Modifier.height(4.dp)); Text(label, color = if (selected) Green else Muted, fontSize = 12.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+                            }
+                        }
+                    }
+                }
+            } },
+            confirmButton = { Button(onClick = { createTask(createTitle.trim(), (createMinutes.toIntOrNull() ?: 45).coerceIn(5, 720), selectedPriority); creatingTask = false }, enabled = createTitle.trim().isNotBlank(), colors = ButtonDefaults.buttonColors(containerColor = Green), shape = RoundedCornerShape(8.dp)) { Text("创建任务") } },
+            dismissButton = { TextButton(onClick = { creatingTask = false }) { Text("取消", color = Muted) } }
+        )
+    }
 }
 
 @Composable
-private fun CurrentTaskCard(currentItem: ScheduledPlanItem?, done: Boolean, onDone: () -> Unit) {
+private fun CompletedTaskRow(item: RemotePlanItem, onReopen: () -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+        Icon(Icons.Default.TaskAlt, null, tint = Color(0xFF4A897D), modifier = Modifier.size(17.dp))
+        Spacer(Modifier.width(8.dp))
+        Column(Modifier.weight(1f)) {
+            Text(item.title, color = Muted, fontSize = 12.sp, textDecoration = androidx.compose.ui.text.style.TextDecoration.LineThrough)
+            Text("实际 ${item.actualMinutes} 分钟 · 已完成", color = Muted, fontSize = 10.sp)
+        }
+        TextButton(onClick = onReopen) { Text("重新打开", color = Green, fontSize = 11.sp) }
+    }
+}
+
+@Composable
+private fun CurrentTaskCard(currentItem: ScheduledPlanItem?, done: Boolean, breakTimer: BreakTimerState?, completedTitle: String?, activeTimer: RemoteActiveTimer?, timerSeconds: Long, onDone: () -> Unit, onStart: () -> Unit, onPause: () -> Unit, onToggleBreak: () -> Unit, onSkipBreak: () -> Unit) {
+    val breakActive = breakTimer != null
+    val visibleTimer = activeTimer?.takeIf { !done && !breakActive && currentItem != null && it.taskId == currentItem.item.id }
+    val estimatedSeconds = (currentItem?.item?.minutes ?: 0).coerceAtLeast(1) * 60L
+    val storedSeconds = currentItem?.item?.actualSeconds ?: 0L
+    // actualSeconds includes all saved sessions, while timerSeconds tracks the
+    // currently running session locally. Add the saved sessions before the
+    // current one so the visible value keeps increasing instead of being reset
+    // to the last server snapshot on every recomposition.
+    val previousSeconds = if (visibleTimer != null) (storedSeconds - visibleTimer.elapsedSeconds).coerceAtLeast(0) else 0L
+    val elapsedSeconds = if (visibleTimer != null) previousSeconds + timerSeconds else storedSeconds
+    val progress = if (done) 1f else (elapsedSeconds.toFloat() / estimatedSeconds.toFloat()).coerceIn(0f, 1f)
     val title = when {
-        done -> "已完成 · 高等数学错题回顾"
+        breakActive -> "休息中"
+        done -> "已完成 · ${completedTitle?.takeIf { it.isNotBlank() } ?: currentItem?.item?.title ?: "当前任务"}"
         currentItem == null -> "今天不再安排核心任务"
         else -> currentItem.item.title
     }
     val detail = when {
+        breakActive -> if (breakTimer!!.running) "自动休息 · 还剩 ${formatElapsed(breakTimer.remainingSeconds)}" else "休息已暂停 · 还剩 ${formatElapsed(breakTimer.remainingSeconds)}"
         done -> "接下来休息 15 分钟"
         currentItem == null -> "剩余事项已留作明天或等待你调整"
         else -> {
@@ -843,8 +1418,30 @@ private fun CurrentTaskCard(currentItem: ScheduledPlanItem?, done: Boolean, onDo
     }
     Card(Modifier.padding(horizontal = 16.dp, vertical = 2.dp).fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = GreenSoft), shape = RoundedCornerShape(10.dp)) {
         Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(10.dp).clip(CircleShape).background(if (done) Color(0xFF5AAE9D) else Coral)); Spacer(Modifier.width(10.dp)); Column(Modifier.weight(1f)) { Text("当前任务", color = Muted, fontSize = 10.sp); Text(title, color = Green, fontSize = 14.sp, fontWeight = FontWeight.Bold); Text(detail, color = Color(0xFF4C7168), fontSize = 10.sp) }
-            IconButton(onClick = onDone, enabled = !done && currentItem != null, modifier = Modifier.size(36.dp).clip(CircleShape).background(if (done) Color(0xFFD5E8DE) else Color(0xFFD7EDE3))) { Icon(Icons.Default.Check, "完成当前任务", tint = Color(0xFF257264)) }
+            Box(Modifier.size(10.dp).clip(CircleShape).background(if (breakActive || done) Color(0xFF5AAE9D) else Coral)); Spacer(Modifier.width(10.dp)); Column(Modifier.weight(1f)) { Text(if (breakActive) "当前状态" else "当前任务", color = Muted, fontSize = 10.sp); Text(title, color = Green, fontSize = 14.sp, fontWeight = FontWeight.Bold); Text(detail, color = Color(0xFF4C7168), fontSize = 10.sp) }
+            Column(horizontalAlignment = Alignment.End) {
+                if (breakActive) {
+                    val breakProgress = (1f - breakTimer!!.remainingSeconds / (15 * 60f)).coerceIn(0f, 1f)
+                    Text("休息 ${formatElapsed(breakTimer.remainingSeconds)}", color = Green, fontSize = 10.sp)
+                    LinearProgressIndicator(progress = { breakProgress }, modifier = Modifier.width(92.dp), color = Color(0xFF5AAE9D), trackColor = Color(0xFFD7E4DC))
+                    Row(horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = onToggleBreak, contentPadding = PaddingValues(horizontal = 5.dp, vertical = 0.dp)) {
+                            Text(if (breakTimer.running) "暂停" else "继续", fontSize = 11.sp, color = Green)
+                        }
+                        TextButton(onClick = onSkipBreak, contentPadding = PaddingValues(horizontal = 5.dp, vertical = 0.dp)) {
+                            Text("跳过", fontSize = 11.sp, color = Green)
+                        }
+                    }
+                } else if (currentItem != null && !currentItem.item.isBreak) {
+                    Text(if (visibleTimer?.mode == "countdown") "已用 ${formatElapsed(elapsedSeconds)} · 剩余 ${formatElapsed((estimatedSeconds - elapsedSeconds).coerceAtLeast(0))}" else "已用 ${formatElapsed(elapsedSeconds)} / ${formatElapsed(estimatedSeconds)}", color = Green, fontSize = 10.sp)
+                    LinearProgressIndicator(progress = { progress }, modifier = Modifier.width(92.dp), color = if (progress >= 1f) Color(0xFF5AAE9D) else Coral, trackColor = Color(0xFFD7E4DC))
+                }
+                if (!breakActive && !done && currentItem != null) {
+                    val timerBelongsToCurrent = visibleTimer != null
+                    TextButton(onClick = if (timerBelongsToCurrent) onPause else onStart) { Text(if (timerBelongsToCurrent) "暂停" else "开始", fontSize = 11.sp, color = Green) }
+                    TextButton(onClick = onDone) { Text("完成", fontSize = 11.sp, color = Green) }
+                } else if (done) Text("已完成", color = Color(0xFF4A897D), fontSize = 11.sp)
+            }
         }
     }
 }
@@ -853,12 +1450,21 @@ private fun CurrentTaskCard(currentItem: ScheduledPlanItem?, done: Boolean, onDo
 private fun SectionTitle(title: String, detail: String) { Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 15.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text(title, color = Ink, fontSize = 15.sp, fontWeight = FontWeight.Bold); Text(detail, color = Muted, fontSize = 10.sp) } }
 
 @Composable
-private fun BudgetRow(scheduledMinutes: Long, bufferMinutes: Long, availableMinutes: Long) { Row(Modifier.padding(horizontal = 20.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Metric("任务已排", formatDuration(scheduledMinutes)); Metric("保留缓冲", formatDuration(bufferMinutes)); Metric("剩余可用", formatDuration(availableMinutes)) } }
+private fun BudgetRow(scheduledMinutes: Long, bufferMinutes: Long, freeMinutes: Long) { Row(Modifier.padding(horizontal = 20.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Metric("任务已排", formatDuration(scheduledMinutes)); Metric("保留缓冲", formatDuration(bufferMinutes)); Metric("剩余可用", formatDuration(freeMinutes)) } }
 @Composable
 private fun Metric(label: String, value: String) { Column { Text(label, color = Muted, fontSize = 10.sp); Text(value, color = Color(0xFF34544D), fontSize = 11.sp, fontWeight = FontWeight.SemiBold) } }
 
 @Composable
-private fun PlanRow(scheduled: ScheduledPlanItem) {
+private fun PlanRow(
+    scheduled: ScheduledPlanItem,
+    editTask: (RemotePlanItem) -> Unit,
+    removeTask: (RemotePlanItem) -> Unit = {},
+    isDragging: Boolean = false,
+    dragOffset: Float = 0f,
+    onDragStart: () -> Unit = {},
+    onDrag: (Float) -> Unit = {},
+    onDragEnd: () -> Unit = {}
+) {
     val item = scheduled.item
     val time = when {
         item.done -> "完成"
@@ -870,7 +1476,15 @@ private fun PlanRow(scheduled: ScheduledPlanItem) {
         scheduled.deferredByCapacity -> if (item.deferred) "因今天安排变化而顺延" else "超过今晚可用时间，顺延"
         else -> "${item.note} · 至 ${formatClock(scheduled.end!!.toLocalTime())} · ${item.minutes} 分钟"
     }
-    Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalAlignment = Alignment.Top) { Text(time, color = Muted, fontSize = 10.sp, modifier = Modifier.width(39.dp)); Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(18.dp)) { Box(Modifier.size(9.dp).border(2.dp, item.tone, CircleShape).clip(CircleShape).background(Rail)); Box(Modifier.width(1.dp).height(39.dp).background(Color(0xFFD2DAD1))) }; Spacer(Modifier.width(7.dp)); Column(Modifier.weight(1f)) { Text(item.title, color = if (item.done || scheduled.deferredByCapacity) Muted else Ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, textDecoration = if (item.done) androidx.compose.ui.text.style.TextDecoration.LineThrough else null, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(note, color = Muted, fontSize = 10.sp) }; if (item.done) Icon(Icons.Default.TaskAlt, null, tint = Color(0xFF4A897D), modifier = Modifier.size(17.dp)) }
+    val dragModifier = if (item.id.isNotBlank() && !item.done) Modifier.pointerInput(item.id) {
+        detectDragGesturesAfterLongPress(
+            onDragStart = { onDragStart() },
+            onDragCancel = { onDragEnd() },
+            onDragEnd = { onDragEnd() },
+            onDrag = { _, amount -> onDrag(amount.y) }
+        )
+    } else Modifier
+    Row(dragModifier.graphicsLayer { translationY = if (isDragging) dragOffset else 0f; alpha = if (isDragging) 0.86f else 1f }.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalAlignment = Alignment.Top) { Text(time, color = Muted, fontSize = 10.sp, modifier = Modifier.width(39.dp)); Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(18.dp)) { Box(Modifier.size(9.dp).border(2.dp, item.tone, CircleShape).clip(CircleShape).background(Rail)); Box(Modifier.width(1.dp).height(39.dp).background(Color(0xFFD2DAD1))) }; Spacer(Modifier.width(7.dp)); Column(Modifier.weight(1f).clickable { if (item.id.isNotBlank()) editTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes)) }) { Text(item.title, color = if (item.done || scheduled.deferredByCapacity) Muted else Ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, textDecoration = if (item.done) androidx.compose.ui.text.style.TextDecoration.LineThrough else null, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(note, color = Muted, fontSize = 10.sp) }; if (item.done) Icon(Icons.Default.TaskAlt, null, tint = Color(0xFF4A897D), modifier = Modifier.size(17.dp)) }
 }
 
 @Composable
@@ -880,16 +1494,77 @@ private fun AdjustmentCard(title: String, body: String) { Card(Modifier.padding(
 private fun Composer(input: TextFieldValue, onInput: (TextFieldValue) -> Unit, onSend: () -> Unit, aiBusy: Boolean = false) { Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp).fillMaxWidth().clip(RoundedCornerShape(9.dp)).background(Color.White).border(1.dp, Color(0xFFD6DED4), RoundedCornerShape(9.dp)).padding(8.dp), verticalAlignment = Alignment.Bottom) { OutlinedTextField(value = input, onValueChange = onInput, enabled = !aiBusy, placeholder = { Text(if (aiBusy) "向前正在思考…" else "说进展、临时安排，或直接聊天…", color = Color(0xFF94A19C), fontSize = 12.sp) }, modifier = Modifier.weight(1f), minLines = 1, maxLines = 3, colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = Color.Transparent), trailingIcon = { Icon(Icons.Default.Mic, "语音输入", tint = Muted) }); IconButton(onClick = onSend, enabled = input.text.isNotBlank() && !aiBusy, modifier = Modifier.size(37.dp).clip(RoundedCornerShape(6.dp)).background(if (input.text.isBlank() || aiBusy) Color(0xFFE9EDE8) else Green)) { Icon(Icons.Default.Send, "发送", tint = if (input.text.isBlank() || aiBusy) Color(0xFF93A69F) else Color.White, modifier = Modifier.size(18.dp)) } } }
 
 @Composable
-private fun ChatScreen(padding: PaddingValues, messages: List<ChatMessage>, onSend: () -> Unit, input: TextFieldValue, onInput: (TextFieldValue) -> Unit, aiBusy: Boolean) {
+private fun ChatScreen(
+    padding: PaddingValues,
+    messages: List<ChatMessage>,
+    input: TextFieldValue,
+    onInput: (TextFieldValue) -> Unit,
+    onSend: () -> Unit,
+    aiBusy: Boolean,
+    threadLoading: Boolean,
+    conversationOptions: ConversationOptions,
+    projects: List<RemoteProject>,
+    threads: List<ConversationThread>,
+    onLoadThread: (ConversationThread) -> Unit,
+    onStartConversation: (ConversationOptions) -> Unit,
+    onUpdateConversationOptions: (ConversationOptions) -> Unit
+) {
     val listState = rememberLazyListState()
-    LaunchedEffect(messages.size) { listState.animateScrollToItem((messages.size - 1).coerceAtLeast(0)) }
+    var showHistory by remember { mutableStateOf(false) }
+    var showNewConversation by remember { mutableStateOf(false) }
+    var showConversationOptions by remember { mutableStateOf(false) }
+    val modeTitle = conversationModeLabel(conversationOptions.mode)
+    val projectName = projects.firstOrNull { it.id == conversationOptions.projectId }?.name
+        ?: threads.firstOrNull { it.projectId == conversationOptions.projectId }?.projectName.orEmpty()
+    LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex) }
+
     Column(Modifier.fillMaxSize().padding(padding)) {
-        SectionTitle("对话", "今天")
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 13.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(modeTitle, color = Ink, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    listOfNotNull(projectName.takeIf { it.isNotBlank() }, conversationScopeLabel(conversationOptions)).joinToString(" · "),
+                    color = Muted,
+                    fontSize = 10.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            TextButton(onClick = { showHistory = true }, enabled = !threadLoading && !aiBusy) { Text("历史", color = Green, fontSize = 12.sp) }
+            TextButton(onClick = { showNewConversation = true }, enabled = !threadLoading && !aiBusy) { Text("新建", color = Green, fontSize = 12.sp) }
+            TextButton(onClick = { showConversationOptions = true }, enabled = !threadLoading && !aiBusy) { Text("设置", color = Green, fontSize = 12.sp) }
+        }
         LazyColumn(
             modifier = Modifier.weight(1f),
             state = listState,
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)
         ) {
+            if (messages.isEmpty()) {
+                item {
+                    Card(
+                        Modifier.fillMaxWidth().padding(top = 18.dp, bottom = 8.dp),
+                        colors = CardDefaults.cardColors(containerColor = GreenSoft),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text("开始一段$modeTitle", color = Green, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                when (conversationOptions.mode) {
+                                    "temporary" -> "这段对话默认不读取记忆、不保存原始对话，也不会沉淀长期记忆。"
+                                    "project" -> "围绕指定项目对话；读取范围和保存策略可在右上角单独调整。"
+                                    "daily_planning" -> "告诉我今天的进展、临时安排或作息，我会据此更新计划。"
+                                    else -> "我会结合你允许读取的长期目标和近期记录，帮你推进事情。"
+                                },
+                                color = Color(0xFF4C7168), fontSize = 12.sp, lineHeight = 18.sp
+                            )
+                        }
+                    }
+                }
+            }
             items(messages) { message ->
                 Row(
                     Modifier.fillMaxWidth().padding(vertical = 6.dp),
@@ -914,41 +1589,307 @@ private fun ChatScreen(padding: PaddingValues, messages: List<ChatMessage>, onSe
                 }
             }
         }
-        Composer(input, onInput, onSend, aiBusy)
+        Composer(input, onInput, onSend, aiBusy || threadLoading)
+    }
+
+    if (showHistory) {
+        ConversationHistoryDialog(
+            threads = threads,
+            busy = threadLoading || aiBusy,
+            onDismiss = { showHistory = false },
+            onSelect = { thread -> showHistory = false; onLoadThread(thread) }
+        )
+    }
+    if (showNewConversation) {
+        NewConversationDialog(
+            projects = projects,
+            busy = threadLoading || aiBusy,
+            onDismiss = { showNewConversation = false },
+            onCreate = { options -> showNewConversation = false; onStartConversation(options) }
+        )
+    }
+    if (showConversationOptions) {
+        ConversationOptionsDialog(
+            current = conversationOptions,
+            busy = threadLoading || aiBusy,
+            onDismiss = { showConversationOptions = false },
+            onSave = { options -> showConversationOptions = false; onUpdateConversationOptions(options) }
+        )
     }
 }
 
 @Composable
-private fun MemoryScreen(padding: PaddingValues, remoteMemories: List<RemoteMemory>) {
-    val memories = remoteMemories.filter { it.status != "archived" }.map { it.content }
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(padding),
-        contentPadding = PaddingValues(20.dp)
-    ) {
-        item {
-            Text("记忆库", color = Green, fontSize = 25.sp, fontWeight = FontWeight.Bold)
-            Text("与电脑端共用的待确认和已确认记忆", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp, bottom = 18.dp))
-            Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = GreenSoft)) {
-                Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Visibility, null, tint = Color(0xFF277267))
-                    Spacer(Modifier.width(10.dp))
-                    Column {
-                        Text("云端记忆已同步", color = Green, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                        Text("重要对话会先成为候选，确认后再沉淀", color = Muted, fontSize = 11.sp)
+private fun ConversationHistoryDialog(
+    threads: List<ConversationThread>,
+    busy: Boolean,
+    onDismiss: () -> Unit,
+    onSelect: (ConversationThread) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("历史对话", color = Green, fontWeight = FontWeight.Bold) },
+        text = {
+            if (threads.isEmpty()) {
+                Text("还没有保存的对话。新建普通助手、项目对话或每日规划后，对话会自动出现在这里。", color = Muted, fontSize = 12.sp, lineHeight = 18.sp)
+            } else {
+                LazyColumn(Modifier.heightIn(max = 420.dp)) {
+                    items(threads) { thread ->
+                        Card(
+                            Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable(enabled = !busy) { onSelect(thread) },
+                            colors = CardDefaults.cardColors(containerColor = if (thread.mode == "temporary") Color(0xFFFFF7E9) else Color(0xFFF2F5F1)),
+                            shape = RoundedCornerShape(9.dp)
+                        ) {
+                            Column(Modifier.padding(12.dp)) {
+                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Text(conversationModeLabel(thread.mode), color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                    Text(formatThreadTime(thread.updatedAt), color = Muted, fontSize = 10.sp)
+                                }
+                                thread.projectName.takeIf { it.isNotBlank() }?.let { Text(it, color = Color(0xFF476F66), fontSize = 11.sp, modifier = Modifier.padding(top = 3.dp)) }
+                                Text(thread.preview.ifBlank { "尚未发送消息" }, color = Muted, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp))
+                                Text("${thread.messageCount} 条消息 · ${conversationScopeLabel(thread.toConversationOptions())}", color = Color(0xFF8A9791), fontSize = 9.sp, modifier = Modifier.padding(top = 5.dp))
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭", color = Green) } }
+    )
+}
+
+@Composable
+private fun NewConversationDialog(
+    projects: List<RemoteProject>,
+    busy: Boolean,
+    onDismiss: () -> Unit,
+    onCreate: (ConversationOptions) -> Unit
+) {
+    var mode by remember { mutableStateOf("assistant") }
+    var projectId by remember { mutableStateOf<String?>(null) }
+    var memoryScope by remember { mutableStateOf(true) }
+    var saveFullConversation by remember { mutableStateOf(true) }
+    var allowMemoryDistillation by remember { mutableStateOf(true) }
+    fun chooseMode(nextMode: String) {
+        mode = nextMode
+        if (nextMode != "project") projectId = null
+        val defaults = defaultConversationOptions(nextMode, projectId)
+        memoryScope = defaults.memoryScope
+        saveFullConversation = defaults.saveFullConversation
+        allowMemoryDistillation = defaults.allowMemoryDistillation
+    }
+    val canCreate = mode != "project" || !projectId.isNullOrBlank()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("新建对话", color = Green, fontWeight = FontWeight.Bold) },
+        text = {
+            LazyColumn(Modifier.heightIn(max = 470.dp)) {
+                item { Text("选择这段对话的工作方式", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(bottom = 7.dp)) }
+                items(listOf("temporary", "assistant", "project", "daily_planning")) { item ->
+                    val selected = mode == item
+                    Card(
+                        Modifier.fillMaxWidth().padding(vertical = 3.dp).clickable(enabled = !busy) { chooseMode(item) },
+                        colors = CardDefaults.cardColors(containerColor = if (selected) GreenSoft else Color(0xFFF6F7F4)),
+                        shape = RoundedCornerShape(9.dp)
+                    ) {
+                        Column(Modifier.padding(10.dp)) {
+                            Text(conversationModeLabel(item), color = if (selected) Green else Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                when (item) {
+                                    "temporary" -> "默认不读记忆、不保存原始对话"
+                                    "assistant" -> "读取长期目标和近期记录"
+                                    "project" -> "仅围绕一个指定项目"
+                                    else -> "读取任务、作息、进度和复盘"
+                                },
+                                color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 2.dp)
+                            )
+                        }
+                    }
+                }
+                if (mode == "project") {
+                    item { Text("选择项目", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 12.dp, bottom = 4.dp)) }
+                    if (projects.isEmpty()) item { Text("当前还没有可选择的项目；请先在电脑端建立项目后再创建项目对话。", color = Color(0xFF9C6441), fontSize = 11.sp) }
+                    items(projects) { project ->
+                        val selected = projectId == project.id
+                        Card(
+                            Modifier.fillMaxWidth().padding(vertical = 3.dp).clickable(enabled = !busy) { projectId = project.id },
+                            colors = CardDefaults.cardColors(containerColor = if (selected) Color(0xFFE4F0E8) else Color(0xFFF7F7F5)),
+                            shape = RoundedCornerShape(8.dp)
+                        ) { Text(project.name, color = if (selected) Green else Ink, fontSize = 12.sp, modifier = Modifier.padding(10.dp)) }
+                    }
+                }
+                item { Text("这段对话的数据边界", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 14.dp, bottom = 4.dp)) }
+                item { ConversationSwitchRow("读取记忆", "本次回复是否带入相应范围内的记忆", memoryScope, enabled = !busy) { memoryScope = it } }
+                item { ConversationSwitchRow("保存完整对话", "保留原始聊天记录，之后可重新打开", saveFullConversation, enabled = !busy) { saveFullConversation = it } }
+                item { ConversationSwitchRow("允许沉淀长期记忆", "重要事实、决定和进度可进入每日整理候选", allowMemoryDistillation, enabled = !busy) { allowMemoryDistillation = it } }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onCreate(ConversationOptions(
+                    mode = mode,
+                    projectId = projectId,
+                    memoryScope = memoryScope,
+                    saveFullConversation = saveFullConversation,
+                    allowMemoryDistillation = allowMemoryDistillation,
+                    projectName = projects.firstOrNull { it.id == projectId }?.name
+                )) },
+                enabled = canCreate && !busy,
+                colors = ButtonDefaults.buttonColors(containerColor = Green)
+            ) { Text("开始对话") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("取消", color = Muted) } }
+    )
+}
+
+@Composable
+private fun ConversationOptionsDialog(
+    current: ConversationOptions,
+    busy: Boolean,
+    onDismiss: () -> Unit,
+    onSave: (ConversationOptions) -> Unit
+) {
+    var memoryScope by remember { mutableStateOf(current.memoryScope) }
+    var saveFullConversation by remember { mutableStateOf(current.saveFullConversation) }
+    var allowMemoryDistillation by remember { mutableStateOf(current.allowMemoryDistillation) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("本次对话设置", color = Green, fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text("${conversationModeLabel(current.mode)}：三项控制彼此独立。", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp))
+                ConversationSwitchRow("读取记忆", "只控制本次对话带入哪些已有记忆", memoryScope, enabled = !busy) { memoryScope = it }
+                ConversationSwitchRow("保存完整对话", "只控制原始消息是否保留", saveFullConversation, enabled = !busy) { saveFullConversation = it }
+                ConversationSwitchRow("允许沉淀长期记忆", "只控制每日整理是否处理本段对话", allowMemoryDistillation, enabled = !busy) { allowMemoryDistillation = it }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onSave(current.copy(memoryScope = memoryScope, saveFullConversation = saveFullConversation, allowMemoryDistillation = allowMemoryDistillation)) },
+                enabled = !busy,
+                colors = ButtonDefaults.buttonColors(containerColor = Green)
+            ) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("取消", color = Muted) } }
+    )
+}
+
+@Composable
+private fun ConversationSwitchRow(title: String, detail: String, checked: Boolean, enabled: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = Ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Text(detail, color = Muted, fontSize = 10.sp, lineHeight = 14.sp)
+        }
+        Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
+    }
+}
+
+@Composable
+private fun MemoryScreen(
+    padding: PaddingValues,
+    activity: MainActivity,
+    memories: List<RemoteMemory>,
+    status: MemoryRunStatus?,
+    onStateChanged: (RemoteState) -> Unit,
+    onStatusChanged: (MemoryRunStatus) -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    val snackbar = remember { SnackbarHostState() }
+    var busy by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf<RemoteMemory?>(null) }
+    var editText by remember { mutableStateOf("") }
+    val visible = memories.filter { it.status != "archived" }
+    Scaffold(snackbarHost = { SnackbarHost(snackbar) }, containerColor = Color.Transparent) { inner ->
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().padding(padding).padding(inner),
+            contentPadding = PaddingValues(20.dp)
+        ) {
+            item {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("记忆库", color = Green, fontSize = 25.sp, fontWeight = FontWeight.Bold)
+                        Text("原始对话保留不变，AI 每天整理出可确认的长期记忆", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp))
+                    }
+                    IconButton(onClick = {
+                        if (busy) return@IconButton
+                        scope.launch {
+                            busy = true
+                            runCatching { gatewayRunDailyMemory(activity) }
+                                .onSuccess { state -> onStateChanged(state); runCatching { gatewayMemoryStatus(activity) }.onSuccess(onStatusChanged); snackbar.showSnackbar("今日记忆整理完成") }
+                                .onFailure { snackbar.showSnackbar(it.message ?: "每日整理失败") }
+                            busy = false
+                        }
+                    }) { Icon(Icons.Default.Refresh, "立即整理", tint = Green) }
+                }
+                Card(Modifier.fillMaxWidth().padding(top = 14.dp), colors = CardDefaults.cardColors(containerColor = GreenSoft), shape = RoundedCornerShape(10.dp)) {
+                    Column(Modifier.padding(14.dp)) {
+                        Text(if (busy) "正在整理今天的对话…" else "每日 22:00 自动整理", color = Green, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            status?.let { "今日 ${it.rawMessageCount} 条原始消息 · 待确认 ${it.pendingReviewCount} · 已确认 ${it.activeCount}" } ?: "正在读取整理状态…",
+                            color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)
+                        )
+                        status?.summary?.takeIf { it.isNotBlank() }?.let { Text(it, color = Color(0xFF4C7168), fontSize = 11.sp, lineHeight = 16.sp, modifier = Modifier.padding(top = 7.dp)) }
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+            }
+            if (visible.isEmpty()) item {
+                Text("目前还没有记忆条目。每天自动整理后，重要决定、项目进度和生活事件会先出现在这里，确认后才成为长期记忆。", color = Muted, fontSize = 12.sp, lineHeight = 18.sp, modifier = Modifier.padding(top = 12.dp))
+            }
+            items(visible) { memory ->
+                Card(Modifier.fillMaxWidth().padding(vertical = 5.dp), colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(9.dp)) {
+                    Column(Modifier.padding(12.dp)) {
+                        Row(verticalAlignment = Alignment.Top) {
+                            Icon(Icons.Default.Lightbulb, null, tint = Color(0xFFB77D55), modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(9.dp))
+                            Text(memory.content, color = Ink, fontSize = 13.sp, lineHeight = 19.sp, modifier = Modifier.weight(1f))
+                        }
+                        Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text(if (memory.status == "active") "已确认" else "待确认", color = if (memory.status == "active") Color(0xFF4A897D) else Color(0xFFB77D55), fontSize = 10.sp)
+                            Spacer(Modifier.weight(1f))
+                            if (memory.status == "pending_review") TextButton(enabled = !busy, onClick = {
+                                scope.launch {
+                                    busy = true
+                                    runCatching { gatewayUpdateMemory(activity, memory.id, "active") }
+                                        .onSuccess(onStateChanged)
+                                        .onFailure { snackbar.showSnackbar(it.message ?: "确认记忆失败") }
+                                    busy = false
+                                }
+                            }) { Text("确认", color = Green, fontSize = 11.sp) }
+                            TextButton(enabled = !busy, onClick = { editing = memory; editText = memory.content }) { Text("编辑", color = Green, fontSize = 11.sp) }
+                            TextButton(enabled = !busy, onClick = {
+                                scope.launch {
+                                    busy = true
+                                    runCatching { gatewayUpdateMemory(activity, memory.id, "archived") }
+                                        .onSuccess(onStateChanged)
+                                        .onFailure { snackbar.showSnackbar(it.message ?: "归档记忆失败") }
+                                    busy = false
+                                }
+                            }) { Text("归档", color = Color(0xFF9C4B3B), fontSize = 11.sp) }
+                        }
                     }
                 }
             }
         }
-        if (memories.isEmpty()) item { Text("还没有已沉淀的记忆。对话中的重要信息会先作为候选，等你确认后保存。", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 16.dp)) }
-        items(memories) { label ->
-            Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.Lightbulb, null, tint = Color(0xFFB77D55), modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(10.dp))
-                Text(label, color = Ink, fontSize = 13.sp)
-                Spacer(Modifier.weight(1f))
-                Text("可读取", color = Muted, fontSize = 10.sp)
-            }
-        }
+    }
+    editing?.let { memory ->
+        AlertDialog(
+            onDismissRequest = { if (!busy) editing = null },
+            title = { Text("编辑记忆", color = Green, fontWeight = FontWeight.Bold) },
+            text = { OutlinedTextField(value = editText, onValueChange = { editText = it }, minLines = 3, maxLines = 6, modifier = Modifier.fillMaxWidth()) },
+            confirmButton = {
+                Button(enabled = !busy && editText.isNotBlank(), onClick = {
+                    scope.launch {
+                        busy = true
+                        runCatching { gatewayUpdateMemory(activity, memory.id, memory.status, editText.trim()) }
+                            .onSuccess { state -> editing = null; onStateChanged(state); snackbar.showSnackbar("记忆已更新") }
+                            .onFailure { snackbar.showSnackbar(it.message ?: "更新记忆失败") }
+                        busy = false
+                    }
+                }, colors = ButtonDefaults.buttonColors(containerColor = Green)) { Text("保存") }
+            },
+            dismissButton = { TextButton(enabled = !busy, onClick = { editing = null }) { Text("取消", color = Muted) } }
+        )
     }
 }
 
@@ -959,15 +1900,18 @@ private fun SettingsScreen(
     snackbar: SnackbarHostState,
     sleepTime: LocalTime,
     wakeTime: LocalTime,
+    bufferMinutes: Int,
     usageSnapshot: UsageMonitorSnapshot,
     onSleepTime: (LocalTime) -> Unit,
     onWakeTime: (LocalTime) -> Unit,
+    onBufferMinutes: (Int) -> Unit,
     aiProviders: List<AiProviderOption>,
     selectedProviderId: String,
     selectedModel: String,
     onAiSelection: (String, String) -> Unit,
     onUsageSnapshotChanged: () -> Unit,
-    onRemoteState: (RemoteState) -> Unit
+    onRemoteState: (RemoteState) -> Unit,
+    onThreadsRefresh: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
     var usageAccess by remember { mutableStateOf(activity.hasUsageAccess()) }
@@ -991,8 +1935,9 @@ private fun SettingsScreen(
         item { TimeSettingRow(Icons.Default.CalendarToday, "明天起床时间", formatClock(wakeTime), "明早计划从这个时间开始", onClick = {
             TimePickerDialog(activity, { _, hour, minute -> onWakeTime(LocalTime.of(hour, minute)) }, wakeTime.hour, wakeTime.minute, true).show()
         }) }
+        item { BufferSettingRow(bufferMinutes, onBufferMinutes) }
         item { SettingRow(Icons.Default.NotificationsNone, "任务提醒", "安卓通知通道已准备", true) }
-        item { CloudSyncCard(activity, snackbar, onRemoteState) }
+        item { CloudSyncCard(activity, snackbar, onRemoteState, onThreadsRefresh) }
         item {
             AiProviderSettingsCard(
                 providers = aiProviders,
@@ -1030,7 +1975,12 @@ private fun SettingsScreen(
 }
 
 @Composable
-private fun CloudSyncCard(activity: MainActivity, snackbar: SnackbarHostState, onRemoteState: (RemoteState) -> Unit) {
+private fun CloudSyncCard(
+    activity: MainActivity,
+    snackbar: SnackbarHostState,
+    onRemoteState: (RemoteState) -> Unit,
+    onThreadsRefresh: () -> Unit
+) {
     val scope = rememberCoroutineScope()
     var email by remember { mutableStateOf(AssistantSessionStore.email(activity)) }
     var password by remember { mutableStateOf("") }
@@ -1051,15 +2001,15 @@ private fun CloudSyncCard(activity: MainActivity, snackbar: SnackbarHostState, o
                     busy = true
                     scope.launch {
                         runCatching { supabasePasswordLogin(activity, email, password); gatewayFetchState(activity) }
-                            .onSuccess { state -> onRemoteState(state); status = "已登录 ${AssistantSessionStore.email(activity)}，正在使用云端数据"; snackbar.showSnackbar("云端同步已连接") }
+                            .onSuccess { state -> onRemoteState(state); onThreadsRefresh(); status = "已登录 ${AssistantSessionStore.email(activity)}，正在使用云端数据"; snackbar.showSnackbar("云端同步已连接") }
                             .onFailure { error -> status = error.message ?: "登录失败"; snackbar.showSnackbar(status) }
                         busy = false
                     }
                 }, colors = ButtonDefaults.buttonColors(containerColor = Green), modifier = Modifier.fillMaxWidth()) { Text(if (busy) "正在连接…" else "登录并同步") }
             } else {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(onClick = { scope.launch { runCatching { gatewayFetchState(activity) }.onSuccess { onRemoteState(it); snackbar.showSnackbar("已刷新云端数据") }.onFailure { snackbar.showSnackbar(it.message ?: "刷新失败") } } }) { Text("刷新云端", color = Green) }
-                    TextButton(onClick = { scope.launch { runCatching { gatewayInitializeCloud(activity) }.onSuccess { onRemoteState(it); snackbar.showSnackbar("已将服务器本机状态初始化到云端") }.onFailure { snackbar.showSnackbar(it.message ?: "云端已有数据或初始化失败") } } }) { Text("首次初始化", color = Green) }
+                    TextButton(onClick = { scope.launch { runCatching { gatewayFetchState(activity) }.onSuccess { onRemoteState(it); onThreadsRefresh(); snackbar.showSnackbar("已刷新云端数据") }.onFailure { snackbar.showSnackbar(it.message ?: "刷新失败") } } }) { Text("刷新云端", color = Green) }
+                    TextButton(onClick = { scope.launch { runCatching { gatewayInitializeCloud(activity) }.onSuccess { onRemoteState(it); onThreadsRefresh(); snackbar.showSnackbar("已将服务器本机状态初始化到云端") }.onFailure { snackbar.showSnackbar(it.message ?: "云端已有数据或初始化失败") } } }) { Text("首次初始化", color = Green) }
                     TextButton(onClick = { AssistantSessionStore.clear(activity); status = "已退出登录，本机不会继续读取云端数据" }) { Text("退出", color = Color(0xFF9C4B3B)) }
                 }
             }
@@ -1302,6 +2252,34 @@ private fun TimeSettingRow(
             Text(detail, color = Muted, fontSize = 10.sp)
         }
         Text(time, color = Green, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun BufferSettingRow(value: Int, onSave: (Int) -> Unit) {
+    var text by remember(value) { mutableStateOf(value.coerceIn(0, 1440).toString()) }
+    Column(Modifier.fillMaxWidth().padding(vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+        Text("每日缓冲时间", color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+        Text("给临时事件、任务超时和任务切换预留的时间；睡觉和外出时间单独计算。", color = Muted, fontSize = 10.sp, lineHeight = 14.sp)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it.filter(Char::isDigit).take(4) },
+                label = { Text("分钟") },
+                singleLine = true,
+                modifier = Modifier.weight(1f)
+            )
+            Button(
+                onClick = { onSave((text.toIntOrNull() ?: value).coerceIn(0, 1440)) },
+                colors = ButtonDefaults.buttonColors(containerColor = Green),
+                shape = RoundedCornerShape(7.dp)
+            ) { Text("保存") }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf(0, 30, 60, 90).forEach { preset ->
+                TextButton(onClick = { text = preset.toString() }) { Text("${preset}分", color = Green, fontSize = 10.sp) }
+            }
+        }
     }
 }
 

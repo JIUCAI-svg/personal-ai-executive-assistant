@@ -70,7 +70,9 @@ export function normalizeAiProviderDraft(draft = {}, existing = null) {
   const name = text(draft.name || existing?.name, 120);
   const baseUrl = text(draft.base_url || existing?.base_url, 500).replace(/\/$/, '');
   const apiKey = text(draft.api_key || existing?.api_key, 1000);
-  const requestedId = safeId(draft.id || existing?.id || name);
+  // Existing provider IDs are stable references used by clients and the
+  // active-profile setting. Preserve legacy IDs, including non-ASCII ones.
+  const requestedId = existing ? text(existing.id, 120) : safeId(draft.id || name);
   const id = requestedId || `provider-${Date.now().toString(36)}`;
   const profile = normalizeProfile(id, {
     name: name || id,
@@ -174,7 +176,9 @@ export function selectAiProvider(registry, providerId, model, fallbackModel = ''
   const requestedId = text(providerId, 120);
   const profile = registry.profiles[requestedId] || registry.profiles[registry.active] || Object.values(registry.profiles)[0];
   if (!profile) return null;
-  const requestedModel = text(model, 160) || profile.selected_model || fallbackModel || profile.models[0] || '';
+  // A provider's own selection is authoritative. The legacy environment
+  // fallback is only for a provider without any configured model.
+  const requestedModel = text(model, 160) || profile.selected_model || profile.models[0] || fallbackModel || '';
   if (!requestedModel) return null;
   if (profile.models.length && !profile.models.includes(requestedModel)) {
     const error = new Error(`模型不在提供商“${profile.name}”的可用列表中。`);

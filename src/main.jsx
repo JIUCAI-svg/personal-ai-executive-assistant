@@ -91,6 +91,9 @@ function App() {
   const [memoryDraft, setMemoryDraft] = useState('');
   const [showConversationOptions, setShowConversationOptions] = useState(false);
   const [showNewConversation, setShowNewConversation] = useState(false);
+  const [showNewTask, setShowNewTask] = useState(false);
+  const [newTask, setNewTask] = useState({ title: '', estimated_minutes: '45', priority: '3', project_id: '', notes: '' });
+  const [taskBusy, setTaskBusy] = useState(false);
   const [showSidebar, setShowSidebar] = useState(false);
   const [memoryScope, setMemoryScope] = useState(true);
   const [saveTranscript, setSaveTranscript] = useState(true);
@@ -540,6 +543,42 @@ function App() {
     }
   }
 
+  async function createTaskManually(event) {
+    event.preventDefault();
+    const title = newTask.title.trim();
+    if (!title || taskBusy) return;
+    setTaskBusy(true);
+    try {
+      const selectedProject = projects.find((item) => item.id === newTask.project_id);
+      const response = await apiFetch('/api/assistant/actions', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          thread_id: threadId,
+          conversation_mode: conversationMode,
+          project_id: newTask.project_id || projectId,
+          conversation_options: { memory_scope: memoryScope, save_full_conversation: saveTranscript, allow_memory_distillation: distillMemory },
+          actions: [{
+            type: 'create_task', title,
+            estimated_minutes: Number(newTask.estimated_minutes) || 45,
+            priority: Number(newTask.priority) || 3,
+            project: selectedProject?.name || undefined,
+            reason: newTask.notes.trim()
+          }]
+        })
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '新建任务失败');
+      applyAssistantData(payload);
+      setNewTask({ title: '', estimated_minutes: '45', priority: '3', project_id: '', notes: '' });
+      setShowNewTask(false);
+      loadThreads();
+    } catch (error) {
+      setNotice(error.message || '新建任务失败');
+    } finally {
+      setTaskBusy(false);
+    }
+  }
+
   async function handleUserMessage(text) {
     setAiBusy(true);
     try {
@@ -814,7 +853,7 @@ function App() {
           <div className="chat-column">
             <section className="day-intro">
               <div className="date-kicker"><span className="pulse-dot" /> {dateKicker()}</div>
-              <h1>今天，先把最重要的事做下去。</h1>
+              <div className="day-heading-row"><h1>今天，先把最重要的事做下去。</h1><button className="new-task-button" type="button" onClick={() => setShowNewTask(true)}><Plus size={16} /> 新建任务</button></div>
               <p>现在 <strong>{planner?.now?.slice(-5) || now}</strong> · 可自主调整 <strong>{planner ? formatMinutes(planner.free_minutes) : '加载中'}</strong> · 已安排 <strong>{planner ? formatMinutes(planner.scheduled_minutes) : formatMinutes(scheduleMinutes)}</strong></p>
             </section>
 
@@ -844,7 +883,7 @@ function App() {
 
           <aside className="insight-rail" aria-label="计划与上下文">
             <section className="rail-section plan-section">
-              <div className="rail-heading"><div><span>今日动态计划</span><small>现在 {planner?.now?.slice(-5) || now}</small></div><button className="icon-button" aria-label="更多计划操作"><MoreHorizontal size={18} /></button></div>
+              <div className="rail-heading"><div><span>今日动态计划</span><small>现在 {planner?.now?.slice(-5) || now}</small></div><button className="text-button plan-add-button" onClick={() => setShowNewTask(true)}><Plus size={13} /> 新建</button></div>
               <div className="time-budget"><div><span>已安排</span><strong>{formatMinutes(planner?.scheduled_minutes ?? scheduleMinutes)}</strong></div><div><span>保留缓冲</span><strong>{planner ? formatMinutes(planner.buffer_minutes) : '加载中'}</strong></div><div><span>自主可用</span><strong>{planner ? formatMinutes(planner.free_minutes) : '加载中'}</strong></div></div>
               <div className="schedule-list">
                 {plan.filter((item) => item.state !== 'deferred').map((item) => (
@@ -879,6 +918,7 @@ function App() {
       </main>
 
       {showNewConversation && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="新建对话"><button className="modal-backdrop" onClick={() => setShowNewConversation(false)} aria-label="关闭新建对话" /><section className="new-conversation-modal"><div className="modal-header"><div><span>新建对话</span><p>选择 AI 本次可以了解什么。</p></div><button className="icon-button" onClick={() => setShowNewConversation(false)} aria-label="关闭"><X size={20} /></button></div><div className="new-mode-list">{modes.map((item) => { const Icon = item.icon; return <button key={item.id} onClick={() => selectMode(item.id)}><span className={`new-mode-icon ${item.id}`}><Icon size={20} /></span><span><strong>{item.label}</strong><small>{item.description}</small></span><ChevronRight size={18} /></button>; })}</div></section></div>}
+      {showNewTask && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="新建任务"><button className="modal-backdrop" onClick={() => setShowNewTask(false)} aria-label="关闭新建任务" /><section className="task-modal"><div className="modal-header"><div><span>新建任务</span><p>设置完成它所需的时间和优先级。</p></div><button className="icon-button" type="button" onClick={() => setShowNewTask(false)} aria-label="关闭"><X size={20} /></button></div><form className="task-form" onSubmit={createTaskManually}><label>任务内容<input autoFocus value={newTask.title} onChange={(event) => setNewTask((current) => ({ ...current, title: event.target.value }))} placeholder="例如：复习高等数学错题" maxLength={120} required /></label><div className="task-form-grid"><label>预计时长（分钟）<input type="number" min="5" max="720" step="5" value={newTask.estimated_minutes} onChange={(event) => setNewTask((current) => ({ ...current, estimated_minutes: event.target.value }))} /></label><label>所属项目<select value={newTask.project_id} onChange={(event) => setNewTask((current) => ({ ...current, project_id: event.target.value }))}><option value="">不指定项目</option>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label></div><fieldset className="priority-field"><legend>优先级</legend><div className="priority-options">{[{ value: '5', label: '高', tone: 'high', detail: '优先安排' }, { value: '3', label: '中', tone: 'medium', detail: '正常推进' }, { value: '1', label: '低', tone: 'low', detail: '有空再做' }].map((item) => <label className={`priority-option ${item.tone}`} key={item.value}><input type="radio" name="task-priority" value={item.value} checked={newTask.priority === item.value} onChange={(event) => setNewTask((current) => ({ ...current, priority: event.target.value }))} /><span className="priority-swatch" /><span><strong>{item.label}</strong><small>{item.detail}</small></span></label>)}</div></fieldset><label>备注（可选）<textarea rows="3" value={newTask.notes} onChange={(event) => setNewTask((current) => ({ ...current, notes: event.target.value }))} placeholder="补充范围、完成标准或提醒" maxLength={500} /></label><div className="task-form-actions"><button className="text-command" type="button" onClick={() => setShowNewTask(false)}>取消</button><button className="primary-command" type="submit" disabled={taskBusy || !newTask.title.trim()}>{taskBusy ? '正在创建…' : '创建任务'}</button></div></form></section></div>}
       {showHistory && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="所有对话"><button className="modal-backdrop" onClick={() => setShowHistory(false)} aria-label="关闭对话历史" /><section className="history-modal"><div className="modal-header"><div><span>所有对话</span><p>恢复任一已保存的对话，继续使用原来的上下文。</p></div><button className="icon-button" onClick={() => setShowHistory(false)} aria-label="关闭"><X size={20} /></button></div><div className="history-list">{threads.length ? threads.map((thread) => <button key={thread.id} onClick={() => openThread(thread.id)}><MessageCircle size={17} /><span><strong>{modes.find((item) => item.id === thread.mode)?.label || '对话'}{thread.project_name ? ` · ${thread.project_name}` : ''}</strong><small>{thread.preview || '尚未发送消息'} · {messageTime(thread.updated_at)}</small></span><em>{thread.message_count}</em><ChevronRight size={17} /></button>) : <p className="empty-state">还没有已保存的对话。</p>}</div></section></div>}
       {showVault && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="本地知识库"><button className="modal-backdrop" onClick={() => { setShowVault(false); setSelectedDocument(null); }} aria-label="关闭知识库" /><section className="vault-modal"><div className="modal-header"><div><span>本地知识库</span><p>{vault.connected ? `${vault.documentCount} 篇 Markdown · ${vault.folders.length} 个目录 · 文件改动会自动刷新` : '尚未连接本地桥接服务'}</p></div><button className="icon-button" onClick={() => { setShowVault(false); setSelectedDocument(null); }} aria-label="关闭"><X size={20} /></button></div>{vaultError && <p className="vault-modal-error">{vaultError}</p>}{selectedDocument ? <div className="document-reader"><button className="back-button" onClick={() => setSelectedDocument(null)}>‹ 返回资料列表</button><small>{selectedDocument.relativePath}</small><h2>{selectedDocument.title}</h2><pre>{selectedDocument.content}</pre></div> : <><div className="vault-modal-toolbar"><span className={`connection-status ${vault.connected ? 'online' : ''}`}><span /> {vault.connected ? '已连接到 Obsidian 文件夹' : '等待桥接服务'}</span><button className="icon-button" onClick={() => loadVault(true)} aria-label="刷新知识库"><RefreshCw size={17} /></button></div><div className="vault-document-list">{vaultDocuments.map((document) => <button key={document.id} onClick={() => openDocument(document.id)}><FileText size={18} /><span><strong>{document.title}</strong><small>{document.folder} · {document.preview || '没有正文摘要'}</small></span><ChevronRight size={17} /></button>)}{vault.connected && vaultDocuments.length === 0 && <p className="empty-state">知识库里还没有 Markdown 资料。</p>}</div></>}</section></div>}
       {showAiSettings && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="AI 与记忆设置"><button className="modal-backdrop" onClick={() => setShowAiSettings(false)} aria-label="关闭 AI 设置" /><section className="account-modal ai-settings-modal"><div className="modal-header"><div><span>AI 与自增长记忆库</span><p>日常对话和每日整理各自选择模型；原始对话始终保留，整理结果可追溯、可确认。</p></div><button className="icon-button" onClick={() => setShowAiSettings(false)} aria-label="关闭"><X size={20} /></button></div>

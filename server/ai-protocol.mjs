@@ -32,10 +32,15 @@ export function buildAssistantModelRequest(provider, request = {}) {
     model,
     input: messages
       .filter((message) => text(message?.content))
-      .map((message) => ({
-        role: normalizeRole(message.role),
-        content: [{ type: 'input_text', text: text(message.content) }]
-      })),
+      .map((message) => {
+        const role = normalizeRole(message.role);
+        // Responses distinguishes input content from prior assistant output.
+        // Relays that enforce the schema reject assistant history as input_text.
+        return {
+          role,
+          content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: text(message.content) }]
+        };
+      }),
     text: { format: { type: 'json_object' } },
     ...(request.reasoning_effort ? { reasoning: { effort: request.reasoning_effort } } : {})
   };

@@ -63,6 +63,14 @@ let revision = Date.now();
 
 app.use(express.json({ limit: '200kb' }));
 
+// All assistant state endpoints are private when exposed through the public
+// reverse proxy. Same-origin web requests, local development, and Android's
+// x-forward-token remain supported; arbitrary Internet clients do not.
+app.use('/api/assistant', (request, response, next) => {
+  if (!requireGatewayAccess(request, response)) return;
+  next();
+});
+
 function supabaseIsConfigured() {
   return Boolean(supabaseUrl && supabaseAnonKey);
 }
@@ -114,6 +122,12 @@ function documentId(relativePath) {
 
 function dateStamp() {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai' }).format(new Date());
+}
+
+function dateOffset(date, offset) {
+  const [year, month, day] = String(date || '').split('-').map(Number);
+  if (![year, month, day].every(Number.isInteger)) return dateStamp();
+  return new Date(Date.UTC(year, month - 1, day + offset)).toISOString().slice(0, 10);
 }
 
 function cleanFilePart(value, fallback = 'untitled') {
@@ -279,29 +293,40 @@ function isLoopbackRequest(request) {
   return address === '::1' || address === 'localhost' || address.startsWith('127.');
 }
 
+function isLocalDirectRequest(request) {
+  const host = String(request.get('host') || '').split(':')[0].toLowerCase();
+  return isLoopbackRequest(request) && ['127.0.0.1', 'localhost', '::1'].includes(host);
+}
+
+function browserSameOriginRequest(request) {
+  const origin = request.get('origin');
+  const sameOrigin = origin && (() => {
+    try { return new URL(origin).host === request.get('host'); } catch { return false; }
+  })();
+  return Boolean(sameOrigin || request.get('sec-fetch-site') === 'same-origin');
+}
+
+function hasGatewayAccess(request) {
+  if (!aiGatewayToken) return isLocalDirectRequest(request) || browserSameOriginRequest(request);
+  return isLocalDirectRequest(request) || browserSameOriginRequest(request) || request.get('x-forward-token') === aiGatewayToken;
+}
+
+function requireGatewayAccess(request, response, message = 'AI 网关访问令牌不匹配。') {
+  if (hasGatewayAccess(request)) return true;
+  response.status(401).json({ error: message });
+  return false;
+}
+
 function assistantAuthorized(request, response) {
   if (!Object.keys(aiProviderRegistry.profiles).length) {
     response.status(503).json({ error: 'AI 网关尚未配置。' });
     return false;
   }
-  const origin = request.get('origin');
-  const sameOrigin = origin && (() => {
-    try { return new URL(origin).host === request.get('host'); } catch { return false; }
-  })();
-  const browserSameOrigin = sameOrigin || request.get('sec-fetch-site') === 'same-origin';
-  if (aiGatewayToken && !isLoopbackRequest(request) && !browserSameOrigin && request.get('x-forward-token') !== aiGatewayToken) {
-    response.status(401).json({ error: 'AI 网关访问令牌不匹配。' });
-    return false;
-  }
-  return true;
+  return requireGatewayAccess(request, response);
 }
 
 function bridgeAuthorized(request, response) {
-  if (aiGatewayToken && !isLoopbackRequest(request) && request.get('x-forward-token') !== aiGatewayToken) {
-    response.status(401).json({ error: '桥接访问令牌不匹配。' });
-    return false;
-  }
-  return true;
+  return requireGatewayAccess(request, response, '桥接访问令牌不匹配。');
 }
 
 function stringValue(value, maxLength = 240) {
@@ -429,6 +454,52 @@ function explicitTimeActions(message, context = {}) {
   return actions.filter((action, index) => actions.findIndex((item) => item.type === action.type) === index);
 }
 
+function alarmDateFromText(text, hour, context = {}) {
+  const baseDate = String(context?.now || '').slice(0, 10) || dateStamp();
+  if (/后天/.test(text)) return dateOffset(baseDate, 2);
+  if (/明天|明早|明晨/.test(text)) return dateOffset(baseDate, 1);
+  if (/今天|今早|今晚/.test(text)) return dateOffset(baseDate, /今晚/.test(text) && hour < 6 ? 1 : 0);
+  return '';
+}
+
+function alarmLabelFromText(text) {
+  if (/起床|叫醒|醒来|起身/.test(text)) return '起床提醒';
+  if (/睡觉|睡下|上床|入睡/.test(text)) return '睡觉提醒';
+  return '向前提醒';
+}
+
+function explicitAlarmActions(message, context = {}) {
+  const text = String(message || '');
+  const alarmIntent = /(闹钟|闹铃|叫我|叫醒|提醒我|提醒一下|提醒我在)/.test(text);
+  if (!alarmIntent) return [];
+  const cancelIntent = /(取消|删除|删掉|移除)/.test(text);
+  const expression = /(?:(凌晨|早上|上午|中午|下午|傍晚|晚上|今晚|明天|明早|明晨|后天|今天)\s*)?(\d{1,2}|[零一二三四五六七八九十两]{1,3})\s*(?::\s*(\d{1,2})|点\s*(?:(\d{1,2})\s*分?|半)?)/g;
+  const matches = [...text.matchAll(expression)];
+  const match = matches[0];
+  let hour = match ? chineseNumber(match[2]) : null;
+  let minute = match ? (match[3] !== undefined ? Number(match[3]) : match[4] !== undefined ? Number(match[4]) : match[0].includes('半') ? 30 : 0) : 0;
+  if (match && ['下午', '傍晚', '晚上', '今晚'].includes(match[1]) && hour > 0 && hour < 12) hour += 12;
+  if (!Number.isInteger(hour) || hour > 23 || !Number.isInteger(minute) || minute > 59) hour = null;
+  const label = alarmLabelFromText(text);
+  if (cancelIntent) {
+    return [{
+      type: 'cancel_alarm',
+      ...(match && hour !== null ? { time: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}` } : {}),
+      ...(label !== '向前提醒' ? { label } : {}),
+      reason: '用户明确要求取消手机闹钟。'
+    }];
+  }
+  if (hour === null) return [];
+  return [{
+    type: 'set_alarm',
+    time: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`,
+    date: alarmDateFromText(text, hour, context),
+    label,
+    repeat: /每天|每日/.test(text) ? 'daily' : 'none',
+    reason: '用户明确要求在手机上设置提醒。'
+  }];
+}
+
 function explicitUnavailableActions(message) {
   const text = String(message || '');
   if (!/(出门|外出|不可用|不在|有事|占用)/.test(text)) return [];
@@ -490,8 +561,17 @@ function normalizeActions(actions) {
       ...(stringValue(action.end, 5) ? { end: stringValue(action.end, 5) } : {}),
       ...(stringValue(action.task, 120) ? { task: stringValue(action.task, 120) } : {}),
       ...(stringValue(action.title, 120) ? { title: stringValue(action.title, 120) } : {}),
+      ...(stringValue(action.task_id, 80) ? { task_id: stringValue(action.task_id, 80) } : {}),
+      ...(stringValue(action.mode, 20) ? { mode: stringValue(action.mode, 20) } : {}),
+      ...(Array.isArray(action.task_ids) ? { task_ids: action.task_ids.map((id) => stringValue(id, 80)).filter(Boolean).slice(0, 200) } : {}),
+      ...(stringValue(action.notes, 500) ? { notes: stringValue(action.notes, 500) } : {}),
+      ...(stringValue(action.label, 120) ? { label: stringValue(action.label, 120) } : {}),
+      ...(stringValue(action.alarm_id, 80) ? { alarm_id: stringValue(action.alarm_id, 80) } : {}),
+      ...(stringValue(action.repeat, 20) ? { repeat: stringValue(action.repeat, 20) } : {}),
       ...(Number.isFinite(Number(action.estimated_minutes)) ? { estimated_minutes: Math.max(5, Math.min(480, Number(action.estimated_minutes))) } : {}),
       ...(Number.isFinite(Number(action.priority)) ? { priority: Math.max(1, Math.min(5, Number(action.priority))) } : {}),
+      ...(Number.isFinite(Number(action.target_minutes)) ? { target_minutes: Math.max(1, Math.min(720, Number(action.target_minutes))) } : {}),
+      ...(Number.isFinite(Number(action.minutes)) ? { minutes: Math.max(0, Math.min(1440, Number(action.minutes))) } : {}),
       ...(stringValue(action.project, 80) ? { project: stringValue(action.project, 80) } : {}),
       ...(stringValue(action.due_at, 40) ? { due_at: stringValue(action.due_at, 40) } : {}),
       ...(stringValue(action.date, 10) ? { date: stringValue(action.date, 10) } : {}),
@@ -541,6 +621,10 @@ function enforceUserIntent(result, message, context) {
   }
   for (const action of explicitTimeActions(message, context)) {
     result.actions = result.actions.filter((item) => item.type !== action.type);
+    result.actions.push(action);
+  }
+  for (const action of explicitAlarmActions(message, context)) {
+    result.actions = result.actions.filter((item) => !['set_alarm', 'cancel_alarm'].includes(item.type));
     result.actions.push(action);
   }
   for (const action of explicitUnavailableActions(message)) {
@@ -611,11 +695,21 @@ function assistantSystemPrompt() {
   "actions": [
     {"type":"set_sleep_time","time":"HH:mm","reason":"..."},
     {"type":"set_wake_time","time":"HH:mm","reason":"..."},
+    {"type":"set_buffer_minutes","minutes":60,"reason":"..."},
+    {"type":"set_alarm","time":"HH:mm","date":"可选 YYYY-MM-DD","label":"起床提醒","repeat":"none 或 daily","reason":"..."},
+    {"type":"cancel_alarm","alarm_id":"可选闹钟 ID","time":"可选 HH:mm","label":"可选标签","reason":"..."},
     {"type":"complete_current_task","reason":"..."},
     {"type":"cancel_task","task":"任务名","reason":"..."},
     {"type":"cancel_all_tasks","reason":"..."},
     {"type":"defer_task","task":"任务名","reason":"..."},
     {"type":"create_task","title":"任务名","estimated_minutes":45,"priority":3,"project":"项目名","due_at":"可选 ISO 时间","reason":"..."},
+    {"type":"start_task_timer","task":"任务名","mode":"stopwatch 或 countdown","target_minutes":45},
+    {"type":"pause_task_timer","task":"任务名"},
+    {"type":"stop_task_timer","task":"任务名"},
+    {"type":"complete_task","task":"任务名"},
+    {"type":"reopen_task","task":"任务名"},
+    {"type":"update_task","task":"任务名","title":"新标题","estimated_minutes":45,"priority":3},
+    {"type":"reorder_tasks","task_ids":["任务 ID"]},
     {"type":"set_unavailable_period","start":"HH:mm","end":"HH:mm","reason":"..."},
     {"type":"capture_memory","title":"要沉淀的信息","project":"可选项目","reason":"..."},
     {"type":"replan_today","reason":"..."}
@@ -634,6 +728,7 @@ ${assistantToolPrompt()}
 - 用户说“取消所有任务、全部清空计划”时，使用 cancel_all_tasks，清空今天和已顺延的安排。
 - 用户说“今天不做、跳过、顺延、明天再做”时，使用 defer_task，该任务保留但移到之后；取消和顺延不能混用。
 - 用户说外出或某段时间不可用时，使用 set_unavailable_period；用户说疲惫时，使用 defer_task 推迟高消耗任务，并使用 replan_today。
+- 用户说“叫我起床”“提醒我”“设置闹钟”时，使用 set_alarm；时间必须明确，日期不明确时设置为下一次即将到来的时间。用户说“取消闹钟”时使用 cancel_alarm。手机执行结果会单独返回，只有收到设备结果后才能说已经设置成功。
 - 用户新增一件事时，使用 create_task；不要直接声称它已经加入计划而没有 action。若未给预计时长，按合理的最小可执行时长估计，并在回复中说明。
 - 上下文中的 app_usage 是手机本地监控提供的真实使用摘要和每日记录，不是可选工具。若 current 或 daily_history 存在，必须把它们视为当前事实；可以根据今日累计时长、连续时长、历史趋势和上限解释提醒或重排计划，但不要推断用户在应用中看了什么，也不要把每一次使用记录自动沉淀为长期记忆。
 - sleep_wake_from_phone 是根据前一日最后一次、当日第一次前台应用活动计算出的“候选作息”，仅用于提醒、复盘和在用户追问时说明；它不是确认后的作息，绝对不要自动调用 set_sleep_time 或 set_wake_time 覆盖用户设置。要明确说明候选、证据边界和置信度。
@@ -713,22 +808,18 @@ app.get('/api/assistant/providers', (request, response) => {
 });
 
 function providerDraftFromRequest(body = {}) {
-  const models = Array.isArray(body.models)
-    ? body.models
-    : String(body.models || '').split(/[\n,，]/g);
-  const reasoningEfforts = Array.isArray(body.reasoning_efforts)
-    ? body.reasoning_efforts
-    : String(body.reasoning_efforts || '').split(/[\n,，]/g);
-  return {
-    id: stringValue(body.id, 120),
-    name: stringValue(body.name, 120),
-    base_url: stringValue(body.base_url, 500),
-    api_key: String(body.api_key || '').trim().slice(0, 1000),
-    api_mode: stringValue(body.api_mode, 40),
-    models,
-    selected_model: stringValue(body.selected_model, 160),
-    reasoning_efforts: reasoningEfforts
-  };
+  const has = (key) => Object.prototype.hasOwnProperty.call(body, key);
+  const list = (value) => Array.isArray(value) ? value : String(value || '').split(/[\n,，]/g);
+  const draft = {};
+  if (has('id')) draft.id = stringValue(body.id, 120);
+  if (has('name')) draft.name = stringValue(body.name, 120);
+  if (has('base_url')) draft.base_url = stringValue(body.base_url, 500);
+  if (has('api_key')) draft.api_key = String(body.api_key || '').trim().slice(0, 1000);
+  if (has('api_mode')) draft.api_mode = stringValue(body.api_mode, 40);
+  if (has('models')) draft.models = list(body.models);
+  if (has('selected_model')) draft.selected_model = stringValue(body.selected_model, 160);
+  if (has('reasoning_efforts')) draft.reasoning_efforts = list(body.reasoning_efforts);
+  return draft;
 }
 
 async function persistProviderRegistry(registry) {
@@ -941,6 +1032,39 @@ app.get('/api/assistant/state', async (request, response, next) => {
   } catch (error) { next(error); }
 });
 
+app.get('/api/assistant/tasks', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    response.json({ ok: true, source, tasks: await store.listTasks({ includeCompleted: request.query.include_completed !== 'false' }), state: await store.bootstrap() });
+  } catch (error) { next(error); }
+});
+
+app.patch('/api/assistant/tasks/:id', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    const task = await store.updateTask(String(request.params.id), request.body || {});
+    if (!task) return response.status(404).json({ error: '未找到任务。' });
+    response.json({ ok: true, source, task, state: await store.bootstrap() });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/assistant/tasks/reorder', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    response.json({ ok: true, source, tasks: await store.reorderTasks(request.body?.task_ids), state: await store.bootstrap() });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/assistant/tasks/:id/timer', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    const operation = String(request.body?.operation || 'start');
+    const result = await store.taskTimer(String(request.params.id), operation, request.body || {});
+    if (!result) return response.status(404).json({ error: '未找到任务。' });
+    response.json({ ok: true, source, ...result, state: await store.bootstrap() });
+  } catch (error) { next(error); }
+});
+
 app.patch('/api/assistant/preferences', async (request, response, next) => {
   try {
     const { store, source } = await requestStateStore(request);
@@ -1022,40 +1146,53 @@ app.get('/api/assistant/memory/export', async (request, response, next) => {
   } catch (error) { next(error); }
 });
 
-app.post('/api/assistant/memory/daily-run', async (request, response, next) => {
-  let store;
-  let run;
-  let source;
+async function runDailyMemoryOrganization({ store = stateStore, date = dateStamp(), providerId = '', model = '', reasoningEffort = '', trigger = 'manual' } = {}) {
+  const normalizedDate = /^\d{4}-\d{2}-\d{2}$/.test(String(date || '')) ? String(date) : dateStamp();
+  const state = await store.bootstrap();
+  const preferences = state.ai_preferences || {};
+  const provider = selectAiProvider(
+    aiProviderRegistry,
+    providerId || preferences.memory_provider_id || preferences.provider_id,
+    model || preferences.memory_model || preferences.model,
+    aiModel,
+    reasoningEffort || preferences.memory_reasoning_effort || preferences.reasoning_effort || aiReasoningEffort
+  );
+  if (!provider) throw requestError('尚未配置可用的记忆整理模型。', 503, 'MEMORY_PROVIDER_NOT_CONFIGURED');
+
+  const rawMessages = rawMessagesForDay(state, normalizedDate);
+  const completedRuns = (state.memory_organizer_runs || []).filter((item) => item.date === normalizedDate && item.status === 'completed');
+  const processedMessageIds = new Set(completedRuns.flatMap((item) => Array.isArray(item.source_message_ids) ? item.source_message_ids : []));
+  // Runs created before source IDs were persisted are treated as having
+  // processed the first N messages, where N was recorded in source_message_count.
+  const legacyProcessedCount = completedRuns
+    .filter((item) => !Array.isArray(item.source_message_ids))
+    .reduce((count, item) => Math.max(count, Number(item.source_message_count) || 0), 0);
+  const unprocessedMessages = rawMessages.filter((message, index) => (
+    !processedMessageIds.has(message.id) && index >= legacyProcessedCount
+  ));
+  if (!unprocessedMessages.length) {
+    const latestRun = completedRuns.slice().sort((left, right) => String(right.finished_at || '').localeCompare(String(left.finished_at || '')))[0] || null;
+    return { skipped: true, reason: latestRun ? 'already_completed' : 'no_messages', run: latestRun, created: [], duplicate_ids: [], summary: (state.daily_memory_summaries || []).find((item) => item.date === normalizedDate) || null, state };
+  }
+
+  const run = await store.startMemoryOrganizerRun({
+    date: normalizedDate,
+    provider_id: provider.id,
+    model: provider.model,
+    source_message_count: unprocessedMessages.length,
+    source_message_ids: unprocessedMessages.map((message) => message.id)
+  });
   try {
-    if (!assistantAuthorized(request, response)) return;
-    ({ store, source } = await requestStateStore(request));
-    const state = await store.bootstrap();
-    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(request.body?.date || '')) ? String(request.body.date) : dateStamp();
-    const preferences = state.ai_preferences || {};
-    const provider = selectAiProvider(
-      aiProviderRegistry,
-      request.body?.provider_id || preferences.memory_provider_id || preferences.provider_id,
-      request.body?.model || preferences.memory_model || preferences.model,
-      aiModel,
-      request.body?.reasoning_effort || preferences.memory_reasoning_effort || preferences.reasoning_effort || aiReasoningEffort
-    );
-    if (!provider) return response.status(503).json({ error: '尚未配置可用的记忆整理模型。', code: 'MEMORY_PROVIDER_NOT_CONFIGURED' });
-    const rawMessages = rawMessagesForDay(state, date);
-    run = await store.startMemoryOrganizerRun({ date, provider_id: provider.id, model: provider.model, source_message_count: rawMessages.length });
-    if (!rawMessages.length) {
-      const finished = await store.finishMemoryOrganizerRun(run.id, { date, provider_id: provider.id, model: provider.model, result: { candidates: [], projectUpdates: [], updateSuggestions: [], summary: '' } });
-      return response.json({ ok: true, source, empty: true, run: finished.run, created: [], summary: null, state: await store.bootstrap() });
-    }
     const activeMemories = (state.memory_items || []).filter((item) => item.status === 'active').slice(-80).map((item) => ({
       id: item.id, kind: item.kind, content: item.content, project_id: item.project_id, tags: item.tags || []
     }));
     const prompt = memoryOrganizerPrompt({
-      date,
-      messages: rawMessages,
+      date: normalizedDate,
+      messages: unprocessedMessages,
       projects: (state.projects || []).map((item) => ({ id: item.id, name: item.name, status: item.status })),
       existingMemories: activeMemories,
-      actionLogs: (state.action_logs || []).filter((item) => String(item.created_at || '').startsWith(date)).slice(-60),
-      usage: (state.app_usage_daily || []).filter((item) => item.date === date).slice(0, 20),
+      actionLogs: (state.action_logs || []).filter((item) => String(item.created_at || '').startsWith(normalizedDate)).slice(-60),
+      usage: (state.app_usage_daily || []).filter((item) => item.date === normalizedDate).slice(0, 20),
       sleepWake: state.sleep_wake_summary?.latest || null
     });
     const { content, attempts } = await requestModelText({
@@ -1070,15 +1207,29 @@ app.post('/api/assistant/memory/daily-run', async (request, response, next) => {
         { role: 'user', content: prompt }
       ]
     });
-    const parsed = parseDailyMemoryResult(content, { state, messages: rawMessages });
-    const finished = await store.finishMemoryOrganizerRun(run.id, { date, provider_id: provider.id, model: provider.model, result: parsed });
-    response.json({ ok: true, source, attempts, run: finished.run, created: finished.created, duplicate_ids: finished.duplicate_ids, summary: finished.summary, state: await store.bootstrap() });
+    const parsed = parseDailyMemoryResult(content, { state, messages: unprocessedMessages });
+    const finished = await store.finishMemoryOrganizerRun(run.id, { date: normalizedDate, provider_id: provider.id, model: provider.model, result: parsed });
+    return { trigger, attempts, ...finished, state: await store.bootstrap() };
   } catch (error) {
-    if (store && run) {
-      try { await store.finishMemoryOrganizerRun(run.id, { error: error?.message || '每日整理失败。' }); } catch { /* keep the original error */ }
-    }
-    next(error);
+    try { await store.finishMemoryOrganizerRun(run.id, { error: error?.message || '每日整理失败。' }); } catch { /* preserve original failure */ }
+    throw error;
   }
+}
+
+app.post('/api/assistant/memory/daily-run', async (request, response, next) => {
+  try {
+    if (!assistantAuthorized(request, response)) return;
+    const { store, source } = await requestStateStore(request);
+    const result = await runDailyMemoryOrganization({
+      store,
+      date: request.body?.date,
+      providerId: request.body?.provider_id,
+      model: request.body?.model,
+      reasoningEffort: request.body?.reasoning_effort,
+      trigger: 'manual'
+    });
+    response.json({ ok: true, source, ...result });
+  } catch (error) { next(error); }
 });
 
 app.get('/api/assistant/threads', async (request, response, next) => {
@@ -1127,7 +1278,11 @@ app.post('/api/assistant/actions', async (request, response, next) => {
       allow_memory_distillation: thread.allow_memory_distillation,
       persist_action_log: thread.mode !== 'temporary' || thread.save_full_conversation
     });
-    response.json({ ok: true, source, thread, ...execution, state: await store.bootstrap() });
+    response.json({
+      ok: true, source, thread, ...execution,
+      deviceActions: execution.results.filter((item) => item.device_required).map((item) => ({ type: item.type, ...(item.alarm || {}) })),
+      state: await store.bootstrap()
+    });
   } catch (error) { next(error); }
 });
 
@@ -1255,6 +1410,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       knowledge: hydratedThread.memory_scope ? knowledge : []
     });
     const intentContext = {
+      now: planBefore.now,
       today_plan: planBefore.scheduled,
       current_task: planBefore.current_task,
       projects: stateBefore.projects,
@@ -1272,9 +1428,9 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         const completed = execution.results.filter((item) => item.ok);
         const created = completed.find((item) => item.type === 'create_task');
         const cancelled = completed.find((item) => item.type === 'cancel_task');
-        const deferred = completed.find((item) => item.type === 'defer_task');
-        const sleep = completed.find((item) => item.type === 'set_sleep_time');
-        const wake = completed.find((item) => item.type === 'set_wake_time');
+      const deferred = completed.find((item) => item.type === 'defer_task');
+      const sleep = completed.find((item) => item.type === 'set_sleep_time');
+      const wake = completed.find((item) => item.type === 'set_wake_time');
         if (created) result.reply = `已把「${created.task.title}」加入真实任务库，预计 ${created.task.estimated_minutes} 分钟，并按今天的剩余时间重新安排。`;
         else if (cancelled) result.reply = `已取消「${cancelled.title}」，它已从今天的计划中移除。`;
         else if (deferred) result.reply = `已把「${deferred.title}」顺延，今天不再安排它。`;
@@ -1290,8 +1446,11 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         toolCalls: result.actions.map((action) => ({ name: action.type, arguments: { ...action } })),
         actionResults: execution.results,
         toolResults: execution.results,
-        memoryCandidates: result.memoryCandidates, pendingMemories, memoryRead: knowledge,
+          memoryCandidates: result.memoryCandidates, pendingMemories, memoryRead: knowledge,
         appUsage: appUsages,
+        deviceActions: execution.results
+          .filter((item) => item.device_required)
+          .map((item) => ({ type: item.type, ...(item.alarm || {}) })),
         plan: execution.plan, transcriptPath, messageIds: { user: userMessage?.id || null, assistant: assistantMessage?.id || null },
         state: await store.bootstrap()
       });
@@ -1393,13 +1552,52 @@ app.use((error, _request, response, _next) => {
 const androidApkPath = path.join(appRoot, 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
 app.get('/download/forward.apk', (_request, response) => {
   if (!existsSync(androidApkPath)) return response.status(404).json({ error: 'Android 安装包尚未生成。' });
-  response.download(androidApkPath, 'forward-0.2.0-debug.apk');
+  response.download(androidApkPath, 'forward-0.4.0-debug.apk');
 });
 
 const distPath = path.join(appRoot, 'dist');
 if (existsSync(distPath)) {
   app.use(express.static(distPath));
   app.use((_request, response) => response.sendFile(path.join(distPath, 'index.html')));
+}
+
+let automaticMemoryRunPromise = null;
+
+function currentShanghaiClock() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+  }).formatToParts(new Date());
+  const value = (type) => parts.find((part) => part.type === type)?.value || '00';
+  return `${value('hour')}:${value('minute')}`;
+}
+
+async function maybeRunAutomaticMemoryOrganization() {
+  if (automaticMemoryRunPromise) return automaticMemoryRunPromise;
+  automaticMemoryRunPromise = (async () => {
+    try {
+      const state = await stateStore.bootstrap();
+      const preferences = state.ai_preferences || {};
+      if (preferences.memory_auto_daily === false) return { skipped: true, reason: 'disabled' };
+      const configuredTime = /^\\d{2}:\\d{2}$/.test(String(preferences.memory_daily_time || ''))
+        ? String(preferences.memory_daily_time)
+        : '22:00';
+      if (currentShanghaiClock() < configuredTime) return { skipped: true, reason: 'before_scheduled_time' };
+      const today = dateStamp();
+      // A completed run only marks the messages it saw. Let the organizer
+      // check for newly arrived messages on later scheduler ticks.
+      const existingRun = (state.memory_organizer_runs || []).find((item) => item.date === today && item.status === 'running');
+      if (existingRun) return { skipped: true, reason: 'already_running' };
+      const result = await runDailyMemoryOrganization({ store: stateStore, date: today, trigger: 'server_schedule' });
+      console.log(`[memory] automatic daily organization ${result.empty ? 'completed with no messages' : 'completed'} for ${today}`);
+      return result;
+    } catch (error) {
+      console.error('[memory] automatic daily organization failed:', error?.message || error);
+      return { skipped: false, error: error?.message || '每日记忆整理失败。' };
+    } finally {
+      automaticMemoryRunPromise = null;
+    }
+  })();
+  return automaticMemoryRunPromise;
 }
 
 const watcher = chokidar.watch(vaultPath, {
@@ -1415,4 +1613,9 @@ watcher.on('all', (_event, changedPath) => {
 app.listen(port, '0.0.0.0', () => {
   console.log(`Knowledge bridge listening on http://0.0.0.0:${port}`);
   console.log(`Vault: ${vaultPath}`);
+  console.log('Daily memory organization: server scheduler enabled (Asia/Shanghai, default 22:00)');
+  void maybeRunAutomaticMemoryOrganization();
 });
+
+const memoryScheduler = setInterval(() => { void maybeRunAutomaticMemoryOrganization(); }, 30_000);
+if (typeof memoryScheduler.unref === 'function') memoryScheduler.unref();
