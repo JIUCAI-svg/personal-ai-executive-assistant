@@ -174,7 +174,9 @@ data class AssistantAction(
     val date: String? = null,
     val label: String? = null,
     val repeat: String? = null,
-    val alarmId: String? = null
+    val alarmId: String? = null,
+    val dueAt: String? = null,
+    val projectId: String? = null
 )
 data class DeviceActionResult(val action: AssistantAction, val result: AlarmOperationResult)
 data class AssistantResult(
@@ -710,6 +712,7 @@ private fun ForwardApp(activity: MainActivity) {
         var threadLoading by remember { mutableStateOf(false) }
         var now by remember { mutableStateOf(LocalDateTime.now()) }
         var messages by remember { mutableStateOf(emptyList<ChatMessage>()) }
+        var showProjects by remember { mutableStateOf(false) }
         LaunchedEffect(breakTimer?.running) {
             while (breakTimer?.running == true) {
                 delay(1000)
@@ -1084,7 +1087,7 @@ private fun ForwardApp(activity: MainActivity) {
             }
         ) { padding ->
             when (tab) {
-                0 -> TodayScreen(padding, now, sleepTime, currentDone, unavailablePeriod, breakTimer, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), remotePlan, ::completeTask, ::startCurrentTimer, ::pauseCurrentTimer, { breakTimer = breakTimer?.copy(running = !breakTimer!!.running) }, { breakTimer = null; currentDone = false }, ::reopenTask, ::editTask, ::removeTask, ::createTask, ::reorderTasks, ::sendMessage, input, { value -> input = value }, aiBusy)
+                0 -> TodayScreen(padding, now, sleepTime, currentDone, unavailablePeriod, breakTimer, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), remotePlan, remoteProjects, { showProjects = true }, ::completeTask, ::startCurrentTimer, ::pauseCurrentTimer, { breakTimer = breakTimer?.copy(running = !breakTimer!!.running) }, { breakTimer = null; currentDone = false }, ::reopenTask, ::editTask, ::removeTask, ::createTask, ::reorderTasks, ::sendMessage, input, { value -> input = value }, aiBusy)
                 1 -> ChatScreen(
                     padding = padding,
                     messages = messages,
@@ -1163,6 +1166,8 @@ private fun TodayScreen(
     breakTimer: BreakTimerState?,
     plan: List<PlanItem>,
     remotePlan: RemotePlan?,
+    remoteProjects: List<RemoteProject>,
+    onShowProjects: () -> Unit,
     completeTask: () -> Unit,
     startTimer: () -> Unit,
     pauseTimer: () -> Unit,
@@ -1239,6 +1244,17 @@ private fun TodayScreen(
             Row(verticalAlignment = Alignment.CenterVertically) { Box(Modifier.size(7.dp).clip(CircleShape).background(Coral)); Spacer(Modifier.width(7.dp)); Text(dateLabel(now.toLocalDate()), color = Muted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
             Spacer(Modifier.height(10.dp)); Text("今天，先把最重要的事做下去。", color = Green, fontSize = 26.sp, fontWeight = FontWeight.Bold, lineHeight = 34.sp)
             Spacer(Modifier.height(6.dp)); Text("现在 $clock · 今天排到 ${remotePlan?.sleepTime ?: formatClock(sleepTime)} · 还可用 ${formatDuration(availableMinutes)}", color = Muted, fontSize = 11.sp)
+            if (remoteProjects.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                val lead = remoteProjects.maxByOrNull { it.priority }
+                Card(onClick = onShowProjects, colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F0E9)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                    Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.FolderOpen, null, tint = Green, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(9.dp))
+                        Column(Modifier.weight(1f)) { Text("当前主线", color = Muted, fontSize = 10.sp); Text(lead?.name ?: "目标与项目", color = Green, fontSize = 14.sp, fontWeight = FontWeight.SemiBold); Text("点击查看全部目标、项目与截止日期", color = Muted, fontSize = 10.sp) }
+                        Icon(Icons.Default.ArrowForward, null, tint = Green, modifier = Modifier.size(18.dp))
+                    }
+                }
+            }
         } }
         item { CurrentTaskCard(currentItem, currentDone, breakTimer, remotePlan?.completed?.firstOrNull()?.title, remotePlan?.activeTimer, timerSeconds, completeTask, startTimer, pauseTimer, toggleBreak, skipBreak) }
         item { Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 15.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text("今日动态计划", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.Bold); Row(verticalAlignment = Alignment.CenterVertically) { Text("现在 $clock", color = Muted, fontSize = 10.sp); TextButton(onClick = { creatingTask = true; createTitle = ""; createMinutes = "45"; createPriority = "3" }, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)) { Icon(Icons.Default.Add, null, tint = Green, modifier = Modifier.size(16.dp)); Text("新建", color = Green, fontSize = 11.sp) } } } }

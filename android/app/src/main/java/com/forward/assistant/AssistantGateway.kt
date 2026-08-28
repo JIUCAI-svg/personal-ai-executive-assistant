@@ -17,6 +17,7 @@ data class RemotePlanItem(
     val end: String,
     val date: String,
     val status: String,
+    val dueAt: String? = null,
     val reason: String = "",
     val actualMinutes: Int = 0,
     val actualSeconds: Long = 0
@@ -42,7 +43,15 @@ data class RemotePlan(
 )
 
 data class RemoteMemory(val id: String, val content: String, val status: String)
-data class RemoteProject(val id: String, val name: String, val status: String)
+data class RemoteProject(
+    val id: String,
+    val name: String,
+    val status: String,
+    val kind: String = "project",
+    val dueAt: String? = null,
+    val priority: Int = 3,
+    val description: String = ""
+)
 data class RemoteState(
     val plan: RemotePlan?,
     val memories: List<RemoteMemory>,
@@ -91,11 +100,13 @@ private fun gatewayBaseUrl(): String = BuildConfig.AI_GATEWAY_URL.trim().removeS
 private fun remotePlanItem(item: JSONObject): RemotePlanItem = RemotePlanItem(
     id = item.optString("id"), title = item.optString("title"), project = item.optString("project"), notes = item.optString("notes"),
     priority = item.optInt("priority", 3), minutes = item.optInt("estimated_minutes", 45), start = item.optString("start"), end = item.optString("end"),
-    date = item.optString("date"), status = item.optString("status", "open"), reason = item.optString("reason"), actualMinutes = item.optInt("actual_minutes", 0), actualSeconds = item.optLong("actual_seconds", item.optInt("actual_minutes", 0) * 60L)
+    date = item.optString("date"), status = item.optString("status", "open"), dueAt = item.optString("due_at").ifBlank { null }, reason = item.optString("reason"), actualMinutes = item.optInt("actual_minutes", 0), actualSeconds = item.optLong("actual_seconds", item.optInt("actual_minutes", 0) * 60L)
 )
 
 private fun remoteProject(item: JSONObject): RemoteProject = RemoteProject(
-    id = item.optString("id"), name = item.optString("name"), status = item.optString("status", "active")
+    id = item.optString("id"), name = item.optString("name"), status = item.optString("status", "active"),
+    kind = item.optString("kind", "project"), dueAt = item.optString("due_at").ifBlank { null },
+    priority = item.optInt("priority", 3), description = item.optString("description")
 )
 
 fun parseRemotePlan(json: JSONObject?): RemotePlan? {
