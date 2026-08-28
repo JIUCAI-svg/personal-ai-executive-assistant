@@ -60,7 +60,7 @@ export const ASSISTANT_TOOLS = Object.freeze([
   { name: 'stop_task_timer', description: '停止任务计时并保存本次时间。', parameters: { task: '任务名称', task_id: '可选任务 ID' } },
   { name: 'complete_task', description: '完成指定任务，保留任务和计时历史。', parameters: { task: '任务名称', task_id: '可选任务 ID' } },
   { name: 'reopen_task', description: '重新打开已完成或已取消的任务。', parameters: { task: '任务名称', task_id: '可选任务 ID' } },
-  { name: 'update_task', description: '修改任务标题、备注、预计时长或优先级。', parameters: { task: '任务名称', task_id: '可选任务 ID', title: '新标题', notes: '新备注', estimated_minutes: '预计分钟数', priority: '1-5' } },
+  { name: 'update_task', description: '修改任务标题、备注、预计时长、优先级、所属项目或截止时间。', parameters: { task: '任务名称', task_id: '可选任务 ID', title: '新标题', notes: '新备注', estimated_minutes: '预计分钟数', priority: '1-5', project: '项目名称', due_at: '截止时间 ISO' } },
   { name: 'reorder_tasks', description: '按给定任务 ID 顺序调整待办排序。', parameters: { task_ids: '任务 ID 数组' } },
   {
     name: 'set_unavailable_period',

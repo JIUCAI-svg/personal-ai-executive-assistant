@@ -1039,6 +1039,24 @@ app.get('/api/assistant/tasks', async (request, response, next) => {
   } catch (error) { next(error); }
 });
 
+app.post('/api/assistant/projects', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    const project = await store.createProject(request.body || {});
+    if (!project) return response.status(400).json({ error: '需要填写目标或项目名称。' });
+    response.status(201).json({ ok: true, source, project, state: await store.bootstrap() });
+  } catch (error) { next(error); }
+});
+
+app.patch('/api/assistant/projects/:id', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    const project = await store.updateProject(String(request.params.id), request.body || {});
+    if (!project) return response.status(404).json({ error: '未找到目标或项目。' });
+    response.json({ ok: true, source, project, state: await store.bootstrap() });
+  } catch (error) { next(error); }
+});
+
 app.patch('/api/assistant/tasks/:id', async (request, response, next) => {
   try {
     const { store, source } = await requestStateStore(request);
