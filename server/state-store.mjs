@@ -174,6 +174,7 @@ export function repairAssistantState(source) {
     })),
     tasks: (Array.isArray(state.tasks) ? state.tasks : base.tasks).map((task, index) => ({
       ...task,
+      parent_task_id: typeof task.parent_task_id === 'string' && task.parent_task_id.trim() ? task.parent_task_id.trim() : null,
       priority: taskPriority(task.priority),
       status: ['open', 'in_progress', 'done', 'cancelled', 'deferred'].includes(task.status) ? task.status : 'open',
       actual_minutes: Math.max(0, Number(task.actual_minutes) || 0),
@@ -262,8 +263,10 @@ function mergeIntervals(intervals) {
 
 function buildPlan(state, current = nowParts()) {
   const window = todayPlanningWindow(state.settings, current);
+  const parentIds = new Set(state.tasks.map((task) => task.parent_task_id).filter(Boolean));
   const taskItems = state.tasks
-    .filter((task) => ['open', 'in_progress'].includes(task.status))
+    // Container tasks organize sub-plans; only leaf tasks consume calendar time.
+    .filter((task) => ['open', 'in_progress'].includes(task.status) && !parentIds.has(task.id))
     .sort((left, right) => (right.priority - left.priority) || (dueWeight(left) - dueWeight(right)) || ((Number(left.sort_order) || 0) - (Number(right.sort_order) || 0)) || left.created_at.localeCompare(right.created_at));
   const blocks = state.unavailable_blocks
     .filter((block) => block.date === current.date || block.date === window.end_date)
@@ -339,6 +342,7 @@ function buildPlan(state, current = nowParts()) {
       status: task.status,
       due_at: task.due_at,
       notes: task.notes || '',
+      parent_task_id: task.parent_task_id || null,
       actual_minutes: task.actual_minutes || 0,
       actual_seconds: elapsedSecondsForTask(task.id)
     });
@@ -362,6 +366,7 @@ function buildPlan(state, current = nowParts()) {
     scheduled,
     completed: state.tasks.filter((task) => task.status === 'done').slice().sort((a, b) => String(b.completed_at || '').localeCompare(String(a.completed_at || ''))).map((task) => ({
       id: task.id, title: task.title, project: taskProject(task, state.projects)?.name || '未归类', priority: task.priority,
+      parent_task_id: task.parent_task_id || null,
       estimated_minutes: task.estimated_minutes, actual_minutes: task.actual_minutes || 0, status: task.status, completed_at: task.completed_at || '', notes: task.notes || ''
     })),
     deferred,
@@ -1039,7 +1044,7 @@ export class AssistantStateStore {
               state.projects.push(project);
             }
             const task = {
-              id: id(), project_id: project?.id || context.project_id || null, title,
+              id: id(), project_id: project?.id || context.project_id || null, parent_task_id: action.parent_task_id || null, title,
               notes: normalizeText(action.reason, 500), status: 'open', priority: taskPriority(action.priority),
               estimated_minutes: Math.max(5, Math.min(720, Number(action.estimated_minutes) || 45)),
               actual_minutes: 0, sort_order: (state.tasks.length + 1) * 10, due_at: action.due_at || null, created_at: timestamp, updated_at: timestamp

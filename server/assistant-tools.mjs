@@ -52,7 +52,7 @@ export const ASSISTANT_TOOLS = Object.freeze([
     description: '创建任务并加入真实任务库，再由计划器安排时间。',
     parameters: {
       title: '任务名称', estimated_minutes: '预计分钟数', priority: '1-5',
-      project: '可选项目名', due_at: '可选 ISO 时间', date: '可选 YYYY-MM-DD', reason: '创建原因'
+      project: '可选项目名', parent_task_id: '可选父任务 ID；用于创建可独立计时的子任务', due_at: '可选 ISO 时间', date: '可选 YYYY-MM-DD', reason: '创建原因'
     }
   },
   {

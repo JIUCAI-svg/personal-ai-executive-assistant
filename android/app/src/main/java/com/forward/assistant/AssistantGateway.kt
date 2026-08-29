@@ -55,6 +55,7 @@ data class RemoteProject(
 data class RemoteTask(
     val id: String,
     val projectId: String? = null,
+    val parentTaskId: String? = null,
     val title: String,
     val notes: String = "",
     val status: String = "open",
@@ -124,6 +125,7 @@ private fun remoteProject(item: JSONObject): RemoteProject = RemoteProject(
 private fun remoteTask(item: JSONObject): RemoteTask = RemoteTask(
     id = item.optString("id"),
     projectId = item.optString("project_id").ifBlank { null },
+    parentTaskId = item.optString("parent_task_id").ifBlank { null },
     title = item.optString("title"),
     notes = item.optString("notes"),
     status = item.optString("status", "open"),

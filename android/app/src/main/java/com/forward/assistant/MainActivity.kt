@@ -912,7 +912,7 @@ private fun ForwardApp(activity: MainActivity) {
                 .onFailure { snackbar.showSnackbar(it.message ?: "移除任务失败") } }
         }
 
-        fun createTask(title: String, minutes: Int, priority: Int, projectId: String? = null) {
+        fun createTask(title: String, minutes: Int, priority: Int, projectId: String? = null, parentTaskId: String? = null) {
             scope.launch { runCatching {
                 gatewayExecuteAction(activity, remoteThreadId, JSONObject()
                     .put("type", "create_task")
@@ -920,6 +920,7 @@ private fun ForwardApp(activity: MainActivity) {
                     .put("estimated_minutes", minutes)
                     .put("priority", priority)
                     .apply { remoteProjects.firstOrNull { it.id == projectId }?.name?.let { put("project", it) } }
+                    .apply { parentTaskId?.takeIf(String::isNotBlank)?.let { put("parent_task_id", it) } }
                     .put("reason", "用户在移动端手动新建任务"))
             }.onSuccess { state -> remotePlan = state.plan; remoteProjects = state.projects; remoteTasks = state.tasks }
                 .onFailure { snackbar.showSnackbar(it.message ?: "新建任务失败") } }
@@ -1193,8 +1194,10 @@ private fun ForwardApp(activity: MainActivity) {
                     onLoadThread = ::loadThread,
                     onStartConversation = { startConversation(it, 4) },
                     onUpdateConversationOptions = ::updateConversationOptions,
-                    onCreateTask = { title, minutes, priority, projectId -> createTask(title, minutes, priority, projectId) },
+                    onCreateTask = { title, minutes, priority, projectId, parentTaskId -> createTask(title, minutes, priority, projectId, parentTaskId) },
                     onAddTaskToToday = ::addTaskToToday,
+                    onStartTaskTimer = { task -> scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "start_task_timer").put("task_id", task.id).put("mode", "stopwatch")) }.onSuccess { remotePlan = it.plan; remoteTasks = it.tasks }.onFailure { snackbar.showSnackbar(it.message ?: "开始计时失败") } } },
+                    onPauseTaskTimer = { task -> scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "pause_task_timer").put("task_id", task.id)) }.onSuccess { remotePlan = it.plan; remoteTasks = it.tasks }.onFailure { snackbar.showSnackbar(it.message ?: "暂停计时失败") } } },
                     onBack = { projectPageId = null; tab = 0 }
                 )
                 else -> SettingsScreen(
@@ -1871,8 +1874,10 @@ private fun ProjectScreen(
     onLoadThread: (ConversationThread) -> Unit,
     onStartConversation: (ConversationOptions) -> Unit,
     onUpdateConversationOptions: (ConversationOptions) -> Unit,
-    onCreateTask: (String, Int, Int, String?) -> Unit,
+    onCreateTask: (String, Int, Int, String?, String?) -> Unit,
     onAddTaskToToday: (RemoteTask) -> Unit,
+    onStartTaskTimer: (RemoteTask) -> Unit,
+    onPauseTaskTimer: (RemoteTask) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -1880,6 +1885,7 @@ private fun ProjectScreen(
     val projectTasks = tasks.filter { it.projectId == project?.id }
     val completedCount = projectTasks.count { it.status == "done" }
     var showTaskDialog by remember { mutableStateOf(false) }
+    var subtaskParent by remember { mutableStateOf<RemoteTask?>(null) }
     Column(modifier.fillMaxSize().padding(padding)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             TextButton(onClick = onBack, contentPadding = PaddingValues(0.dp)) { Text("‹ 今日", color = Green, fontSize = 12.sp) }
@@ -1898,7 +1904,7 @@ private fun ProjectScreen(
         }
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("项目任务", color = Green, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            TextButton(onClick = { showTaskDialog = true }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) { Icon(Icons.Default.Add, null, tint = Green, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(4.dp)); Text("新建任务", color = Green, fontSize = 11.sp) }
+            TextButton(onClick = { subtaskParent = null; showTaskDialog = true }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) { Icon(Icons.Default.Add, null, tint = Green, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(4.dp)); Text("新建任务", color = Green, fontSize = 11.sp) }
         }
         if (projectTasks.isEmpty()) {
             Text("还没有这个项目的任务，可以先新建一项。", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
@@ -1908,12 +1914,17 @@ private fun ProjectScreen(
                     val progress = (task.actualMinutes.toFloat() / task.minutes.coerceAtLeast(1)).coerceIn(0f, 1f)
                     Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
-                            Text(task.title, color = if (task.status == "done") Muted else Ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, textDecoration = if (task.status == "done") androidx.compose.ui.text.style.TextDecoration.LineThrough else null, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text((if (task.parentTaskId != null) "↳ " else "") + task.title, color = if (task.status == "done") Muted else Ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, textDecoration = if (task.status == "done") androidx.compose.ui.text.style.TextDecoration.LineThrough else null, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Text("${task.minutes} 分钟 · ${when (task.status) { "done" -> "已完成"; "deferred" -> "已顺延"; "cancelled" -> "已取消"; else -> "待完成" }}", color = Muted, fontSize = 10.sp)
                             LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth().padding(top = 4.dp), color = if (task.status == "done") Color(0xFF74A99A) else Coral, trackColor = Color(0xFFE5ECE7))
                         }
                         if (task.status == "deferred" || task.status == "cancelled") {
                             TextButton(onClick = { onAddTaskToToday(task) }, contentPadding = PaddingValues(horizontal = 5.dp)) { Text("加入今日", color = Green, fontSize = 10.sp) }
+                        }
+                        if (task.status == "open" || task.status == "in_progress") {
+                            val running = plan?.activeTimer?.taskId == task.id
+                            TextButton(onClick = { if (running) onPauseTaskTimer(task) else onStartTaskTimer(task) }, contentPadding = PaddingValues(horizontal = 5.dp)) { Text(if (running) "暂停" else "计时", color = Green, fontSize = 10.sp) }
+                            TextButton(onClick = { subtaskParent = task; showTaskDialog = true }, contentPadding = PaddingValues(horizontal = 5.dp)) { Text("子任务", color = Muted, fontSize = 10.sp) }
                         }
                     }
                 }
@@ -1929,8 +1940,9 @@ private fun ProjectScreen(
     if (showTaskDialog) {
         CreateProjectTaskDialog(
             projectId = project?.id,
+            parentTask = subtaskParent,
             onDismiss = { showTaskDialog = false },
-            onCreate = { title, minutes, priority -> showTaskDialog = false; onCreateTask(title, minutes, priority, project?.id) }
+            onCreate = { title, minutes, priority -> showTaskDialog = false; onCreateTask(title, minutes, priority, project?.id, subtaskParent?.id); subtaskParent = null }
         )
     }
 }
@@ -1938,6 +1950,7 @@ private fun ProjectScreen(
 @Composable
 private fun CreateProjectTaskDialog(
     projectId: String?,
+    parentTask: RemoteTask? = null,
     onDismiss: () -> Unit,
     onCreate: (String, Int, Int) -> Unit
 ) {
@@ -1946,7 +1959,7 @@ private fun CreateProjectTaskDialog(
     var priority by remember { mutableStateOf(3) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("新建项目任务", color = Green, fontWeight = FontWeight.Bold) },
+        title = { Text(if (parentTask == null) "新建项目任务" else "新建子任务", color = Green, fontWeight = FontWeight.Bold) },
         text = {
             Column {
                 OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("任务内容") }, singleLine = true)
