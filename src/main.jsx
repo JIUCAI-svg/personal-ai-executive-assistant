@@ -923,7 +923,7 @@ function App() {
             <form className="composer" onSubmit={submitMessage}>
               {pendingImages.length > 0 && <div className="pending-images">{pendingImages.map((image) => <div className="pending-image" key={image.dataUrl}><img src={image.dataUrl} alt={image.name} /><button type="button" onClick={() => setPendingImages((items) => items.filter((item) => item.dataUrl !== image.dataUrl))} aria-label="移除图片"><X size={13} /></button></div>)}</div>}
               <textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder="说说你刚做了什么，或发生了什么变化…" rows="2" />
-              <div className="composer-actions"><label className="tool-button" aria-label="从图库选择图片"><Image size={18} /><input type="file" accept="image/*" multiple hidden onChange={addImages} /></label><label className="tool-button" aria-label="拍照上传"><Camera size={18} /><input type="file" accept="image/*" capture="environment" hidden onChange={addImages} /></label><span>试试："下午要出门"、"这个任务做完了"、"我累了"</span><button type="submit" className="send-button" disabled={!input.trim() && pendingImages.length === 0} aria-label="发送消息"><Send size={17} /></button></div>
+              <div className="composer-actions"><span>试试："下午要出门"、"这个任务做完了"、"我累了"</span><label className="tool-button" aria-label="从图库选择图片"><Image size={18} /><input type="file" accept="image/*" multiple hidden onChange={addImages} /></label><label className="tool-button" aria-label="拍照上传"><Camera size={18} /><input type="file" accept="image/*" capture="environment" hidden onChange={addImages} /></label><button type="submit" className="send-button" disabled={!input.trim() && pendingImages.length === 0} aria-label="发送消息"><Send size={17} /></button></div>
             </form>
           </div>
 

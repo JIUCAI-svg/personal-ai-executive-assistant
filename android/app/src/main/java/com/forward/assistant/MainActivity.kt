@@ -1802,9 +1802,9 @@ private fun AdjustmentCard(title: String, body: String) { Card(Modifier.padding(
 private fun Composer(input: TextFieldValue, onInput: (TextFieldValue) -> Unit, onSend: () -> Unit, aiBusy: Boolean = false, onGallery: () -> Unit = {}, onCamera: () -> Unit = {}, imageData: String? = null) {
     val canSend = (input.text.isNotBlank() || !imageData.isNullOrBlank()) && !aiBusy
     Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp).fillMaxWidth().clip(RoundedCornerShape(9.dp)).background(Color.White).border(1.dp, Color(0xFFD6DED4), RoundedCornerShape(9.dp)).padding(8.dp), verticalAlignment = Alignment.Bottom) {
+        OutlinedTextField(value = input, onValueChange = onInput, enabled = !aiBusy, placeholder = { Text(if (aiBusy) "向前正在思考…" else "说进展、临时安排，或直接聊天…", color = Color(0xFF94A19C), fontSize = 12.sp) }, modifier = Modifier.weight(1f), minLines = 1, maxLines = 3, colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = Color.Transparent))
         IconButton(onClick = onGallery, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.Image, "图库", tint = Muted) }
         IconButton(onClick = onCamera, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.CameraAlt, "拍照", tint = Muted) }
-        OutlinedTextField(value = input, onValueChange = onInput, enabled = !aiBusy, placeholder = { Text(if (aiBusy) "向前正在思考…" else "说进展、临时安排，或直接聊天…", color = Color(0xFF94A19C), fontSize = 12.sp) }, modifier = Modifier.weight(1f), minLines = 1, maxLines = 3, colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = Color.Transparent))
         IconButton(onClick = onSend, enabled = canSend, modifier = Modifier.size(37.dp).clip(RoundedCornerShape(6.dp)).background(if (canSend) Green else Color(0xFFE9EDE8))) { Icon(Icons.Default.Send, "发送", tint = if (canSend) Color.White else Color(0xFF93A69F), modifier = Modifier.size(18.dp)) }
     }
 }
