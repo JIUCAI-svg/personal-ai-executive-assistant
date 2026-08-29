@@ -764,16 +764,30 @@ async function requestModelText(payload) {
 }
 
 async function requestAssistantModel(payload) {
-  const { content, attempts, raw } = await requestModelText(payload);
-  const calls = extractAssistantToolCalls(payload.provider, raw);
-  const actions = calls.map((call) => {
-    let args = {};
-    try { args = JSON.parse(call.arguments || '{}'); } catch { args = {}; }
-    return { type: call.name, ...args };
-  });
-  if (actions.length) return { result: { reply: String(content || '').trim() || '好的，我来处理。', actions: normalizeActions(actions), memoryCandidates: [] }, attempts };
-  try { return { result: parseAssistantContent(content), attempts }; }
-  catch { return { result: parseNaturalAssistantContent(content), attempts }; }
+  async function decode(result) {
+    const calls = extractAssistantToolCalls(payload.provider, result.raw);
+    const actions = calls.map((call) => {
+      let args = {};
+      try { args = JSON.parse(call.arguments || '{}'); } catch { args = {}; }
+      return { type: call.name, ...args };
+    });
+    if (actions.length) return { result: { reply: String(result.content || '').trim() || '好的，我来处理。', actions: normalizeActions(actions), memoryCandidates: [] }, attempts: result.attempts };
+    try { return { result: parseAssistantContent(result.content), attempts: result.attempts }; }
+    catch { return { result: parseNaturalAssistantContent(result.content), attempts: result.attempts }; }
+  }
+
+  try {
+    return await decode(await requestModelText({ ...payload, max_retries: payload.max_retries ?? 1 }));
+  } catch (toolError) {
+    // A number of OpenAI-compatible relays expose chat completions but do not
+    // implement the optional tools field. Retry once in plain natural-text
+    // mode so the conversation remains usable instead of falling into a local
+    // canned response.
+    if (!Array.isArray(payload.tools) || payload.tools.length === 0) throw toolError;
+    const fallbackPayload = { ...payload, tools: [], max_retries: payload.max_retries };
+    delete fallbackPayload.tool_choice;
+    return await decode(await requestModelText(fallbackPayload));
+  }
 }
 
 app.get('/api/assistant/status', (request, response) => {
