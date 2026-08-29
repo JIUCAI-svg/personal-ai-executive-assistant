@@ -1613,7 +1613,7 @@ app.use((error, _request, response, _next) => {
 const androidApkPath = path.join(appRoot, 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
 app.get('/download/forward.apk', (_request, response) => {
   if (!existsSync(androidApkPath)) return response.status(404).json({ error: 'Android 安装包尚未生成。' });
-  response.download(androidApkPath, 'forward-assistant-v0.6.0-image-upload-debug.apk');
+  response.download(androidApkPath, 'forward-assistant-v0.6.3-image-history-debug.apk');
 });
 
 app.delete('/api/assistant/threads/:id', async (request, response, next) => {
