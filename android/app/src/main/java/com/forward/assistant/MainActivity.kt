@@ -954,32 +954,20 @@ private fun ForwardApp(activity: MainActivity) {
                 .onFailure { snackbar.showSnackbar(it.message ?: "移除任务失败") } }
         }
 
-        fun createTask(title: String, minutes: Int, priority: Int, projectId: String? = null, parentTaskId: String? = null) {
+        fun createTask(title: String, minutes: Int, priority: Int, projectId: String? = null, parentTaskId: String? = null, taskType: String = "one_off", dueAt: String? = null) {
             scope.launch { runCatching {
                 gatewayExecuteAction(activity, remoteThreadId, JSONObject()
-                    .put("type", "create_task")
+                    .put("type", if (taskType == "long") "create_long_task" else "create_task")
                     .put("title", title)
                     .put("estimated_minutes", minutes)
+                    .put("daily_minutes", minutes)
                     .put("priority", priority)
+                    .apply { dueAt?.takeIf(String::isNotBlank)?.let { put("due_at", it) } }
                     .apply { remoteProjects.firstOrNull { it.id == projectId }?.name?.let { put("project", it) } }
                     .apply { parentTaskId?.takeIf(String::isNotBlank)?.let { put("parent_task_id", it) } }
                     .put("reason", "用户在移动端手动新建任务"))
             }.onSuccess { state -> remotePlan = state.plan; remoteProjects = state.projects; remoteTasks = state.tasks }
                 .onFailure { snackbar.showSnackbar(it.message ?: "新建任务失败") } }
-        }
-
-        fun createLongTask(title: String, minutes: Int, priority: Int, projectId: String? = null) {
-            scope.launch {
-                runCatching { gatewayCreateLongTask(activity, title, minutes, priority, projectId) }
-                    .onSuccess { state ->
-                        remotePlan = state.plan
-                        remoteProjects = state.projects
-                        remoteTasks = state.tasks
-                        remoteLongTasks = state.longTasks
-                        snackbar.showSnackbar("长期任务已创建，今天的执行项已加入计划")
-                    }
-                    .onFailure { snackbar.showSnackbar(it.message ?: "新建长期任务失败") }
-            }
         }
 
         fun reorderTasks(taskIds: List<String>) {
@@ -1205,10 +1193,10 @@ private fun ForwardApp(activity: MainActivity) {
             }
         ) { padding ->
             when (tab) {
-                0 -> TodayScreen(padding, now, sleepTime, currentDone, unavailablePeriod, breakTimer, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), remotePlan, remoteProjects, remoteLongTasks, { showProjects = true }, ::completeTask, ::startCurrentTimer, ::pauseCurrentTimer, { breakTimer = breakTimer?.copy(running = !breakTimer!!.running) }, { breakTimer = null; currentDone = false }, ::reopenTask, ::editTask, ::removeTask, ::createTask, { parent, title, minutes, priority ->
+                0 -> TodayScreen(padding, now, sleepTime, currentDone, unavailablePeriod, breakTimer, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), remotePlan, remoteProjects, { showProjects = true }, ::completeTask, ::startCurrentTimer, ::pauseCurrentTimer, { breakTimer = breakTimer?.copy(running = !breakTimer!!.running) }, { breakTimer = null; currentDone = false }, ::reopenTask, ::editTask, ::removeTask, ::createTask, { parent, title, minutes, priority ->
                     val projectId = remoteProjects.firstOrNull { it.name == parent.project }?.id
                     createTask(title, minutes, priority, projectId, parent.id)
-                }, ::completeSpecificTask, ::reorderTasks, ::sendMessage, input, { value -> input = value }, aiBusy, ::createLongTask)
+                }, ::completeSpecificTask, ::reorderTasks, ::sendMessage, input, { value -> input = value }, aiBusy)
                 1 -> ChatScreen(
                     padding = padding,
                     messages = messages,
@@ -1454,7 +1442,6 @@ private fun TodayScreen(
     plan: List<PlanItem>,
     remotePlan: RemotePlan?,
     remoteProjects: List<RemoteProject>,
-    remoteLongTasks: List<RemoteLongTask>,
     onShowProjects: () -> Unit,
     completeTask: () -> Unit,
     startTimer: () -> Unit,
@@ -1464,23 +1451,23 @@ private fun TodayScreen(
     reopenTask: (String) -> Unit,
     editTask: (RemotePlanItem) -> Unit,
     removeTask: (RemotePlanItem) -> Unit,
-    createTask: (String, Int, Int) -> Unit,
+    createTask: (String, Int, Int, String?, String?, String, String?) -> Unit,
     createSubtask: (RemotePlanItem, String, Int, Int) -> Unit,
     completeSpecificTask: (RemotePlanItem) -> Unit,
     reorderTasks: (List<String>) -> Unit,
     sendMessage: () -> Unit,
     input: TextFieldValue,
     onInput: (TextFieldValue) -> Unit,
-    aiBusy: Boolean,
-    createLongTask: (String, Int, Int, String?) -> Unit
+    aiBusy: Boolean
 ) {
     var editingTask by remember { mutableStateOf<RemotePlanItem?>(null) }
     var creatingTask by remember { mutableStateOf(false) }
     var creatingSubtask by remember { mutableStateOf<RemotePlanItem?>(null) }
-    var creatingLongTask by remember { mutableStateOf(false) }
     var createTitle by remember { mutableStateOf("") }
     var createMinutes by remember { mutableStateOf("45") }
     var createPriority by remember { mutableStateOf("3") }
+    var createType by remember { mutableStateOf("one_off") }
+    var createDueDate by remember { mutableStateOf("") }
     var editTitle by remember { mutableStateOf("") }
     var editMinutes by remember { mutableStateOf("") }
     var editPriority by remember { mutableStateOf("") }
@@ -1550,7 +1537,6 @@ private fun TodayScreen(
             }
         } }
         item { CurrentTaskCard(currentItem, currentDone, breakTimer, remotePlan?.completed?.firstOrNull()?.title, remotePlan?.activeTimer, timerSeconds, completeTask, startTimer, pauseTimer, toggleBreak, skipBreak) }
-        item { Card(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFF2F5F1)), shape = RoundedCornerShape(9.dp)) { Row(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("长期推进", color = Green, fontSize = 12.sp, fontWeight = FontWeight.SemiBold); Text("${remoteLongTasks.count { it.status == "active" }} 项进行中 · 每个计划日生成独立执行项", color = Muted, fontSize = 10.sp) }; TextButton(onClick = { creatingLongTask = true }, contentPadding = PaddingValues(horizontal = 4.dp)) { Text("新建", color = Green, fontSize = 11.sp) } } } }
         item { Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 15.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text("今日动态计划", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.Bold); Row(verticalAlignment = Alignment.CenterVertically) { Text("现在 $clock", color = Muted, fontSize = 10.sp); TextButton(onClick = { creatingTask = true; createTitle = ""; createMinutes = "45"; createPriority = "3" }, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)) { Icon(Icons.Default.Add, null, tint = Green, modifier = Modifier.size(16.dp)); Text("新建", color = Green, fontSize = 11.sp) } } } }
         item { BudgetRow(scheduledMinutes, bufferMinutes, freeMinutes) }
         // Some legacy/local tasks may not have an id yet; keep LazyColumn keys unique
@@ -1678,7 +1664,14 @@ private fun TodayScreen(
             title = { Text("新建任务", color = Green, fontSize = 21.sp, fontWeight = FontWeight.SemiBold) },
             text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 OutlinedTextField(createTitle, { createTitle = it }, label = { Text("任务名称") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Text("任务类型", color = Muted, fontSize = 12.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                    listOf("one_off" to "普通", "deadline" to "截止", "long" to "长期").forEach { (value, label) ->
+                        TextButton(onClick = { createType = value }) { Text(if (createType == value) "✓ $label" else label, color = if (createType == value) Green else Muted, fontSize = 11.sp) }
+                    }
+                }
                 OutlinedTextField(createMinutes, { createMinutes = it.filter(Char::isDigit) }, label = { Text("预计分钟") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                if (createType != "one_off") OutlinedTextField(createDueDate, { createDueDate = it }, label = { Text("截止日期（YYYY-MM-DD，可选）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("优先级", color = Muted, fontSize = 12.sp, fontWeight = FontWeight.Medium)
                     Row(horizontalArrangement = Arrangement.spacedBy(7.dp), modifier = Modifier.fillMaxWidth()) {
@@ -1691,18 +1684,8 @@ private fun TodayScreen(
                     }
                 }
             } },
-            confirmButton = { Button(onClick = { createTask(createTitle.trim(), (createMinutes.toIntOrNull() ?: 45).coerceIn(5, 720), selectedPriority); creatingTask = false }, enabled = createTitle.trim().isNotBlank(), colors = ButtonDefaults.buttonColors(containerColor = Green), shape = RoundedCornerShape(8.dp)) { Text("创建任务") } },
+            confirmButton = { Button(onClick = { createTask(createTitle.trim(), (createMinutes.toIntOrNull() ?: 45).coerceIn(5, 720), selectedPriority, null, null, createType, createDueDate.trim().takeIf { it.matches(Regex("\\d{4}-\\d{2}-\\d{2}")) }?.let { "${it}T23:59:00+08:00" }); creatingTask = false }, enabled = createTitle.trim().isNotBlank(), colors = ButtonDefaults.buttonColors(containerColor = Green), shape = RoundedCornerShape(8.dp)) { Text("创建任务") } },
             dismissButton = { TextButton(onClick = { creatingTask = false }) { Text("取消", color = Muted) } }
-        )
-    }
-    if (creatingLongTask) {
-        CreateLongTaskDialog(
-            projects = remoteProjects,
-            onDismiss = { creatingLongTask = false },
-            onCreate = { title, minutes, priority, projectId ->
-                creatingLongTask = false
-                createLongTask(title, minutes, priority, projectId)
-            }
         )
     }
 }
