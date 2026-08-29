@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { assistantEndpoint, buildAssistantModelRequest, extractAssistantText } from '../server/ai-protocol.mjs';
+import { assistantEndpoint, buildAssistantModelRequest, extractAssistantText, extractAssistantToolCalls } from '../server/ai-protocol.mjs';
 
 const messages = [
   { role: 'system', content: '系统指令' },
@@ -37,4 +37,18 @@ test('responses extracts text from output content when output_text is absent', (
     output: [{ type: 'message', content: [{ type: 'output_text', text: '{"reply":"完成"}' }] }]
   };
   assert.equal(extractAssistantText(provider, response), '{"reply":"完成"}');
+});
+
+test('chat completions carries optional tools and extracts calls', () => {
+  const provider = { api_mode: 'chat_completions' };
+  const tool = { type: 'function', function: { name: 'create_task', description: '创建任务', parameters: { type: 'object' } } };
+  const body = buildAssistantModelRequest(provider, { model: 'm', messages, tools: [tool] });
+  assert.equal(body.tool_choice, 'auto');
+  assert.deepEqual(body.tools, [tool]);
+  assert.deepEqual(extractAssistantToolCalls(provider, { choices: [{ message: { tool_calls: [{ id: '1', function: { name: 'create_task', arguments: '{"title":"测试"}' } }] } }] }), [{ id: '1', name: 'create_task', arguments: '{"title":"测试"}' }]);
+});
+
+test('natural text providers remain usable without JSON envelope', () => {
+  const provider = { api_mode: 'chat_completions' };
+  assert.equal(extractAssistantText(provider, { choices: [{ message: { content: '你好，今天继续推进。' } }] }), '你好，今天继续推进。');
 });
