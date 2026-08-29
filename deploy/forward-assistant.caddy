@@ -1,14 +1,28 @@
-http://www.zmyhgd.art {
+http://YOUR-SERVER-IP {
     bind YOUR-INTERNAL-IP
-    encode zstd gzip
 
-    @api path /api/*
-    handle @api {
+    @forward_root path /forward-assistant
+    redir @forward_root /forward-assistant/ 308
+
+    @forward_api path /forward-assistant/api/*
+    handle @forward_api {
+        uri strip_prefix /forward-assistant
+        reverse_proxy 127.0.0.1:8787 {
+            # The browser never receives this private gateway token.
+            header_up x-forward-token forward-local-9b4179d4a8e547d8a95e0b5e35838d8a
+        }
+    }
+
+    @forward_download path /forward-assistant/download/*
+    handle @forward_download {
+        uri strip_prefix /forward-assistant
         reverse_proxy 127.0.0.1:8787
     }
 
-    handle {
-        root * /srv/forward-assistant/app/dist
+    @forward_app path /forward-assistant/*
+    handle @forward_app {
+        uri strip_prefix /forward-assistant
+        root * /srv/forward-assistant/app/dist-ip
         try_files {path} /index.html
         file_server
     }
