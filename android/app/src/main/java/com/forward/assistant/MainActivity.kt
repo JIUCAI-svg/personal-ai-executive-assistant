@@ -1167,6 +1167,8 @@ private fun ProjectOverviewDialog(
     projects: List<RemoteProject>,
     onDismiss: () -> Unit
 ) {
+    var selectedProjectId by remember { mutableStateOf<String?>(null) }
+    val selectedProject = projects.firstOrNull { it.id == selectedProjectId }
     AlertDialog(
         onDismissRequest = onDismiss,
         shape = RoundedCornerShape(22.dp),
@@ -1175,11 +1177,28 @@ private fun ProjectOverviewDialog(
         title = {
             Column {
                 Text("目标与项目", color = Green, fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
-                Text("长期目标和项目截止日期", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+                Text(if (selectedProject == null) "长期目标和项目截止日期" else "项目详情", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
             }
         },
         text = {
-            if (projects.isEmpty()) {
+            if (selectedProject != null) {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    TextButton(onClick = { selectedProjectId = null }, contentPadding = PaddingValues(0.dp)) { Text("‹ 返回全部目标与项目", color = Green, fontSize = 12.sp) }
+                    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF1EC)), shape = RoundedCornerShape(11.dp)) {
+                        Column(Modifier.padding(14.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.FolderOpen, null, tint = Green, modifier = Modifier.size(20.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text(selectedProject.name, color = Ink, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                            Text(if (selectedProject.kind == "goal") "长期目标" else "项目", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
+                            Text(selectedProject.description.ifBlank { "还没有项目说明。" }, color = Color(0xFF4C7168), fontSize = 12.sp, lineHeight = 18.sp, modifier = Modifier.padding(top = 8.dp))
+                            Text("优先级 ${when { selectedProject.priority >= 4 -> "高"; selectedProject.priority <= 1 -> "低"; else -> "中" }} · ${selectedProject.dueAt?.takeUnless { it == "null" }?.let { "截止 $it" } ?: "持续推进"}", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 10.dp))
+                        }
+                    }
+                    Text("这个项目的任务可以从今日计划或对话中继续添加，AI 会根据项目上下文帮你推进。", color = Muted, fontSize = 11.sp, lineHeight = 17.sp)
+                }
+            } else if (projects.isEmpty()) {
                 Text("当前还没有目标或项目。", color = Muted, fontSize = 12.sp)
             } else {
                 LazyColumn(
@@ -1196,12 +1215,12 @@ private fun ProjectOverviewDialog(
                         val dueLabel = project.dueAt?.takeIf { it.isNotBlank() }?.let { due ->
                             "截止 $due"
                         } ?: "持续推进"
-                        Card(
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF1EC)),
-                            shape = RoundedCornerShape(11.dp)
-                        ) {
-                            Column(Modifier.padding(12.dp)) {
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF1EC)),
+                                shape = RoundedCornerShape(11.dp)
+                            ) {
+                            Column(Modifier.padding(12.dp).clickable { selectedProjectId = project.id }) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Icon(Icons.Default.FolderOpen, null, tint = Green, modifier = Modifier.size(18.dp))
                                     Spacer(Modifier.width(8.dp))
