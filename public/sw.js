@@ -1,5 +1,6 @@
-const CACHE = 'forward-shell-v1';
-const ASSETS = ['/', '/index.html', '/manifest.webmanifest', '/app-icon.svg'];
+const CACHE = 'forward-shell-v2';
+const BASE = self.registration.scope.endsWith('/') ? self.registration.scope : `${self.registration.scope}/`;
+const ASSETS = [BASE, `${BASE}index.html`, `${BASE}manifest.webmanifest`, `${BASE}app-icon.svg`];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS)));

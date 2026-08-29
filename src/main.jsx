@@ -456,7 +456,7 @@ function App() {
   }, [messages]);
 
   useEffect(() => {
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register(appPath('/sw.js'), { scope: `${appBasePath || ''}/` }).catch(() => {});
   }, []);
 
   async function loadVault(includeDocuments = false) {
