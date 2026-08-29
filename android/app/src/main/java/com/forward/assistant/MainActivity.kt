@@ -1087,7 +1087,7 @@ private fun ForwardApp(activity: MainActivity) {
 
         fun sendMessage() {
             val text = input.text.trim()
-            if (text.isEmpty() || aiBusy) return
+            if ((text.isEmpty() && pendingImageData.isNullOrBlank()) || aiBusy) return
             val priorConversation = messages
             val image = pendingImageData
             pendingImageData = null
@@ -1200,7 +1200,7 @@ private fun ForwardApp(activity: MainActivity) {
                     onSetThreadLocked = ::setThreadLocked,
                     onDeleteThreads = ::deleteThreads
                     ,onGallery = { galleryLauncher.launch("image/*") },
-                    onCamera = { cameraLauncher.launch(null) }
+                    onCamera = { cameraLauncher.launch(null) }, imageData = pendingImageData, onClearImage = { pendingImageData = null }
                 )
                 2 -> MemoryScreen(
                     padding = padding,
@@ -1789,7 +1789,7 @@ private fun PlanRow(
 private fun AdjustmentCard(title: String, body: String) { Card(Modifier.padding(horizontal = 20.dp, vertical = 10.dp).fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color(0xFFE1EDE6)), shape = RoundedCornerShape(7.dp)) { Row(Modifier.padding(10.dp), horizontalArrangement = Arrangement.spacedBy(7.dp)) { Icon(Icons.Default.AutoAwesome, null, tint = Color(0xFF2C655B), modifier = Modifier.size(16.dp)); Column { Text(title, color = Color(0xFF2C655B), fontSize = 11.sp, fontWeight = FontWeight.Bold); Text(body, color = Color(0xFF56756D), fontSize = 10.sp, lineHeight = 15.sp) } } } }
 
 @Composable
-private fun Composer(input: TextFieldValue, onInput: (TextFieldValue) -> Unit, onSend: () -> Unit, aiBusy: Boolean = false, onGallery: () -> Unit = {}, onCamera: () -> Unit = {}) { Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp).fillMaxWidth().clip(RoundedCornerShape(9.dp)).background(Color.White).border(1.dp, Color(0xFFD6DED4), RoundedCornerShape(9.dp)).padding(8.dp), verticalAlignment = Alignment.Bottom) { IconButton(onClick = onGallery, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.Image, "图库", tint = Muted) }; IconButton(onClick = onCamera, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.CameraAlt, "拍照", tint = Muted) }; OutlinedTextField(value = input, onValueChange = onInput, enabled = !aiBusy, placeholder = { Text(if (aiBusy) "向前正在思考…" else "说进展、临时安排，或直接聊天…", color = Color(0xFF94A19C), fontSize = 12.sp) }, modifier = Modifier.weight(1f), minLines = 1, maxLines = 3, colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = Color.Transparent)); IconButton(onClick = onSend, enabled = input.text.isNotBlank() && !aiBusy, modifier = Modifier.size(37.dp).clip(RoundedCornerShape(6.dp)).background(if (input.text.isBlank() || aiBusy) Color(0xFFE9EDE8) else Green)) { Icon(Icons.Default.Send, "发送", tint = if (input.text.isBlank() || aiBusy) Color(0xFF93A69F) else Color.White, modifier = Modifier.size(18.dp)) } } }
+private fun Composer(input: TextFieldValue, onInput: (TextFieldValue) -> Unit, onSend: () -> Unit, aiBusy: Boolean = false, onGallery: () -> Unit = {}, onCamera: () -> Unit = {}, imageData: String? = null) { Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp).fillMaxWidth().clip(RoundedCornerShape(9.dp)).background(Color.White).border(1.dp, Color(0xFFD6DED4), RoundedCornerShape(9.dp)).padding(8.dp), verticalAlignment = Alignment.Bottom) { IconButton(onClick = onGallery, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.Image, "图库", tint = Muted) }; IconButton(onClick = onCamera, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.CameraAlt, "拍照", tint = Muted) }; OutlinedTextField(value = input, onValueChange = onInput, enabled = !aiBusy, placeholder = { Text(if (aiBusy) "向前正在思考…" else "说进展、临时安排，或直接聊天…", color = Color(0xFF94A19C), fontSize = 12.sp) }, modifier = Modifier.weight(1f), minLines = 1, maxLines = 3, colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = Color.Transparent)); IconButton(onClick = onSend, enabled = (input.text.isNotBlank()) && !aiBusy, modifier = Modifier.size(37.dp).clip(RoundedCornerShape(6.dp)).background(if (input.text.isBlank() || aiBusy) Color(0xFFE9EDE8) else Green)) { Icon(Icons.Default.Send, "发送", tint = if (input.text.isBlank() || aiBusy) Color(0xFF93A69F) else Color.White, modifier = Modifier.size(18.dp)) } } }
 
 @Composable
 private fun ChatScreen(
@@ -1811,6 +1811,8 @@ private fun ChatScreen(
     onDeleteThreads: (List<ConversationThread>) -> Unit = {},
     onGallery: () -> Unit = {},
     onCamera: () -> Unit = {},
+    imageData: String? = null,
+    onClearImage: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val listState = rememberLazyListState()
@@ -1893,7 +1895,7 @@ private fun ChatScreen(
                 }
             }
         }
-        Composer(input, onInput, onSend, aiBusy || threadLoading, onGallery, onCamera)
+        if (!imageData.isNullOrBlank()) Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) { Text("已选择图片", color = Green, fontSize = 10.sp); Spacer(Modifier.weight(1f)); TextButton(onClick = onClearImage) { Text("移除", color = Coral, fontSize = 10.sp) } }; Composer(input, onInput, onSend, aiBusy || threadLoading, onGallery, onCamera, imageData)
     }
 
     if (showHistory) {
