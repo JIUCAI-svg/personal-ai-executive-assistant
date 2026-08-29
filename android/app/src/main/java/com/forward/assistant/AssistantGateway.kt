@@ -100,12 +100,12 @@ private fun gatewayBaseUrl(): String = BuildConfig.AI_GATEWAY_URL.trim().removeS
 private fun remotePlanItem(item: JSONObject): RemotePlanItem = RemotePlanItem(
     id = item.optString("id"), title = item.optString("title"), project = item.optString("project"), notes = item.optString("notes"),
     priority = item.optInt("priority", 3), minutes = item.optInt("estimated_minutes", 45), start = item.optString("start"), end = item.optString("end"),
-    date = item.optString("date"), status = item.optString("status", "open"), dueAt = item.optString("due_at").ifBlank { null }, reason = item.optString("reason"), actualMinutes = item.optInt("actual_minutes", 0), actualSeconds = item.optLong("actual_seconds", item.optInt("actual_minutes", 0) * 60L)
+    date = item.optString("date"), status = item.optString("status", "open"), dueAt = item.optString("due_at").takeUnless { it.isBlank() || it == "null" }, reason = item.optString("reason"), actualMinutes = item.optInt("actual_minutes", 0), actualSeconds = item.optLong("actual_seconds", item.optInt("actual_minutes", 0) * 60L)
 )
 
 private fun remoteProject(item: JSONObject): RemoteProject = RemoteProject(
     id = item.optString("id"), name = item.optString("name"), status = item.optString("status", "active"),
-    kind = item.optString("kind", "project"), dueAt = item.optString("due_at").ifBlank { null },
+    kind = item.optString("kind", "project"), dueAt = item.optString("due_at").takeUnless { it.isBlank() || it == "null" },
     priority = item.optInt("priority", 3), description = item.optString("description")
 )
 

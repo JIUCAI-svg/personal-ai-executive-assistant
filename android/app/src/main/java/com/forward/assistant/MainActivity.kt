@@ -1153,7 +1153,74 @@ private fun ForwardApp(activity: MainActivity) {
                 )
             }
         }
+        if (showProjects) {
+            ProjectOverviewDialog(
+                projects = remoteProjects,
+                onDismiss = { showProjects = false }
+            )
+        }
     }
+}
+
+@Composable
+private fun ProjectOverviewDialog(
+    projects: List<RemoteProject>,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        shape = RoundedCornerShape(22.dp),
+        containerColor = Color(0xFFFFFEFA),
+        tonalElevation = 0.dp,
+        title = {
+            Column {
+                Text("目标与项目", color = Green, fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
+                Text("长期目标和项目截止日期", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+            }
+        },
+        text = {
+            if (projects.isEmpty()) {
+                Text("当前还没有目标或项目。", color = Muted, fontSize = 12.sp)
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 420.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(projects, key = { it.id }) { project ->
+                        val kindLabel = if (project.kind == "goal") "长期目标" else "项目"
+                        val priorityLabel = when {
+                            project.priority >= 4 -> "高优先级"
+                            project.priority <= 1 -> "低优先级"
+                            else -> "中优先级"
+                        }
+                        val dueLabel = project.dueAt?.takeIf { it.isNotBlank() }?.let { due ->
+                            "截止 $due"
+                        } ?: "持续推进"
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF1EC)),
+                            shape = RoundedCornerShape(11.dp)
+                        ) {
+                            Column(Modifier.padding(12.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.FolderOpen, null, tint = Green, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(project.name, color = Ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                Text("$kindLabel · $priorityLabel · $dueLabel", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 5.dp))
+                                project.description.takeIf { it.isNotBlank() }?.let {
+                                    Text(it, color = Color(0xFF4C7168), fontSize = 11.sp, lineHeight = 16.sp, modifier = Modifier.padding(top = 5.dp), maxLines = 3, overflow = TextOverflow.Ellipsis)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("关闭", color = Green) }
+        }
+    )
 }
 
 @Composable
