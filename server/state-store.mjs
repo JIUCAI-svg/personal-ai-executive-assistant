@@ -66,6 +66,24 @@ function normalizeText(value, limit = 240) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
 }
 
+function normalizeMessageAttachments(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 4).map((entry, index) => {
+    const dataUrl = typeof entry === 'string'
+      ? entry
+      : String(entry?.data_url || entry?.dataUrl || entry?.url || '').trim();
+    if (!dataUrl || (!/^data:image\//i.test(dataUrl) && !/^https?:\/\//i.test(dataUrl))) return null;
+    // The request parser already limits the whole message. Keep the persisted
+    // transcript bounded as well so a malformed client cannot grow it forever.
+    if (dataUrl.length > 12_000_000) return null;
+    return {
+      data_url: dataUrl,
+      name: normalizeText(typeof entry === 'object' ? entry?.name : `image-${index + 1}`, 160) || `image-${index + 1}`,
+      type: normalizeText(typeof entry === 'object' ? entry?.type : '', 80)
+    };
+  }).filter(Boolean);
+}
+
 function completedSinceSleep(task, current, sleepTime) {
   if (!task.completed_at) return false;
   const sleepMinutes = minutes(sleepTime);
@@ -203,7 +221,10 @@ export function repairAssistantState(source) {
       ...thread,
       locked: thread.locked === true
     })),
-    messages: Array.isArray(state.messages) ? state.messages : [],
+    messages: (Array.isArray(state.messages) ? state.messages : []).map((message) => ({
+      ...message,
+      attachments: normalizeMessageAttachments(message?.attachments)
+    })),
     memory_items: Array.isArray(state.memory_items) ? state.memory_items : [],
     daily_memory_summaries: Array.isArray(state.daily_memory_summaries) ? state.daily_memory_summaries : [],
     memory_organizer_runs: Array.isArray(state.memory_organizer_runs) ? state.memory_organizer_runs : [],
@@ -515,7 +536,7 @@ export class AssistantStateStore {
     });
   }
 
-  async appendMessage(thread, role, content, actionResult = null) {
+  async appendMessage(thread, role, content, actionResult = null, attachments = []) {
     if (!thread?.id || !thread.save_full_conversation) return null;
     return this.mutate((state) => {
       const current = nowParts();
@@ -525,6 +546,7 @@ export class AssistantStateStore {
         role: role === 'assistant' ? 'assistant' : 'user',
         content: normalizeText(content, 12000),
         action_result: actionResult,
+        attachments: normalizeMessageAttachments(attachments),
         created_at: isoAt(current.date, current.time)
       };
       state.messages.push(message);

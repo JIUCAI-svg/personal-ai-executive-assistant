@@ -720,7 +720,8 @@ function App() {
         id: message.id,
         role: message.role,
         time: messageTime(message.created_at),
-        text: message.content
+        text: message.content,
+        attachments: Array.isArray(message.attachments) ? message.attachments : []
       })));
       setShowHistory(false);
       setNotice('已恢复这段对话及其上下文。');

@@ -64,7 +64,12 @@ test('thread APIs preserve a selected conversation and keep temporary chat out o
 
     const reply = await (await fetch(`${baseUrl}/api/assistant/respond`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: '项目今天已经推进了一步。', thread_id: created.thread.id, conversation_mode: 'project' })
+      body: JSON.stringify({
+        message: '项目今天已经推进了一步。',
+        attachments: [{ name: 'progress.png', type: 'image/png', data_url: 'data:image/png;base64,aGVsbG8=' }],
+        thread_id: created.thread.id,
+        conversation_mode: 'project'
+      })
     })).json();
     assert.equal(reply.thread.id, created.thread.id);
 
@@ -76,6 +81,9 @@ test('thread APIs preserve a selected conversation and keep temporary chat out o
     const detail = await (await fetch(`${baseUrl}/api/assistant/threads/${created.thread.id}`)).json();
     assert.equal(detail.thread.messages.length, 2);
     assert.deepEqual(detail.thread.messages.map((message) => message.role), ['user', 'assistant']);
+    assert.deepEqual(detail.thread.messages[0].attachments, [{
+      name: 'progress.png', type: 'image/png', data_url: 'data:image/png;base64,aGVsbG8='
+    }]);
 
     const temporary = await (await fetch(`${baseUrl}/api/assistant/threads`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },

@@ -1417,7 +1417,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
     const stateBefore = await store.bootstrap();
     const projectName = threadProjectName(thread, stateBefore);
     const hydratedThread = { ...thread, project_name: projectName };
-    const userMessage = await store.appendMessage(hydratedThread, 'user', message);
+    const userMessage = await store.appendMessage(hydratedThread, 'user', message, null, attachments);
     const storedConversation = userMessage
       ? (await store.recentMessages(hydratedThread.id, 16)).filter((entry) => entry.id !== userMessage.id)
       : [];

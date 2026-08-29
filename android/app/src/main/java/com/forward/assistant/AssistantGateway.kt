@@ -237,7 +237,14 @@ suspend fun gatewayLoadThread(context: Context, threadId: String, limit: Int = 2
         val messages = rawThread.optJSONArray("messages")?.let { array ->
             (0 until array.length()).mapNotNull { index -> array.optJSONObject(index)?.let { message ->
                 val content = message.optString("content").trim()
-                content.takeIf(String::isNotBlank)?.let { ChatMessage(message.optString("role") == "assistant", it) }
+                val imageData = message.optJSONArray("attachments")
+                    ?.optJSONObject(0)
+                    ?.optString("data_url")
+                    ?.trim()
+                    ?.takeIf(String::isNotBlank)
+                if (content.isNotBlank() || imageData != null) {
+                    ChatMessage(message.optString("role") == "assistant", content, imageData)
+                } else null
             } }
         }.orEmpty()
         RemoteThreadDetail(remoteThread(rawThread), messages)
