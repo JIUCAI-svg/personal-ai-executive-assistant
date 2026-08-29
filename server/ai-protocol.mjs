@@ -22,6 +22,7 @@ export function buildAssistantModelRequest(provider, request = {}) {
       ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
       ...(request.reasoning_effort ? { reasoning_effort: request.reasoning_effort } : {}),
       ...(request.response_format ? { response_format: request.response_format } : {}),
+      ...(Array.isArray(request.tools) && request.tools.length ? { tools: request.tools, tool_choice: request.tool_choice || 'auto' } : {}),
       messages
     };
   }
@@ -41,7 +42,10 @@ export function buildAssistantModelRequest(provider, request = {}) {
           content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: text(message.content) }]
         };
       }),
-    text: { format: { type: 'json_object' } },
+    ...(Array.isArray(request.tools) && request.tools.length ? {} : { text: { format: { type: 'json_object' } } }),
+    ...(Array.isArray(request.tools) && request.tools.length ? {
+      tools: request.tools.map((tool) => ({ type: 'function', name: tool.function?.name || tool.name, description: tool.function?.description || tool.description, parameters: tool.function?.parameters || tool.parameters }))
+    } : {}),
     ...(request.reasoning_effort ? { reasoning: { effort: request.reasoning_effort } } : {})
   };
 }
@@ -66,6 +70,18 @@ export function extractAssistantText(provider, payload) {
     return [responseContentText(item.content)];
   }).filter(Boolean);
   return pieces.join('\n').trim();
+}
+
+export function extractAssistantToolCalls(provider, payload) {
+  if (provider?.api_mode !== 'responses') {
+    return (payload?.choices?.[0]?.message?.tool_calls || []).map((call) => ({
+      id: text(call?.id), name: text(call?.function?.name), arguments: call?.function?.arguments || '{}'
+    })).filter((call) => call.name);
+  }
+  const output = Array.isArray(payload?.output) ? payload.output : [];
+  return output.filter((item) => item?.type === 'function_call' || item?.type === 'tool_call').map((call) => ({
+    id: text(call.call_id || call.id), name: text(call.name || call.function?.name), arguments: call.arguments || call.function?.arguments || '{}'
+  })).filter((call) => call.name);
 }
 
 export function upstreamErrorMessage(payload, status) {

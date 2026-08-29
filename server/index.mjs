@@ -9,7 +9,7 @@ import matter from 'gray-matter';
 import { AssistantStateStore } from './state-store.mjs';
 import { SupabaseStateStore } from './supabase-state-store.mjs';
 import { loadAiProviders, normalizeAiProviderDraft, providerCatalog, saveAiProviders, selectAiProvider } from './ai-providers.mjs';
-import { assistantEndpoint, buildAssistantModelRequest, extractAssistantText, upstreamErrorMessage } from './ai-protocol.mjs';
+import { assistantEndpoint, buildAssistantModelRequest, extractAssistantText, extractAssistantToolCalls, upstreamErrorMessage } from './ai-protocol.mjs';
 import { memoryOrganizerPrompt, parseDailyMemoryResult, rawMessagesForDay, searchMemory } from './memory-organizer.mjs';
 import {
   ASSISTANT_TOOL_NAMES,
@@ -658,6 +658,18 @@ function parseAssistantContent(content) {
   };
 }
 
+function parseNaturalAssistantContent(content) {
+  const reply = String(content || '').trim();
+  return { reply: reply || '我在听。', actions: [], memoryCandidates: [] };
+}
+
+function toolDefinitionsForProvider(provider) {
+  if (!provider || provider.api_mode === 'responses' || provider.api_mode === 'chat_completions') {
+    return assistantMcpTools().map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.inputSchema } }));
+  }
+  return [];
+}
+
 async function assistantKnowledgeContext({ enabled = true, projectName = '', projectId = '', query = '', state = null } = {}) {
   if (!enabled) return [];
   const structured = state && query
@@ -689,35 +701,7 @@ function assistantSystemPrompt() {
 
 职责：理解用户自然语言，协助其管理作息、今日计划、任务、项目进度和每日记录。回答自然、简洁、具体。先回应用户真正关心的事，再说明你做了哪些调整及原因。不要假装已经完成未在 actions 中表达的操作。
 
-你必须只输出有效 JSON，不要 Markdown，不要额外文字：
-{
-  "reply": "给用户看的自然中文回复",
-  "actions": [
-    {"type":"set_sleep_time","time":"HH:mm","reason":"..."},
-    {"type":"set_wake_time","time":"HH:mm","reason":"..."},
-    {"type":"set_buffer_minutes","minutes":60,"reason":"..."},
-    {"type":"set_alarm","time":"HH:mm","date":"可选 YYYY-MM-DD","label":"起床提醒","repeat":"none 或 daily","reason":"..."},
-    {"type":"cancel_alarm","alarm_id":"可选闹钟 ID","time":"可选 HH:mm","label":"可选标签","reason":"..."},
-    {"type":"complete_current_task","reason":"..."},
-    {"type":"cancel_task","task":"任务名","reason":"..."},
-    {"type":"cancel_all_tasks","reason":"..."},
-    {"type":"defer_task","task":"任务名","reason":"..."},
-    {"type":"create_task","title":"任务名","estimated_minutes":45,"priority":3,"project":"项目名","due_at":"可选 ISO 时间","reason":"..."},
-    {"type":"start_task_timer","task":"任务名","mode":"stopwatch 或 countdown","target_minutes":45},
-    {"type":"pause_task_timer","task":"任务名"},
-    {"type":"stop_task_timer","task":"任务名"},
-    {"type":"complete_task","task":"任务名"},
-    {"type":"reopen_task","task":"任务名"},
-    {"type":"update_task","task":"任务名","title":"新标题","estimated_minutes":45,"priority":3},
-    {"type":"reorder_tasks","task_ids":["任务 ID"]},
-    {"type":"set_unavailable_period","start":"HH:mm","end":"HH:mm","reason":"..."},
-    {"type":"capture_memory","title":"要沉淀的信息","project":"可选项目","reason":"..."},
-    {"type":"replan_today","reason":"..."}
-  ],
-  "memory_candidates": ["需要用户确认后写入长期记忆的候选"]
-}
-
-可调用工具（actions.type 必须使用以下名称）：
+普通聊天请直接用自然中文回复。需要改变任务、计划、作息、闹钟或记忆时调用对应工具；工具执行后再用自然中文解释结果和原因。仅在提供商不支持工具调用时，才使用兼容 JSON。\n\n可调用工具（actions.type 必须使用以下名称）：
 ${assistantToolPrompt()}
 
 规则：
@@ -766,10 +750,11 @@ async function requestModelText(payload) {
         throw new Error(upstreamErrorMessage(upstreamBody, upstream.status));
       }
       const content = extractAssistantText(provider, upstreamBody);
-      if (!String(content || '').trim()) {
+      const toolCalls = extractAssistantToolCalls(provider, upstreamBody);
+      if (!String(content || '').trim() && !toolCalls.length) {
         throw new Error('AI 返回正文为空。');
       }
-      return { content, attempts: retry + 1 };
+      return { content, raw: upstreamBody, attempts: retry + 1 };
     } catch (error) {
       lastError = error;
       console.error(`AI attempt ${retry + 1}/${maxRetries + 1} failed`, error?.cause?.code || error?.message || error?.name || 'unknown');
@@ -779,8 +764,16 @@ async function requestModelText(payload) {
 }
 
 async function requestAssistantModel(payload) {
-  const { content, attempts } = await requestModelText(payload);
-  return { result: parseAssistantContent(content), attempts };
+  const { content, attempts, raw } = await requestModelText(payload);
+  const calls = extractAssistantToolCalls(payload.provider, raw);
+  const actions = calls.map((call) => {
+    let args = {};
+    try { args = JSON.parse(call.arguments || '{}'); } catch { args = {}; }
+    return { type: call.name, ...args };
+  });
+  if (actions.length) return { result: { reply: String(content || '').trim() || '好的，我来处理。', actions: normalizeActions(actions), memoryCandidates: [] }, attempts };
+  try { return { result: parseAssistantContent(content), attempts }; }
+  catch { return { result: parseNaturalAssistantContent(content), attempts }; }
 }
 
 app.get('/api/assistant/status', (request, response) => {
@@ -877,7 +870,8 @@ app.post('/api/assistant/providers/:id/test', async (request, response, next) =>
       max_retries: 0,
       ...(provider.reasoning_effort ? { reasoning_effort: provider.reasoning_effort } : {}),
       temperature: 0,
-      response_format: { type: 'json_object' },
+      tools: toolDefinitionsForProvider(provider),
+      tool_choice: 'auto',
       messages: [
         { role: 'system', content: '只输出有效 JSON：{"reply":"连接正常","actions":[],"memory_candidates":[]}' },
         { role: 'user', content: '请返回连接正常。' }
@@ -1219,7 +1213,6 @@ async function runDailyMemoryOrganization({ store = stateStore, date = dateStamp
       temperature: 0.1,
       max_retries: 2,
       ...(provider.reasoning_effort ? { reasoning_effort: provider.reasoning_effort } : {}),
-      response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content: '你负责每天整理个人记忆。必须遵守用户数据来源边界并输出 JSON。' },
         { role: 'user', content: prompt }
@@ -1480,7 +1473,8 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         model: provider.model,
         temperature: 0.45,
         ...(provider.reasoning_effort ? { reasoning_effort: provider.reasoning_effort } : {}),
-        response_format: { type: 'json_object' },
+        tools: toolDefinitionsForProvider(provider),
+        tool_choice: 'auto',
         messages: [
           { role: 'system', content: assistantSystemPrompt() },
           { role: 'system', content: `当前对话模式为 ${hydratedThread.mode}，可使用的 Skill：\n${assistantSkillPrompt(hydratedThread.mode)}` },
@@ -1637,3 +1631,7 @@ app.listen(port, '0.0.0.0', () => {
 
 const memoryScheduler = setInterval(() => { void maybeRunAutomaticMemoryOrganization(); }, 30_000);
 if (typeof memoryScheduler.unref === 'function') memoryScheduler.unref();
+
+
+
+
