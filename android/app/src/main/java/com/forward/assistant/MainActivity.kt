@@ -13,6 +13,7 @@ import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -22,6 +23,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -106,6 +108,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
@@ -163,7 +167,13 @@ data class ScheduledPlanItem(
     val deferredByCapacity: Boolean = false
 )
 
-data class ChatMessage(val fromAssistant: Boolean, val text: String)
+data class ChatMessage(val fromAssistant: Boolean, val text: String, val imageData: String? = null)
+
+private fun decodeImageData(data: String?): Bitmap? = runCatching {
+    val encoded = data?.substringAfter(',', "")?.takeIf { it.isNotBlank() } ?: return null
+    val bytes = Base64.decode(encoded, Base64.DEFAULT)
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+}.getOrNull()
 
 data class BreakTimerState(
     val remainingSeconds: Long = 15 * 60L,
@@ -1091,7 +1101,7 @@ private fun ForwardApp(activity: MainActivity) {
             val priorConversation = messages
             val image = pendingImageData
             pendingImageData = null
-            messages = messages + ChatMessage(false, text)
+            messages = messages + ChatMessage(false, text, image)
             input = TextFieldValue()
             aiBusy = true
             scope.launch {
@@ -1889,21 +1899,32 @@ private fun ChatScreen(
                         Icon(Icons.Default.SmartToy, null, tint = Color.White, modifier = Modifier.size(28.dp).clip(RoundedCornerShape(7.dp)).background(Green).padding(6.dp))
                         Spacer(Modifier.width(7.dp))
                     }
-                    Text(
-                        message.text,
-                        color = if (message.fromAssistant) Ink else Color.White,
-                        fontSize = 13.sp,
-                        lineHeight = 21.sp,
+                    Column(
                         modifier = Modifier
                             .widthIn(max = if (message.fromAssistant) 286.dp else 250.dp)
                             .clip(RoundedCornerShape(8.dp))
                             .background(if (message.fromAssistant) Color(0xFFE9EFEA) else Green)
                             .padding(11.dp)
-                    )
+                    ) {
+                        decodeImageData(message.imageData)?.let { bitmap ->
+                            Image(
+                                bitmap = bitmap.asImageBitmap(),
+                                contentDescription = "已发送图片",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.size(150.dp, 110.dp).clip(RoundedCornerShape(6.dp))
+                            )
+                            if (message.text.isNotBlank()) Spacer(Modifier.height(6.dp))
+                        }
+                        if (message.text.isNotBlank()) Text(message.text, color = if (message.fromAssistant) Ink else Color.White, fontSize = 13.sp, lineHeight = 21.sp)
+                    }
                 }
             }
         }
-        if (!imageData.isNullOrBlank()) Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) { Text("已选择图片", color = Green, fontSize = 10.sp); Spacer(Modifier.weight(1f)); TextButton(onClick = onClearImage) { Text("移除", color = Coral, fontSize = 10.sp) } }; Composer(input, onInput, onSend, aiBusy || threadLoading, onGallery, onCamera, imageData)
+        if (!imageData.isNullOrBlank()) Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            decodeImageData(imageData)?.let { bitmap -> Image(bitmap = bitmap.asImageBitmap(), contentDescription = "待发送图片", contentScale = ContentScale.Crop, modifier = Modifier.size(56.dp).clip(RoundedCornerShape(6.dp))) }
+            Spacer(Modifier.width(8.dp)); Text("已选择图片", color = Green, fontSize = 10.sp); Spacer(Modifier.weight(1f)); TextButton(onClick = onClearImage) { Text("移除", color = Coral, fontSize = 10.sp) }
+        }
+        Composer(input, onInput, onSend, aiBusy || threadLoading, onGallery, onCamera, imageData)
     }
 
     if (showHistory) {
