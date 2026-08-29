@@ -865,6 +865,11 @@ private fun ForwardApp(activity: MainActivity) {
             breakTimer = BreakTimerState()
         }
 
+        fun refreshThreads() { scope.launch { runCatching { gatewayListThreads(activity) }.onSuccess { threads = it }.onFailure { snackbar.showSnackbar(it.message ?: "刷新历史失败") } } }
+        fun deleteThread(thread: ConversationThread) { scope.launch { runCatching { gatewayDeleteThread(activity, thread.id) }.onSuccess { refreshThreads(); if (remoteThreadId == thread.id) { remoteThreadId = null; messages = emptyList() } }.onFailure { snackbar.showSnackbar(it.message ?: "删除对话失败") } } }
+        fun setThreadLocked(thread: ConversationThread, locked: Boolean) { scope.launch { runCatching { gatewaySetThreadLocked(activity, thread.id, locked) }.onSuccess { saved -> threads = threads.map { if (it.id == saved.id) saved else it } }.onFailure { snackbar.showSnackbar(it.message ?: "更新锁定状态失败") } } }
+        fun deleteThreads(selected: List<ConversationThread>) { scope.launch { runCatching { gatewayDeleteThreads(activity, selected.map { it.id }) }.onSuccess { (_, locked) -> refreshThreads(); snackbar.showSnackbar(if (locked.isEmpty()) "已删除 ${selected.size} 段对话" else "有 ${locked.size} 段对话已锁定，未删除") }.onFailure { snackbar.showSnackbar(it.message ?: "批量删除失败") } } }
+
         fun createProject(name: String, kind: String, description: String, priority: Int, dueAt: String?) {
             scope.launch {
                 runCatching { gatewayCreateProject(activity, name, kind, description, priority, dueAt) }
@@ -1175,6 +1180,9 @@ private fun ForwardApp(activity: MainActivity) {
                     onLoadThread = ::loadThread,
                     onStartConversation = ::startConversation,
                     onUpdateConversationOptions = ::updateConversationOptions
+                    ,onDeleteThread = ::deleteThread,
+                    onSetThreadLocked = ::setThreadLocked,
+                    onDeleteThreads = ::deleteThreads
                 )
                 2 -> MemoryScreen(
                     padding = padding,
@@ -1780,6 +1788,9 @@ private fun ChatScreen(
     onLoadThread: (ConversationThread) -> Unit,
     onStartConversation: (ConversationOptions) -> Unit,
     onUpdateConversationOptions: (ConversationOptions) -> Unit,
+    onDeleteThread: (ConversationThread) -> Unit = {},
+    onSetThreadLocked: (ConversationThread, Boolean) -> Unit = { _, _ -> },
+    onDeleteThreads: (List<ConversationThread>) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val listState = rememberLazyListState()
@@ -1870,7 +1881,10 @@ private fun ChatScreen(
             threads = threads,
             busy = threadLoading || aiBusy,
             onDismiss = { showHistory = false },
-            onSelect = { thread -> showHistory = false; onLoadThread(thread) }
+            onSelect = { thread -> showHistory = false; onLoadThread(thread) },
+            onDeleteThread = onDeleteThread,
+            onSetThreadLocked = onSetThreadLocked,
+            onDeleteThreads = onDeleteThreads
         )
     }
     if (showNewConversation) {
@@ -2013,8 +2027,13 @@ private fun ConversationHistoryDialog(
     threads: List<ConversationThread>,
     busy: Boolean,
     onDismiss: () -> Unit,
-    onSelect: (ConversationThread) -> Unit
+    onSelect: (ConversationThread) -> Unit,
+    onDeleteThread: (ConversationThread) -> Unit = {},
+    onSetThreadLocked: (ConversationThread, Boolean) -> Unit = { _, _ -> },
+    onDeleteThreads: (List<ConversationThread>) -> Unit = {}
 ) {
+    var selected by remember { mutableStateOf(setOf<String>()) }
+    var confirmDelete by remember { mutableStateOf<List<ConversationThread>?>(null) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("历史对话", color = Green, fontWeight = FontWeight.Bold) },
@@ -2025,14 +2044,21 @@ private fun ConversationHistoryDialog(
                 LazyColumn(Modifier.heightIn(max = 420.dp)) {
                     items(threads) { thread ->
                         Card(
-                            Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable(enabled = !busy) { onSelect(thread) },
+                            Modifier.fillMaxWidth().padding(vertical = 4.dp),
                             colors = CardDefaults.cardColors(containerColor = if (thread.mode == "temporary") Color(0xFFFFF7E9) else Color(0xFFF2F5F1)),
                             shape = RoundedCornerShape(9.dp)
                         ) {
                             Column(Modifier.padding(12.dp)) {
                                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Checkbox(checked = thread.id in selected, onCheckedChange = { checked -> selected = if (checked) selected + thread.id else selected - thread.id }, enabled = !busy, modifier = Modifier.size(28.dp))
                                     Text(conversationModeLabel(thread.mode), color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                                     Text(formatThreadTime(thread.updatedAt), color = Muted, fontSize = 10.sp)
+                                }
+                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                    TextButton(onClick = { if (!busy) onSelect(thread) }, contentPadding = PaddingValues(0.dp)) { Text("打开", color = Green, fontSize = 10.sp) }
+                                    Spacer(Modifier.weight(1f))
+                                    TextButton(onClick = { onSetThreadLocked(thread, !thread.locked) }, contentPadding = PaddingValues(horizontal = 5.dp)) { Text(if (thread.locked) "解锁" else "锁定", color = Muted, fontSize = 10.sp) }
+                                    TextButton(onClick = { if (!thread.locked) onDeleteThread(thread) }, enabled = !thread.locked, contentPadding = PaddingValues(horizontal = 5.dp)) { Text("删除", color = if (thread.locked) Muted else Coral, fontSize = 10.sp) }
                                 }
                                 thread.projectName.takeIf { it.isNotBlank() }?.let { Text(it, color = Color(0xFF476F66), fontSize = 11.sp, modifier = Modifier.padding(top = 3.dp)) }
                                 Text(thread.preview.ifBlank { "尚未发送消息" }, color = Muted, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp))
@@ -2043,8 +2069,9 @@ private fun ConversationHistoryDialog(
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭", color = Green) } }
+        confirmButton = { Row { if (selected.isNotEmpty()) TextButton(onClick = { confirmDelete = threads.filter { it.id in selected } }) { Text("删除所选", color = Coral) }; TextButton(onClick = onDismiss) { Text("关闭", color = Green) } } }
     )
+    confirmDelete?.let { targets -> AlertDialog(onDismissRequest = { confirmDelete = null }, title = { Text("确认删除", color = Green) }, text = { Text("将删除 ${targets.size} 段对话；已锁定的对话会保留。", color = Muted) }, confirmButton = { TextButton(onClick = { onDeleteThreads(targets); selected = emptySet(); confirmDelete = null }) { Text("确定", color = Coral) } }, dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text("取消", color = Muted) } }) }
 }
 
 @Composable

@@ -199,7 +199,10 @@ export function repairAssistantState(source) {
     })),
     time_sessions: Array.isArray(state.time_sessions) ? state.time_sessions : [],
     unavailable_blocks: Array.isArray(state.unavailable_blocks) ? state.unavailable_blocks : [],
-    threads: Array.isArray(state.threads) ? state.threads : [],
+    threads: (Array.isArray(state.threads) ? state.threads : []).map((thread) => ({
+      ...thread,
+      locked: thread.locked === true
+    })),
     messages: Array.isArray(state.messages) ? state.messages : [],
     memory_items: Array.isArray(state.memory_items) ? state.memory_items : [],
     daily_memory_summaries: Array.isArray(state.daily_memory_summaries) ? state.daily_memory_summaries : [],
@@ -504,7 +507,8 @@ export class AssistantStateStore {
         save_full_conversation: options.save_full_conversation !== false,
         allow_memory_distillation: options.allow_memory_distillation !== false,
         created_at: isoAt(current.date, current.time),
-        updated_at: isoAt(current.date, current.time)
+        updated_at: isoAt(current.date, current.time),
+        locked: false
       };
       if (thread.mode !== 'temporary' || thread.save_full_conversation) state.threads.push(thread);
       return thread;
@@ -542,7 +546,16 @@ export class AssistantStateStore {
   }
 
   async listThreads(limit = 60) {
-    const state = await this.read();
+    const state = await this.mutate((draft) => {
+      const messageCounts = new Map();
+      for (const message of draft.messages || []) messageCounts.set(message.thread_id, (messageCounts.get(message.thread_id) || 0) + 1);
+      const emptyIds = new Set((draft.threads || []).filter((thread) => !thread.locked && (messageCounts.get(thread.id) || 0) === 0).map((thread) => thread.id));
+      if (emptyIds.size) {
+        draft.threads = draft.threads.filter((thread) => !emptyIds.has(thread.id));
+        draft.messages = draft.messages.filter((message) => !emptyIds.has(message.thread_id));
+      }
+      return draft;
+    });
     return state.threads
       .slice()
       .sort((left, right) => right.updated_at.localeCompare(left.updated_at))
@@ -579,6 +592,7 @@ export class AssistantStateStore {
       for (const key of ['memory_scope', 'save_full_conversation', 'allow_memory_distillation']) {
         if (typeof options[key] === 'boolean') thread[key] = options[key];
       }
+      if (typeof options.locked === 'boolean') thread.locked = options.locked;
       thread.updated_at = isoAt(nowParts().date, nowParts().time);
       return thread;
     });
@@ -731,6 +745,29 @@ export class AssistantStateStore {
       }
       task.updated_at = isoAt(nowParts().date, nowParts().time);
       return task;
+    });
+  }
+
+  async deleteThread(threadId) {
+    return this.mutate((state) => {
+      const thread = state.threads.find((item) => item.id === threadId);
+      if (!thread) return { ok: false, reason: '没有找到这段对话。' };
+      if (thread.locked) return { ok: false, locked: true, reason: '这段对话已锁定，请先解锁后再删除。' };
+      state.threads = state.threads.filter((item) => item.id !== threadId);
+      state.messages = state.messages.filter((item) => item.thread_id !== threadId);
+      return { ok: true, thread_id: threadId };
+    });
+  }
+
+  async deleteThreads(threadIds = []) {
+    const ids = new Set(Array.isArray(threadIds) ? threadIds.filter(Boolean) : []);
+    return this.mutate((state) => {
+      const locked = state.threads.filter((thread) => ids.has(thread.id) && thread.locked).map((thread) => thread.id);
+      const deleted = state.threads.filter((thread) => ids.has(thread.id) && !thread.locked).map((thread) => thread.id);
+      const deletedSet = new Set(deleted);
+      state.threads = state.threads.filter((thread) => !deletedSet.has(thread.id));
+      state.messages = state.messages.filter((message) => !deletedSet.has(message.thread_id));
+      return { ok: locked.length === 0, deleted, locked, reason: locked.length ? '部分对话已锁定，未删除。' : '对话已删除。' };
     });
   }
 

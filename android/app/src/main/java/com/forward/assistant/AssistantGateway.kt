@@ -91,7 +91,8 @@ data class ConversationThread(
     val allowMemoryDistillation: Boolean,
     val preview: String,
     val updatedAt: String,
-    val messageCount: Int
+    val messageCount: Int,
+    val locked: Boolean = false
 )
 
 data class RemoteThreadDetail(val thread: ConversationThread, val messages: List<ChatMessage>)
@@ -177,7 +178,8 @@ private fun remoteThread(item: JSONObject): ConversationThread = ConversationThr
     allowMemoryDistillation = item.optBoolean("allow_memory_distillation", true),
     preview = item.optString("preview"),
     updatedAt = item.optString("updated_at"),
-    messageCount = item.optInt("message_count")
+    messageCount = item.optInt("message_count"),
+    locked = item.optBoolean("locked", false)
 )
 
 private fun optionsJson(options: ConversationOptions): JSONObject = JSONObject().apply {
@@ -366,6 +368,29 @@ suspend fun gatewayInitializeCloud(context: Context): RemoteState = kotlinx.coro
     try {
         connection.outputStream.use { it.write("{}".toByteArray(Charsets.UTF_8)) }
         parseRemoteState(connection.readJsonOrThrow("初始化云端同步失败").optJSONObject("state"))
+    } finally { connection.disconnect() }
+}
+
+suspend fun gatewayDeleteThread(context: Context, threadId: String): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val connection = gatewayConnection(context, "/api/assistant/threads/${threadId.trim()}", "DELETE")
+    try { connection.readJsonOrThrow("删除对话失败"); true } finally { connection.disconnect() }
+}
+
+suspend fun gatewaySetThreadLocked(context: Context, threadId: String, locked: Boolean): ConversationThread = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val request = JSONObject().put("locked", locked).toString().toByteArray(Charsets.UTF_8)
+    val connection = gatewayConnection(context, "/api/assistant/threads/${threadId.trim()}", "PATCH", request)
+    try { connection.outputStream.use { it.write(request) }; remoteThread(connection.readJsonOrThrow("更新对话锁定状态失败").optJSONObject("thread") ?: error("服务没有返回对话")) } finally { connection.disconnect() }
+}
+
+suspend fun gatewayDeleteThreads(context: Context, threadIds: List<String>): Pair<List<String>, List<String>> = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val request = JSONObject().put("thread_ids", JSONArray(threadIds)).toString().toByteArray(Charsets.UTF_8)
+    val connection = gatewayConnection(context, "/api/assistant/threads/bulk-delete", "POST", request)
+    try {
+        connection.outputStream.use { it.write(request) }
+        val json = connection.readJsonOrThrow("批量删除对话失败")
+        val deleted = json.optJSONArray("deleted")?.let { a -> (0 until a.length()).map { a.optString(it) } }.orEmpty()
+        val locked = json.optJSONArray("locked")?.let { a -> (0 until a.length()).map { a.optString(it) } }.orEmpty()
+        deleted to locked
     } finally { connection.disconnect() }
 }
 

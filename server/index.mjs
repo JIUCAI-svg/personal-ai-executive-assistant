@@ -1588,6 +1588,23 @@ app.get('/download/forward.apk', (_request, response) => {
   response.download(androidApkPath, 'forward-assistant-v0.5.8-click-edit-double-complete-debug.apk');
 });
 
+app.delete('/api/assistant/threads/:id', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    const result = await store.deleteThread(stringValue(request.params.id, 80));
+    if (!result.ok) return response.status(result.locked ? 423 : 404).json({ error: result.reason, locked: Boolean(result.locked) });
+    response.json({ ok: true, source, ...result });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/assistant/threads/bulk-delete', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    const result = await store.deleteThreads(request.body?.thread_ids);
+    response.json({ ok: result.ok, source, ...result });
+  } catch (error) { next(error); }
+});
+
 const distPath = path.join(appRoot, 'dist');
 if (existsSync(distPath)) {
   app.use(express.static(distPath));
