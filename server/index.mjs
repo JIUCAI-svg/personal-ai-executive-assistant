@@ -61,7 +61,34 @@ const clients = new Set();
 const stateStore = new AssistantStateStore(vaultPath);
 let revision = Date.now();
 
-app.use(express.json({ limit: '200kb' }));
+// Image attachments are sent as data URLs. Keep a practical per-request cap so
+// camera/gallery uploads are not rejected by the JSON parser before reaching
+// the multimodal provider.
+app.use(express.json({ limit: '12mb' }));
+
+function normalizeImageAttachments(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 4).map((entry, index) => {
+    const dataUrl = typeof entry === 'string'
+      ? entry
+      : String(entry?.data_url || entry?.dataUrl || entry?.url || '').trim();
+    if (!dataUrl || (!/^data:image\//i.test(dataUrl) && !/^https?:\/\//i.test(dataUrl))) return null;
+    return {
+      url: dataUrl,
+      name: typeof entry === 'object' ? stringValue(entry.name, 160) : `image-${index + 1}`,
+      type: typeof entry === 'object' ? stringValue(entry.type, 80) : ''
+    };
+  }).filter(Boolean);
+}
+
+function multimodalUserContent(message, attachments) {
+  const parts = [];
+  if (message) parts.push({ type: 'text', text: message });
+  for (const attachment of attachments) {
+    parts.push({ type: 'image_url', image_url: { url: attachment.url } });
+  }
+  return parts.length ? parts : message;
+}
 
 // All assistant state endpoints are private when exposed through the public
 // reverse proxy. Same-origin web requests, local development, and Android's
@@ -1367,8 +1394,9 @@ app.post('/api/assistant/respond', async (request, response, next) => {
     if (!assistantAuthorized(request, response)) return;
     const { store, source } = await requestStateStore(request);
     const body = request.body || {};
-    const message = stringValue(body.message, 4000);
-    if (!message) return response.status(400).json({ error: '需要一条消息。' });
+    const attachments = normalizeImageAttachments(body.attachments);
+    const message = stringValue(body.message, 4000) || (attachments.length ? '请查看我上传的图片。' : '');
+    if (!message && !attachments.length) return response.status(400).json({ error: '需要一条消息或图片。' });
     const provider = selectAiProvider(
       aiProviderRegistry,
       body.provider_id || body.provider,
@@ -1501,7 +1529,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
           { role: 'system', content: `当前对话模式为 ${hydratedThread.mode}，可使用的 Skill：\n${assistantSkillPrompt(hydratedThread.mode)}` },
           { role: 'system', content: `当前可用上下文（只使用其中真实内容）：${contextText}` },
           ...conversation,
-          { role: 'user', content: message }
+          { role: 'user', content: multimodalUserContent(message, attachments) }
         ]
       });
       const normalizedResult = enforceUserIntent(result, message, intentContext);

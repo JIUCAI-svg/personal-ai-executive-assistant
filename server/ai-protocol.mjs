@@ -32,14 +32,22 @@ export function buildAssistantModelRequest(provider, request = {}) {
   return {
     model,
     input: messages
-      .filter((message) => text(message?.content))
+      .filter((message) => text(message?.content) || Array.isArray(message?.content))
       .map((message) => {
         const role = normalizeRole(message.role);
-        // Responses distinguishes input content from prior assistant output.
-        // Relays that enforce the schema reject assistant history as input_text.
+        const content = Array.isArray(message.content)
+          ? message.content.map((part) => {
+            if (part?.type === 'image_url') {
+              const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+              return { type: 'input_image', image_url: url };
+            }
+            const value = text(part?.text || part?.output_text || part?.content);
+            return value ? { type: role === 'assistant' ? 'output_text' : 'input_text', text: value } : null;
+          }).filter(Boolean)
+          : [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: text(message.content) }];
         return {
           role,
-          content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: text(message.content) }]
+          content
         };
       }),
     ...(Array.isArray(request.tools) && request.tools.length ? {} : { text: { format: { type: 'json_object' } } }),
