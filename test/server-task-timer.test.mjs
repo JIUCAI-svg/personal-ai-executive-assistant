@@ -56,8 +56,10 @@ test('task update and reorder persist', async () => {
   let result = await store.executeActions([{ type: 'update_task', task_id: first.id, title: '更新后的任务', estimated_minutes: 30, priority: 4 }]);
   assert.equal(result.results[0].task.title, '更新后的任务');
   result = await store.executeActions([{ type: 'update_task', task_id: first.id, estimated_minutes: 120 }]);
-  const updatedPlanItem = [...result.plan.scheduled, ...result.plan.deferred].find((item) => item.id === first.id);
-  assert.equal(updatedPlanItem.estimated_minutes, 120);
+  // A real sleep window can make the current plan intentionally empty. The
+  // task mutation itself must still persist regardless of the current clock.
+  const updatedTask = (await store.listTasks()).find((item) => item.id === first.id);
+  assert.equal(updatedTask.estimated_minutes, 120);
   result = await store.executeActions([{ type: 'reorder_tasks', task_ids: [second.id, first.id] }]);
   const tasks = await store.listTasks();
   assert.equal(tasks[0].id, second.id);

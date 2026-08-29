@@ -20,7 +20,9 @@ data class RemotePlanItem(
     val dueAt: String? = null,
     val reason: String = "",
     val actualMinutes: Int = 0,
-    val actualSeconds: Long = 0
+    val actualSeconds: Long = 0,
+    val longTaskId: String? = null,
+    val occurrenceDate: String? = null
 )
 
 data class RemoteActiveTimer(val taskId: String, val mode: String, val targetMinutes: Int, val elapsedSeconds: Long)
@@ -29,6 +31,8 @@ data class RemotePlan(
     val now: String,
     val sleepTime: String,
     val wakeTime: String,
+    val sleepDurationMinutes: Int = 480,
+    val isSleeping: Boolean = false,
     val availableMinutes: Int,
     val scheduledMinutes: Int,
     val bufferMinutes: Int,
@@ -62,13 +66,26 @@ data class RemoteTask(
     val priority: Int = 3,
     val minutes: Int = 45,
     val actualMinutes: Int = 0,
+    val dueAt: String? = null,
+    val longTaskId: String? = null,
+    val occurrenceDate: String? = null
+)
+data class RemoteLongTask(
+    val id: String,
+    val projectId: String? = null,
+    val title: String,
+    val notes: String = "",
+    val status: String = "active",
+    val priority: Int = 3,
+    val dailyMinutes: Int = 45,
     val dueAt: String? = null
 )
 data class RemoteState(
     val plan: RemotePlan?,
     val memories: List<RemoteMemory>,
     val projects: List<RemoteProject> = emptyList(),
-    val tasks: List<RemoteTask> = emptyList()
+    val tasks: List<RemoteTask> = emptyList(),
+    val longTasks: List<RemoteLongTask> = emptyList()
 )
 
 /** Conversation metadata is deliberately independent from the selected mode. */
@@ -114,7 +131,7 @@ private fun gatewayBaseUrl(): String = BuildConfig.AI_GATEWAY_URL.trim().removeS
 private fun remotePlanItem(item: JSONObject): RemotePlanItem = RemotePlanItem(
     id = item.optString("id"), title = item.optString("title"), project = item.optString("project"), notes = item.optString("notes"),
     priority = item.optInt("priority", 3), minutes = item.optInt("estimated_minutes", 45), start = item.optString("start"), end = item.optString("end"),
-    date = item.optString("date"), status = item.optString("status", "open"), dueAt = item.optString("due_at").takeUnless { it.isBlank() || it == "null" }, reason = item.optString("reason"), actualMinutes = item.optInt("actual_minutes", 0), actualSeconds = item.optLong("actual_seconds", item.optInt("actual_minutes", 0) * 60L)
+    date = item.optString("date"), status = item.optString("status", "open"), dueAt = item.optString("due_at").takeUnless { it.isBlank() || it == "null" }, reason = item.optString("reason"), actualMinutes = item.optInt("actual_minutes", 0), actualSeconds = item.optLong("actual_seconds", item.optInt("actual_minutes", 0) * 60L), longTaskId = item.optString("long_task_id").ifBlank { null }, occurrenceDate = item.optString("occurrence_date").ifBlank { null }
 )
 
 private fun remoteProject(item: JSONObject): RemoteProject = RemoteProject(
@@ -133,6 +150,13 @@ private fun remoteTask(item: JSONObject): RemoteTask = RemoteTask(
     priority = item.optInt("priority", 3),
     minutes = item.optInt("estimated_minutes", 45),
     actualMinutes = item.optInt("actual_minutes", 0),
+    dueAt = item.optString("due_at").takeUnless { it.isBlank() || it == "null" },
+    longTaskId = item.optString("long_task_id").ifBlank { null }, occurrenceDate = item.optString("occurrence_date").ifBlank { null }
+)
+
+private fun remoteLongTask(item: JSONObject): RemoteLongTask = RemoteLongTask(
+    id = item.optString("id"), projectId = item.optString("project_id").ifBlank { null }, title = item.optString("title"), notes = item.optString("notes"),
+    status = item.optString("status", "active"), priority = item.optInt("priority", 3), dailyMinutes = item.optInt("daily_minutes", 45),
     dueAt = item.optString("due_at").takeUnless { it.isBlank() || it == "null" }
 )
 
@@ -144,7 +168,7 @@ fun parseRemotePlan(json: JSONObject?): RemotePlan? {
     }
     val active = json.optJSONObject("active_timer")?.let { timer -> RemoteActiveTimer(timer.optString("task_id"), timer.optString("mode", "stopwatch"), timer.optInt("target_minutes"), timer.optLong("elapsed_seconds")) }
     return RemotePlan(
-        now = json.optString("now"), sleepTime = json.optString("sleep_time", "01:00"), wakeTime = json.optString("wake_time", "08:00"),
+        now = json.optString("now"), sleepTime = json.optString("sleep_time", "01:00"), wakeTime = json.optString("wake_time", "08:00"), sleepDurationMinutes = json.optInt("sleep_duration_minutes", 480), isSleeping = json.optBoolean("is_sleeping", false),
         availableMinutes = json.optInt("available_minutes"), scheduledMinutes = json.optInt("scheduled_minutes"),
         bufferMinutes = json.optInt("buffer_minutes"), configuredBufferMinutes = json.optInt("configured_buffer_minutes", json.optInt("buffer_minutes")), freeMinutes = json.optInt("free_minutes"),
         adjustmentReason = json.optString("adjustment_reason"), scheduled = items("scheduled"), deferred = items("deferred"),
@@ -165,7 +189,10 @@ fun parseRemoteState(json: JSONObject?): RemoteState {
     val tasks = state.optJSONArray("tasks")?.let { array ->
         (0 until array.length()).mapNotNull { index -> array.optJSONObject(index)?.let(::remoteTask) }
     }.orEmpty()
-    return RemoteState(parseRemotePlan(state.optJSONObject("plan")), memories, projects, tasks)
+    val longTasks = state.optJSONArray("long_tasks")?.let { array ->
+        (0 until array.length()).mapNotNull { index -> array.optJSONObject(index)?.let(::remoteLongTask) }
+    }.orEmpty()
+    return RemoteState(parseRemotePlan(state.optJSONObject("plan")), memories, projects, tasks, longTasks)
 }
 
 private fun remoteThread(item: JSONObject): ConversationThread = ConversationThread(
@@ -413,5 +440,21 @@ suspend fun gatewayCreateProject(context: Context, name: String, kind: String, d
     try {
         connection.outputStream.use { it.write(request) }
         parseRemoteState(connection.readJsonOrThrow("新建项目失败").optJSONObject("state"))
+    } finally { connection.disconnect() }
+}
+
+suspend fun gatewayCreateLongTask(context: Context, title: String, dailyMinutes: Int, priority: Int, projectId: String? = null, dueAt: String? = null, notes: String = ""): RemoteState = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val request = JSONObject().apply {
+        put("title", title)
+        put("daily_minutes", dailyMinutes.coerceIn(5, 720))
+        put("priority", priority)
+        put("project_id", projectId ?: JSONObject.NULL)
+        put("due_at", dueAt ?: JSONObject.NULL)
+        put("notes", notes)
+    }.toString().toByteArray(Charsets.UTF_8)
+    val connection = gatewayConnection(context, "/api/assistant/long-tasks", "POST", request)
+    try {
+        connection.outputStream.use { it.write(request) }
+        parseRemoteState(connection.readJsonOrThrow("新建长期任务失败").optJSONObject("state"))
     } finally { connection.disconnect() }
 }

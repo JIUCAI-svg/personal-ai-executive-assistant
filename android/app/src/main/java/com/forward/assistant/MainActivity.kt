@@ -726,6 +726,7 @@ private fun ForwardApp(activity: MainActivity) {
         var memoryStatus by remember { mutableStateOf<MemoryRunStatus?>(null) }
         var remoteProjects by remember { mutableStateOf(emptyList<RemoteProject>()) }
         var remoteTasks by remember { mutableStateOf(emptyList<RemoteTask>()) }
+        var remoteLongTasks by remember { mutableStateOf(emptyList<RemoteLongTask>()) }
         var remoteThreadId by remember { mutableStateOf<String?>(null) }
         var conversationOptions by remember { mutableStateOf(defaultConversationOptions("assistant")) }
         var threads by remember { mutableStateOf(emptyList<ConversationThread>()) }
@@ -765,6 +766,7 @@ private fun ForwardApp(activity: MainActivity) {
                 remoteMemories = state.memories
                 remoteProjects = state.projects
                 remoteTasks = state.tasks
+                remoteLongTasks = state.longTasks
                 runCatching { gatewayMemoryStatus(activity) }.onSuccess { memoryStatus = it }
                 parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
                 parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
@@ -804,6 +806,7 @@ private fun ForwardApp(activity: MainActivity) {
                         remoteMemories = state.memories
                         remoteProjects = state.projects
                         remoteTasks = state.tasks
+                        remoteLongTasks = state.longTasks
                         parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
                         parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
                     }
@@ -963,6 +966,20 @@ private fun ForwardApp(activity: MainActivity) {
                     .put("reason", "用户在移动端手动新建任务"))
             }.onSuccess { state -> remotePlan = state.plan; remoteProjects = state.projects; remoteTasks = state.tasks }
                 .onFailure { snackbar.showSnackbar(it.message ?: "新建任务失败") } }
+        }
+
+        fun createLongTask(title: String, minutes: Int, priority: Int, projectId: String? = null) {
+            scope.launch {
+                runCatching { gatewayCreateLongTask(activity, title, minutes, priority, projectId) }
+                    .onSuccess { state ->
+                        remotePlan = state.plan
+                        remoteProjects = state.projects
+                        remoteTasks = state.tasks
+                        remoteLongTasks = state.longTasks
+                        snackbar.showSnackbar("长期任务已创建，今天的执行项已加入计划")
+                    }
+                    .onFailure { snackbar.showSnackbar(it.message ?: "新建长期任务失败") }
+            }
         }
 
         fun reorderTasks(taskIds: List<String>) {
@@ -1188,10 +1205,10 @@ private fun ForwardApp(activity: MainActivity) {
             }
         ) { padding ->
             when (tab) {
-                0 -> TodayScreen(padding, now, sleepTime, currentDone, unavailablePeriod, breakTimer, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), remotePlan, remoteProjects, { showProjects = true }, ::completeTask, ::startCurrentTimer, ::pauseCurrentTimer, { breakTimer = breakTimer?.copy(running = !breakTimer!!.running) }, { breakTimer = null; currentDone = false }, ::reopenTask, ::editTask, ::removeTask, ::createTask, { parent, title, minutes, priority ->
+                0 -> TodayScreen(padding, now, sleepTime, currentDone, unavailablePeriod, breakTimer, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), remotePlan, remoteProjects, remoteLongTasks, { showProjects = true }, ::completeTask, ::startCurrentTimer, ::pauseCurrentTimer, { breakTimer = breakTimer?.copy(running = !breakTimer!!.running) }, { breakTimer = null; currentDone = false }, ::reopenTask, ::editTask, ::removeTask, ::createTask, { parent, title, minutes, priority ->
                     val projectId = remoteProjects.firstOrNull { it.name == parent.project }?.id
                     createTask(title, minutes, priority, projectId, parent.id)
-                }, ::completeSpecificTask, ::reorderTasks, ::sendMessage, input, { value -> input = value }, aiBusy)
+                }, ::completeSpecificTask, ::reorderTasks, ::sendMessage, input, { value -> input = value }, aiBusy, ::createLongTask)
                 1 -> ChatScreen(
                     padding = padding,
                     messages = messages,
@@ -1437,6 +1454,7 @@ private fun TodayScreen(
     plan: List<PlanItem>,
     remotePlan: RemotePlan?,
     remoteProjects: List<RemoteProject>,
+    remoteLongTasks: List<RemoteLongTask>,
     onShowProjects: () -> Unit,
     completeTask: () -> Unit,
     startTimer: () -> Unit,
@@ -1453,11 +1471,13 @@ private fun TodayScreen(
     sendMessage: () -> Unit,
     input: TextFieldValue,
     onInput: (TextFieldValue) -> Unit,
-    aiBusy: Boolean
+    aiBusy: Boolean,
+    createLongTask: (String, Int, Int, String?) -> Unit
 ) {
     var editingTask by remember { mutableStateOf<RemotePlanItem?>(null) }
     var creatingTask by remember { mutableStateOf(false) }
     var creatingSubtask by remember { mutableStateOf<RemotePlanItem?>(null) }
+    var creatingLongTask by remember { mutableStateOf(false) }
     var createTitle by remember { mutableStateOf("") }
     var createMinutes by remember { mutableStateOf("45") }
     var createPriority by remember { mutableStateOf("3") }
@@ -1516,7 +1536,7 @@ private fun TodayScreen(
         item { Column(Modifier.padding(horizontal = 20.dp, vertical = 18.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) { Box(Modifier.size(7.dp).clip(CircleShape).background(Coral)); Spacer(Modifier.width(7.dp)); Text(dateLabel(now.toLocalDate()), color = Muted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
             Spacer(Modifier.height(10.dp)); Text("今天，先把最重要的事做下去。", color = Green, fontSize = 26.sp, fontWeight = FontWeight.Bold, lineHeight = 34.sp)
-            Spacer(Modifier.height(6.dp)); Text("现在 $clock · 今天排到 ${remotePlan?.sleepTime ?: formatClock(sleepTime)} · 还可用 ${formatDuration(availableMinutes)}", color = Muted, fontSize = 11.sp)
+            Spacer(Modifier.height(6.dp)); Text(if (remotePlan?.isSleeping == true) "现在 $clock · 正在睡眠时段 · ${remotePlan?.wakeTime.orEmpty()} 后恢复安排" else "现在 $clock · 今天排到 ${remotePlan?.sleepTime ?: formatClock(sleepTime)} · 还可用 ${formatDuration(availableMinutes)}", color = Muted, fontSize = 11.sp)
             if (remoteProjects.isNotEmpty()) {
                 Spacer(Modifier.height(12.dp))
                 val lead = remoteProjects.maxByOrNull { it.priority }
@@ -1530,6 +1550,7 @@ private fun TodayScreen(
             }
         } }
         item { CurrentTaskCard(currentItem, currentDone, breakTimer, remotePlan?.completed?.firstOrNull()?.title, remotePlan?.activeTimer, timerSeconds, completeTask, startTimer, pauseTimer, toggleBreak, skipBreak) }
+        item { Card(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFF2F5F1)), shape = RoundedCornerShape(9.dp)) { Row(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("长期推进", color = Green, fontSize = 12.sp, fontWeight = FontWeight.SemiBold); Text("${remoteLongTasks.count { it.status == "active" }} 项进行中 · 每个计划日生成独立执行项", color = Muted, fontSize = 10.sp) }; TextButton(onClick = { creatingLongTask = true }, contentPadding = PaddingValues(horizontal = 4.dp)) { Text("新建", color = Green, fontSize = 11.sp) } } } }
         item { Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 15.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text("今日动态计划", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.Bold); Row(verticalAlignment = Alignment.CenterVertically) { Text("现在 $clock", color = Muted, fontSize = 10.sp); TextButton(onClick = { creatingTask = true; createTitle = ""; createMinutes = "45"; createPriority = "3" }, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)) { Icon(Icons.Default.Add, null, tint = Green, modifier = Modifier.size(16.dp)); Text("新建", color = Green, fontSize = 11.sp) } } } }
         item { BudgetRow(scheduledMinutes, bufferMinutes, freeMinutes) }
         // Some legacy/local tasks may not have an id yet; keep LazyColumn keys unique
@@ -1674,6 +1695,44 @@ private fun TodayScreen(
             dismissButton = { TextButton(onClick = { creatingTask = false }) { Text("取消", color = Muted) } }
         )
     }
+    if (creatingLongTask) {
+        CreateLongTaskDialog(
+            projects = remoteProjects,
+            onDismiss = { creatingLongTask = false },
+            onCreate = { title, minutes, priority, projectId ->
+                creatingLongTask = false
+                createLongTask(title, minutes, priority, projectId)
+            }
+        )
+    }
+}
+
+@Composable
+private fun CreateLongTaskDialog(
+    projects: List<RemoteProject>,
+    onDismiss: () -> Unit,
+    onCreate: (String, Int, Int, String?) -> Unit
+) {
+    var title by remember { mutableStateOf("") }
+    var minutes by remember { mutableStateOf("45") }
+    var priority by remember { mutableStateOf(3) }
+    var projectId by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("新建长期任务", color = Green, fontWeight = FontWeight.Bold) },
+        text = { Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Text("每天生成一条可计时、可复盘的执行项；完成今天不会结束主任务。", color = Muted, fontSize = 11.sp, lineHeight = 16.sp)
+            OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("长期任务名称") }, singleLine = true)
+            OutlinedTextField(value = minutes, onValueChange = { minutes = it.filter(Char::isDigit) }, label = { Text("每天预计分钟") }, singleLine = true)
+            if (projects.isNotEmpty()) {
+                Text("所属项目", color = Muted, fontSize = 11.sp)
+                projects.take(4).forEach { project -> TextButton(onClick = { projectId = project.id }) { Text(if (projectId == project.id) "✓ ${project.name}" else project.name, color = if (projectId == project.id) Green else Muted, fontSize = 10.sp) } }
+            }
+            Row { listOf(1 to "低", 3 to "中", 5 to "高").forEach { (value, label) -> TextButton(onClick = { priority = value }) { Text(if (priority == value) "✓ $label" else label, color = if (priority == value) Green else Muted) } } }
+        } },
+        confirmButton = { TextButton(onClick = { if (title.isNotBlank()) onCreate(title.trim(), minutes.toIntOrNull()?.coerceIn(5, 720) ?: 45, priority, projectId.ifBlank { null }) }) { Text("创建", color = Green) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消", color = Muted) } }
+    )
 }
 
 @Composable
@@ -1924,6 +1983,7 @@ private fun ChatScreen(
             decodeImageData(imageData)?.let { bitmap -> Image(bitmap = bitmap.asImageBitmap(), contentDescription = "待发送图片", contentScale = ContentScale.Crop, modifier = Modifier.size(56.dp).clip(RoundedCornerShape(6.dp))) }
             Spacer(Modifier.width(8.dp)); Text("已选择图片", color = Green, fontSize = 10.sp); Spacer(Modifier.weight(1f)); TextButton(onClick = onClearImage) { Text("移除", color = Coral, fontSize = 10.sp) }
         }
+
         Composer(input, onInput, onSend, aiBusy || threadLoading, onGallery, onCamera, imageData)
     }
 

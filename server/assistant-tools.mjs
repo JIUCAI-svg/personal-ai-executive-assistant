@@ -56,6 +56,22 @@ export const ASSISTANT_TOOLS = Object.freeze([
     }
   },
   {
+    name: 'create_long_task',
+    description: '创建长期重复任务；每天自动生成一条独立执行项，完成今天不会结束长期任务。截止时间可留空表示无限期。',
+    parameters: {
+      title: '长期任务名称', daily_minutes: '每天预计分钟数', priority: '1-5', project: '可选项目名',
+      due_at: '可选 ISO 截止时间，留空表示无限期', start_date: '可选 YYYY-MM-DD', notes: '可选备注', reason: '创建原因'
+    }
+  },
+  {
+    name: 'update_long_task',
+    description: '更新、暂停、恢复或结束长期任务；可调整每日时长和截止日期。',
+    parameters: {
+      long_task_id: '可选长期任务 ID', task: '长期任务名称', title: '新名称', daily_minutes: '新的每日分钟数',
+      priority: '1-5', due_at: 'ISO 截止时间；空字符串表示无限期', notes: '新备注', status: 'active、paused、completed 或 archived'
+    }
+  },
+  {
     name: 'create_project',
     description: '创建一个人生主线、支线或具体项目，并可设置说明、优先级和截止时间。',
     parameters: { name: '目标或项目名称', kind: 'goal 或 project', description: '项目说明', priority: '1-5', due_at: '可选 ISO 截止时间', reason: '创建原因' }
@@ -91,7 +107,7 @@ export const ASSISTANT_TOOLS = Object.freeze([
 
 export const ASSISTANT_TOOL_NAMES = new Set(ASSISTANT_TOOLS.map((tool) => tool.name));
 
-const NUMBER_PARAMETERS = new Set(['estimated_minutes', 'priority', 'target_minutes', 'minutes']);
+const NUMBER_PARAMETERS = new Set(['estimated_minutes', 'daily_minutes', 'priority', 'target_minutes', 'minutes']);
 const REQUIRED_PARAMETERS = {
   set_sleep_time: ['time'],
   set_wake_time: ['time'],
@@ -100,6 +116,7 @@ const REQUIRED_PARAMETERS = {
   cancel_task: ['task'],
   defer_task: ['task'],
   create_task: ['title'],
+  create_long_task: ['title'],
   create_project: ['name'],
   update_project: ['project'],
   set_unavailable_period: ['start', 'end'],
@@ -115,7 +132,7 @@ export const ASSISTANT_SKILLS = Object.freeze([
   {
     name: 'task_management',
     description: '创建、编辑、排序、计时、完成、取消和顺延任务。',
-    tools: ['create_task', 'update_task', 'reorder_tasks', 'start_task_timer', 'pause_task_timer', 'stop_task_timer', 'complete_task', 'reopen_task', 'complete_current_task', 'cancel_task', 'cancel_all_tasks', 'defer_task']
+    tools: ['create_task', 'create_long_task', 'update_task', 'update_long_task', 'reorder_tasks', 'start_task_timer', 'pause_task_timer', 'stop_task_timer', 'complete_task', 'reopen_task', 'complete_current_task', 'cancel_task', 'cancel_all_tasks', 'defer_task']
   },
   {
     name: 'project_management',
@@ -135,7 +152,7 @@ export const ASSISTANT_SKILLS = Object.freeze([
   {
     name: 'daily_review',
     description: '围绕完成情况、阻碍、事件和明日优先级组织复盘。',
-    tools: ['capture_memory', 'create_task', 'replan_today']
+    tools: ['capture_memory', 'create_task', 'create_long_task', 'replan_today']
   }
 ]);
 

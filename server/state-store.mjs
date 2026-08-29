@@ -12,6 +12,7 @@ const DEFAULT_SETTINGS = {
   focus_minutes: 50,
   break_minutes: 10,
   buffer_minutes: 60,
+  sleep_duration_minutes: 8 * 60,
   clear_completed_at_sleep: true
 };
 
@@ -64,6 +65,16 @@ function isoAt(date, time) {
 
 function normalizeText(value, limit = 240) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+
+function daysBetween(startDate, endDate) {
+  return Math.round((Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`)) / 86400000);
+}
+
+function addClockMinutes(date, time, offset) {
+  const total = (minutes(time) ?? 0) + offset;
+  const dayOffset = Math.floor(total / 1440);
+  return { date: plusDays(date, dayOffset), time: timeLabel(total % 1440) };
 }
 
 function normalizeMessageAttachments(value) {
@@ -153,6 +164,7 @@ export function createDefaultAssistantState() {
       { id: id(), project_id: dramaProject, title: '拆解一个热门开场', notes: '可顺延', status: 'open', priority: 2, estimated_minutes: 45, actual_minutes: 0, sort_order: 40, due_at: null, created_at: createdAt, updated_at: createdAt },
       { id: id(), project_id: liveProject, title: '设计一段特色玩法', notes: '可顺延', status: 'open', priority: 2, estimated_minutes: 45, actual_minutes: 0, sort_order: 50, due_at: null, created_at: createdAt, updated_at: createdAt }
     ],
+    long_tasks: [],
     time_sessions: [],
     unavailable_blocks: [],
     threads: [],
@@ -190,14 +202,20 @@ export function repairAssistantState(source) {
       Number(aiPreferences.memory_daily_time.slice(0, 2)) > 23 || Number(aiPreferences.memory_daily_time.slice(3, 5)) > 59) {
     aiPreferences.memory_daily_time = '22:00';
   }
+  const settings = {
+    ...DEFAULT_SETTINGS,
+    ...(state.settings || {}),
+    clear_completed_at_sleep: state.settings?.clear_completed_at_sleep !== false
+  };
+  settings.sleep_time = clock(settings.sleep_time) || DEFAULT_SETTINGS.sleep_time;
+  settings.sleep_duration_minutes = Math.max(60, Math.min(900, Number(settings.sleep_duration_minutes) || DEFAULT_SETTINGS.sleep_duration_minutes));
+  // Wake time is derived from bedtime and sleep duration so the planner has
+  // one unambiguous overnight block instead of two unrelated settings.
+  settings.wake_time = addClockMinutes(nowParts().date, settings.sleep_time, settings.sleep_duration_minutes).time;
   return {
     ...base,
     ...state,
-    settings: {
-      ...DEFAULT_SETTINGS,
-      ...(state.settings || {}),
-      clear_completed_at_sleep: state.settings?.clear_completed_at_sleep !== false
-    },
+    settings,
     projects: (Array.isArray(state.projects) ? state.projects : base.projects).map((project, index) => ({
       ...project,
       kind: project.kind === 'goal' ? 'goal' : 'project',
@@ -210,10 +228,20 @@ export function repairAssistantState(source) {
       ...task,
       parent_task_id: typeof task.parent_task_id === 'string' && task.parent_task_id.trim() ? task.parent_task_id.trim() : null,
       priority: taskPriority(task.priority),
-      status: ['open', 'in_progress', 'done', 'cancelled', 'deferred'].includes(task.status) ? task.status : 'open',
+      status: ['open', 'in_progress', 'done', 'cancelled', 'deferred', 'missed'].includes(task.status) ? task.status : 'open',
       actual_minutes: Math.max(0, Number(task.actual_minutes) || 0),
       estimated_minutes: Math.max(5, Math.min(720, Number(task.estimated_minutes) || 45)),
       sort_order: Number.isFinite(Number(task.sort_order)) ? Number(task.sort_order) : (index + 1) * 10
+    })),
+    long_tasks: (Array.isArray(state.long_tasks) ? state.long_tasks : []).map((task) => ({
+      ...task,
+      status: ['active', 'paused', 'completed', 'archived'].includes(task.status) ? task.status : 'active',
+      priority: taskPriority(task.priority),
+      repeat_rule: task.repeat_rule === 'daily' ? 'daily' : 'daily',
+      daily_minutes: Math.max(5, Math.min(720, Number(task.daily_minutes) || 45)),
+      start_date: /^\d{4}-\d{2}-\d{2}$/.test(String(task.start_date || '')) ? task.start_date : nowParts().date,
+      due_at: typeof task.due_at === 'string' && task.due_at.trim() ? task.due_at.trim() : null,
+      project_id: typeof task.project_id === 'string' && task.project_id ? task.project_id : null
     })),
     time_sessions: Array.isArray(state.time_sessions) ? state.time_sessions : [],
     unavailable_blocks: Array.isArray(state.unavailable_blocks) ? state.unavailable_blocks : [],
@@ -261,25 +289,82 @@ function taskMatches(task, query) {
 function todayPlanningWindow(settings, current = nowParts()) {
   const currentMinutes = minutes(current.time) ?? 0;
   const sleepMinutes = minutes(settings.sleep_time) ?? minutes(DEFAULT_SETTINGS.sleep_time);
-  const isAfterMidnightBedtime = sleepMinutes < 8 * 60;
-  let endDate = current.date;
-  let endMinutes = sleepMinutes;
-  // A bedtime after midnight belongs to the upcoming overnight window. When
-  // the current time has already passed it (for example 03:39 with 00:00),
-  // use the next day's bedtime instead of collapsing availability to zero.
-  if (isAfterMidnightBedtime && currentMinutes >= sleepMinutes) endDate = plusDays(current.date, 1);
-  if (!isAfterMidnightBedtime && currentMinutes >= sleepMinutes) endMinutes = currentMinutes;
-  const dayOffset = endDate === current.date ? 0 : 1;
-  const totalUntilEnd = Math.max(0, dayOffset * 1440 + endMinutes - currentMinutes);
+  const sleepDuration = Math.max(60, Math.min(900, Number(settings.sleep_duration_minutes) || DEFAULT_SETTINGS.sleep_duration_minutes));
+  const lastSleepDate = currentMinutes >= sleepMinutes ? current.date : plusDays(current.date, -1);
+  const lastSleepOffset = daysBetween(current.date, lastSleepDate) * 1440 + sleepMinutes;
+  const currentAbsolute = currentMinutes;
+  const isSleeping = currentAbsolute >= lastSleepOffset && currentAbsolute < lastSleepOffset + sleepDuration;
+  const lastSleepEnd = addClockMinutes(lastSleepDate, timeLabel(sleepMinutes), sleepDuration);
+  const nextSleepDate = currentMinutes < sleepMinutes ? current.date : plusDays(current.date, 1);
+  const nextSleepOffset = daysBetween(current.date, nextSleepDate) * 1440 + sleepMinutes;
+  const totalUntilEnd = isSleeping ? 0 : Math.max(0, nextSleepOffset - currentAbsolute);
   return {
-    start_date: current.date,
+    start_date: isSleeping ? lastSleepEnd.date : current.date,
     start_time: current.time,
-    end_date: endDate,
-    end_time: timeLabel(endMinutes),
+    end_date: isSleeping ? lastSleepEnd.date : nextSleepDate,
+    end_time: isSleeping ? lastSleepEnd.time : timeLabel(sleepMinutes),
     available_minutes: totalUntilEnd,
     current_minutes: currentMinutes,
-    end_absolute_minutes: currentMinutes + totalUntilEnd
+    end_absolute_minutes: currentMinutes + totalUntilEnd,
+    planning_date: isSleeping ? lastSleepEnd.date : current.date,
+    is_sleeping: isSleeping,
+    sleep_start: { date: lastSleepDate, time: timeLabel(sleepMinutes) },
+    sleep_end: lastSleepEnd,
+    sleep_duration_minutes: sleepDuration
   };
+}
+
+function finalizeDailyReview(state, date, timestamp) {
+  if (!date || (state.daily_reviews || []).some((review) => review.date === date)) return false;
+  const items = (state.tasks || []).filter((task) => task.occurrence_date === date);
+  if (!items.length) return false;
+  const review = {
+    id: id(), date, created_at: timestamp,
+    planned_count: items.length,
+    completed_count: items.filter((task) => task.status === 'done').length,
+    missed_count: items.filter((task) => task.status === 'missed').length,
+    skipped_count: items.filter((task) => ['cancelled', 'deferred'].includes(task.status)).length,
+    actual_minutes: items.reduce((sum, task) => sum + (Number(task.actual_minutes) || 0), 0),
+    items: items.map((task) => ({ id: task.id, long_task_id: task.long_task_id || null, title: task.title, status: task.status, estimated_minutes: task.estimated_minutes, actual_minutes: task.actual_minutes || 0 }))
+  };
+  state.daily_reviews ||= [];
+  state.daily_reviews.push(review);
+  state.daily_reviews = state.daily_reviews.slice(-366);
+  return true;
+}
+
+function ensureDailyTaskInstances(state, current = nowParts()) {
+  const window = todayPlanningWindow(state.settings, current);
+  const planningDate = window.planning_date;
+  const timestamp = isoAt(current.date, current.time);
+  let changed = false;
+  state.long_tasks ||= [];
+  state.tasks ||= [];
+  for (const task of state.tasks) {
+    if (task.long_task_id && task.occurrence_date && task.occurrence_date < planningDate && ['open', 'in_progress', 'deferred'].includes(task.status)) {
+      task.status = 'missed';
+      task.missed_at = timestamp;
+      task.updated_at = timestamp;
+      changed = true;
+    }
+  }
+  const priorDates = [...new Set(state.tasks.filter((task) => task.long_task_id && task.occurrence_date && task.occurrence_date < planningDate).map((task) => task.occurrence_date))];
+  for (const date of priorDates) changed = finalizeDailyReview(state, date, timestamp) || changed;
+  for (const master of state.long_tasks) {
+    const dueDate = String(master.due_at || '').slice(0, 10);
+    if (master.status !== 'active' || master.repeat_rule !== 'daily' || master.start_date > planningDate || (dueDate && dueDate < planningDate)) continue;
+    if (state.tasks.some((task) => task.long_task_id === master.id && task.occurrence_date === planningDate)) continue;
+    state.tasks.push({
+      id: id(), long_task_id: master.id, occurrence_date: planningDate,
+      project_id: master.project_id || null, parent_task_id: null, title: master.title,
+      notes: master.notes || '', status: 'open', priority: master.priority,
+      estimated_minutes: master.daily_minutes, actual_minutes: 0,
+      sort_order: (state.tasks.length + 1) * 10, due_at: master.due_at || null,
+      created_at: timestamp, updated_at: timestamp
+    });
+    changed = true;
+  }
+  return changed;
 }
 
 function dueWeight(task) {
@@ -307,6 +392,8 @@ function buildPlan(state, current = nowParts()) {
   const taskItems = state.tasks
     // Container tasks organize sub-plans; only leaf tasks consume calendar time.
     .filter((task) => ['open', 'in_progress'].includes(task.status) && !parentIds.has(task.id))
+    .filter((task) => !task.long_task_id || task.occurrence_date === window.planning_date)
+    .filter(() => !window.is_sleeping)
     .sort((left, right) => (right.priority - left.priority) || (dueWeight(left) - dueWeight(right)) || ((Number(left.sort_order) || 0) - (Number(right.sort_order) || 0)) || left.created_at.localeCompare(right.created_at));
   const blocks = state.unavailable_blocks
     .filter((block) => block.date === current.date || block.date === window.end_date)
@@ -347,7 +434,7 @@ function buildPlan(state, current = nowParts()) {
     return stored;
   };
   const deferred = state.tasks
-    .filter((task) => task.status === 'deferred')
+    .filter((task) => task.status === 'deferred' && (!task.long_task_id || task.occurrence_date === window.planning_date))
     .map((task) => ({ ...task, reason: '已按你的要求顺延，等待下次安排' }));
 
   function nextAvailableStart(start, duration) {
@@ -383,6 +470,8 @@ function buildPlan(state, current = nowParts()) {
       due_at: task.due_at,
       notes: task.notes || '',
       parent_task_id: task.parent_task_id || null,
+      long_task_id: task.long_task_id || null,
+      occurrence_date: task.occurrence_date || null,
       actual_minutes: task.actual_minutes || 0,
       actual_seconds: elapsedSecondsForTask(task.id)
     });
@@ -393,6 +482,10 @@ function buildPlan(state, current = nowParts()) {
     now: `${current.date} ${current.time}`,
     sleep_time: state.settings.sleep_time,
     wake_time: state.settings.wake_time,
+    sleep_duration_minutes: window.sleep_duration_minutes,
+    sleep_window: { start: window.sleep_start, end: window.sleep_end, is_sleeping: window.is_sleeping },
+    planning_date: window.planning_date,
+    is_sleeping: window.is_sleeping,
     available_minutes: usableMinutes,
     total_remaining_minutes: window.available_minutes,
     scheduled_minutes: scheduled.reduce((total, item) => total + item.estimated_minutes, 0),
@@ -404,13 +497,17 @@ function buildPlan(state, current = nowParts()) {
     next_task: scheduled[1] || null,
     active_timer: activeTimer,
     scheduled,
-    completed: state.tasks.filter((task) => task.status === 'done' && (!state.settings.clear_completed_at_sleep || completedSinceSleep(task, current, state.settings.sleep_time))).slice().sort((a, b) => String(b.completed_at || '').localeCompare(String(a.completed_at || ''))).map((task) => ({
+    completed: state.tasks.filter((task) => task.status === 'done' && (!task.long_task_id || task.occurrence_date === window.planning_date) && (!state.settings.clear_completed_at_sleep || completedSinceSleep(task, current, state.settings.sleep_time))).slice().sort((a, b) => String(b.completed_at || '').localeCompare(String(a.completed_at || ''))).map((task) => ({
       id: task.id, title: task.title, project: taskProject(task, state.projects)?.name || '未归类', priority: task.priority,
       parent_task_id: task.parent_task_id || null,
+      long_task_id: task.long_task_id || null,
+      occurrence_date: task.occurrence_date || null,
       estimated_minutes: task.estimated_minutes, actual_minutes: task.actual_minutes || 0, status: task.status, completed_at: task.completed_at || '', notes: task.notes || ''
     })),
     deferred,
-    adjustment_reason: deferred.length
+    adjustment_reason: window.is_sleeping
+      ? `当前处于睡眠时间，计划将在 ${window.sleep_end.time} 后恢复安排。`
+      : deferred.length
       ? '优先安排截止更近、优先级更高的事项，并为睡眠、不可用时段和缓冲时间留出空间。'
       : '当前任务均可在今天的可用时间内完成，已保留缓冲时间。'
   };
@@ -495,6 +592,7 @@ export class AssistantStateStore {
   async mutate(operation) {
     const work = this.pending.then(async () => {
       const state = await this.read();
+      ensureDailyTaskInstances(state);
       const result = await operation(state);
       state.updated_at = isoAt(nowParts().date, nowParts().time);
       await mkdir(this.rootPath, { recursive: true });
@@ -511,9 +609,16 @@ export class AssistantStateStore {
     // Keep generated default project IDs stable across the first state read and the
     // first conversation creation. Without this initialization, a fresh vault could
     // generate a different default project list for each request.
-    const state = existsSync(this.filePath)
-      ? await this.read()
-      : await this.mutate((draft) => draft);
+    let state;
+    if (!existsSync(this.filePath)) {
+      state = await this.mutate((draft) => draft);
+    } else {
+      state = await this.read();
+      if (ensureDailyTaskInstances(state)) {
+        await this.mutate((draft) => draft);
+        state = await this.read();
+      }
+    }
     return { ...state, plan: buildPlan(state), sleep_wake_summary: sleepWakeSummary(state) };
   }
 
@@ -721,6 +826,60 @@ export class AssistantStateStore {
       .slice().sort((a, b) => (Number(b.priority) - Number(a.priority)) || (Number(a.sort_order) - Number(b.sort_order)) || String(a.created_at).localeCompare(String(b.created_at)));
   }
 
+  async listLongTasks(options = {}) {
+    const state = await this.read();
+    const includeInactive = options.includeInactive === true;
+    return state.long_tasks
+      .filter((task) => includeInactive || task.status === 'active')
+      .slice()
+      .sort((left, right) => (Number(right.priority) - Number(left.priority)) || dueWeight(left) - dueWeight(right));
+  }
+
+  async createLongTask(values = {}) {
+    return this.mutate((state) => {
+      const title = normalizeText(values.title, 120);
+      if (!title) return null;
+      const current = nowParts();
+      const timestamp = isoAt(current.date, current.time);
+      const projectId = normalizeText(values.project_id, 80) || null;
+      const task = {
+        id: id(), project_id: projectId, title,
+        notes: normalizeText(values.notes || values.reason, 500),
+        status: 'active', repeat_rule: 'daily',
+        priority: taskPriority(values.priority),
+        daily_minutes: Math.max(5, Math.min(720, Number(values.daily_minutes || values.estimated_minutes) || 45)),
+        start_date: /^\d{4}-\d{2}-\d{2}$/.test(String(values.start_date || '')) ? values.start_date : todayPlanningWindow(state.settings, current).planning_date,
+        due_at: normalizeText(values.due_at, 48) || null,
+        created_at: timestamp, updated_at: timestamp
+      };
+      state.long_tasks.push(task);
+      ensureDailyTaskInstances(state, current);
+      return task;
+    });
+  }
+
+  async updateLongTask(longTaskId, values = {}) {
+    return this.mutate((state) => {
+      const task = state.long_tasks.find((item) => item.id === longTaskId);
+      if (!task) return null;
+      if (values.title !== undefined) task.title = normalizeText(values.title, 120) || task.title;
+      if (values.notes !== undefined) task.notes = normalizeText(values.notes, 500);
+      if (values.project_id !== undefined) task.project_id = normalizeText(values.project_id, 80) || null;
+      if (values.priority !== undefined) task.priority = taskPriority(values.priority);
+      if (values.daily_minutes !== undefined) task.daily_minutes = Math.max(5, Math.min(720, Number(values.daily_minutes) || task.daily_minutes));
+      if (values.due_at !== undefined) task.due_at = normalizeText(values.due_at, 48) || null;
+      if (values.start_date !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(String(values.start_date))) task.start_date = values.start_date;
+      if (['active', 'paused', 'completed', 'archived'].includes(values.status)) task.status = values.status;
+      task.updated_at = isoAt(nowParts().date, nowParts().time);
+      return task;
+    });
+  }
+
+  async dailyReviewHistory(limit = 30) {
+    const state = await this.read();
+    return (state.daily_reviews || []).slice().sort((left, right) => String(right.date).localeCompare(String(left.date))).slice(0, Math.max(1, Math.min(366, Number(limit) || 30)));
+  }
+
   async createProject(values = {}) {
     return this.mutate((state) => {
       const name = normalizeText(values.name, 120);
@@ -760,7 +919,7 @@ export class AssistantStateStore {
       for (const key of textFields) if (values[key] !== undefined) task[key] = normalizeText(values[key], key === 'notes' ? 500 : 240);
       if (values.estimated_minutes !== undefined) task.estimated_minutes = Math.max(5, Math.min(720, Number(values.estimated_minutes) || task.estimated_minutes || 45));
       if (values.priority !== undefined) task.priority = taskPriority(values.priority);
-      if (['open', 'in_progress', 'done', 'cancelled', 'deferred'].includes(values.status)) {
+      if (['open', 'in_progress', 'done', 'cancelled', 'deferred', 'missed'].includes(values.status)) {
         task.status = values.status;
         if (values.status === 'done') task.completed_at ||= isoAt(nowParts().date, nowParts().time);
         if (values.status !== 'done') delete task.completed_at;
@@ -1026,13 +1185,15 @@ export class AssistantStateStore {
           const value = clock(action.time);
           if (value) {
             state.settings.sleep_time = value;
-            result = { type, ok: true, value, reason: action.reason || '已更新今晚睡觉时间。' };
+            state.settings.wake_time = addClockMinutes(current.date, value, state.settings.sleep_duration_minutes).time;
+            result = { type, ok: true, value, wake_time: state.settings.wake_time, reason: action.reason || '已更新今晚睡觉时间。' };
           }
         } else if (type === 'set_wake_time') {
           const value = clock(action.time);
           if (value) {
             state.settings.wake_time = value;
-            result = { type, ok: true, value, reason: action.reason || '已更新明天起床时间。' };
+            state.settings.sleep_time = addClockMinutes(current.date, value, -Number(state.settings.sleep_duration_minutes || DEFAULT_SETTINGS.sleep_duration_minutes)).time;
+            result = { type, ok: true, value, sleep_time: state.settings.sleep_time, reason: action.reason || '已更新明天起床时间。' };
           }
         } else if (type === 'set_buffer_minutes') {
           const numeric = Number(action.minutes);
@@ -1109,6 +1270,40 @@ export class AssistantStateStore {
             project.updated_at = timestamp;
             result = { type, ok: true, project, reason: action.reason || '项目已更新。' };
           } else result = { type, ok: false, reason: '没有找到匹配的项目。' };
+        } else if (type === 'create_long_task') {
+          const title = normalizeText(action.title, 120);
+          if (title) {
+            const projectName = normalizeText(action.project, 80);
+            let project = state.projects.find((item) => item.name === projectName);
+            if (!project && projectName) {
+              project = { id: id(), name: projectName, description: '', kind: 'project', status: 'active', priority: 3, due_at: null, created_at: timestamp, updated_at: timestamp };
+              state.projects.push(project);
+            }
+            const master = {
+              id: id(), project_id: project?.id || context.project_id || null, title,
+              notes: normalizeText(action.notes || action.reason, 500), status: 'active', repeat_rule: 'daily',
+              priority: taskPriority(action.priority), daily_minutes: Math.max(5, Math.min(720, Number(action.daily_minutes || action.estimated_minutes) || 45)),
+              start_date: /^\d{4}-\d{2}-\d{2}$/.test(String(action.start_date || '')) ? action.start_date : todayPlanningWindow(state.settings, current).planning_date,
+              due_at: normalizeText(action.due_at, 48) || null, created_at: timestamp, updated_at: timestamp
+            };
+            state.long_tasks.push(master);
+            ensureDailyTaskInstances(state, current);
+            result = { type, ok: true, long_task: master, reason: '长期任务已创建，并已生成当天执行项。' };
+          }
+        } else if (type === 'update_long_task') {
+          const master = action.long_task_id
+            ? state.long_tasks.find((item) => item.id === action.long_task_id)
+            : state.long_tasks.find((item) => taskMatches(item, action.task || action.title));
+          if (master) {
+            if (action.title !== undefined) master.title = normalizeText(action.title, 120) || master.title;
+            if (action.notes !== undefined) master.notes = normalizeText(action.notes, 500);
+            if (action.priority !== undefined) master.priority = taskPriority(action.priority);
+            if (action.daily_minutes !== undefined) master.daily_minutes = Math.max(5, Math.min(720, Number(action.daily_minutes) || master.daily_minutes));
+            if (action.due_at !== undefined) master.due_at = normalizeText(action.due_at, 48) || null;
+            if (['active', 'paused', 'completed', 'archived'].includes(action.status)) master.status = action.status;
+            master.updated_at = timestamp;
+            result = { type, ok: true, long_task: master, reason: '长期任务已更新。' };
+          } else result = { type, ok: false, reason: '没有找到匹配的长期任务。' };
         } else if (type === 'create_task') {
           const title = normalizeText(action.title, 120);
           if (title) {

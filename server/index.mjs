@@ -1074,6 +1074,38 @@ app.get('/api/assistant/tasks', async (request, response, next) => {
   } catch (error) { next(error); }
 });
 
+app.get('/api/assistant/long-tasks', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    response.json({ ok: true, source, long_tasks: await store.listLongTasks({ includeInactive: request.query.include_inactive === 'true' }), state: await store.bootstrap() });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/assistant/long-tasks', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    const task = await store.createLongTask(request.body || {});
+    if (!task) return response.status(400).json({ error: '需要填写长期任务名称。' });
+    response.status(201).json({ ok: true, source, long_task: task, state: await store.bootstrap() });
+  } catch (error) { next(error); }
+});
+
+app.patch('/api/assistant/long-tasks/:id', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    const task = await store.updateLongTask(String(request.params.id), request.body || {});
+    if (!task) return response.status(404).json({ error: '未找到长期任务。' });
+    response.json({ ok: true, source, long_task: task, state: await store.bootstrap() });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/assistant/daily-reviews', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    response.json({ ok: true, source, reviews: await store.dailyReviewHistory(request.query.limit), state: await store.bootstrap() });
+  } catch (error) { next(error); }
+});
+
 app.post('/api/assistant/projects', async (request, response, next) => {
   try {
     const { store, source } = await requestStateStore(request);
@@ -1455,9 +1487,17 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       })),
       project_tasks: (stateBefore.tasks || [])
         .filter((item) => !hydratedThread.project_id || item.project_id === hydratedThread.project_id)
-        .slice(0, 20),
+        .slice(0, 80),
+      long_tasks: (stateBefore.long_tasks || [])
+        .filter((item) => !hydratedThread.project_id || item.project_id === hydratedThread.project_id)
+        .slice(0, 80),
+      daily_execution_history: (stateBefore.daily_reviews || []).slice(-30),
       sleep_time: planBefore.sleep_time,
       wake_time: planBefore.wake_time,
+      sleep_duration_minutes: planBefore.sleep_duration_minutes,
+      sleep_window: planBefore.sleep_window,
+      planning_date: planBefore.planning_date,
+      is_sleeping: planBefore.is_sleeping,
       today_plan: planBefore.scheduled.slice(0, 12),
       current_task: planBefore.current_task,
       deferred_tasks: planBefore.deferred.slice(0, 8),
@@ -1613,7 +1653,7 @@ app.use((error, _request, response, _next) => {
 const androidApkPath = path.join(appRoot, 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
 app.get('/download/forward.apk', (_request, response) => {
   if (!existsSync(androidApkPath)) return response.status(404).json({ error: 'Android 安装包尚未生成。' });
-  response.download(androidApkPath, 'forward-assistant-v0.6.3-image-history-debug.apk');
+  response.download(androidApkPath, 'forward-assistant-v0.6.4-planning-debug.apk');
 });
 
 app.delete('/api/assistant/threads/:id', async (request, response, next) => {

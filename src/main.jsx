@@ -93,6 +93,9 @@ function App() {
   const [showNewConversation, setShowNewConversation] = useState(false);
   const [showNewTask, setShowNewTask] = useState(false);
   const [newTask, setNewTask] = useState({ title: '', estimated_minutes: '45', priority: '3', project_id: '', due_at: '', notes: '' });
+  const [showLongTasks, setShowLongTasks] = useState(false);
+  const [showNewLongTask, setShowNewLongTask] = useState(false);
+  const [longTaskDraft, setLongTaskDraft] = useState({ title: '', daily_minutes: '45', priority: '3', project_id: '', due_at: '', notes: '' });
   const [showProjects, setShowProjects] = useState(false);
   const [showProjectDetail, setShowProjectDetail] = useState(false);
   const [projectDetailId, setProjectDetailId] = useState('');
@@ -143,6 +146,7 @@ function App() {
 
   const mode = modes.find((item) => item.id === conversationMode) || modes[0];
   const projects = assistantState?.projects || [];
+  const longTasks = assistantState?.long_tasks || [];
   const pendingMemories = (assistantState?.memory_items || []).filter((item) => item.status === 'pending_review');
   const project = projects.find((item) => item.id === projectId) || null;
   const projectDetail = projects.find((item) => item.id === projectDetailId) || null;
@@ -614,6 +618,55 @@ function App() {
     finally { setTaskBusy(false); }
   }
 
+  async function createLongTaskManually(event) {
+    event.preventDefault();
+    const title = longTaskDraft.title.trim();
+    if (!title || taskBusy) return;
+    setTaskBusy(true);
+    try {
+      const response = await apiFetch('/api/assistant/long-tasks', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title,
+          daily_minutes: Number(longTaskDraft.daily_minutes) || 45,
+          priority: Number(longTaskDraft.priority) || 3,
+          project_id: longTaskDraft.project_id || projectId || null,
+          due_at: longTaskDraft.due_at ? new Date(longTaskDraft.due_at).toISOString() : null,
+          notes: longTaskDraft.notes.trim()
+        })
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '新建长期任务失败');
+      applyAssistantData(payload);
+      setLongTaskDraft({ title: '', daily_minutes: '45', priority: '3', project_id: '', due_at: '', notes: '' });
+      setShowNewLongTask(false);
+      setNotice('长期任务已创建，今天的执行项已加入动态计划。');
+    } catch (error) {
+      setNotice(error.message || '新建长期任务失败');
+    } finally {
+      setTaskBusy(false);
+    }
+  }
+
+  async function toggleLongTask(task) {
+    if (taskBusy) return;
+    setTaskBusy(true);
+    try {
+      const nextStatus = task.status === 'active' ? 'paused' : 'active';
+      const response = await apiFetch(`/api/assistant/long-tasks/${encodeURIComponent(task.id)}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: nextStatus })
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '更新长期任务失败');
+      applyAssistantData(payload);
+    } catch (error) {
+      setNotice(error.message || '更新长期任务失败');
+    } finally {
+      setTaskBusy(false);
+    }
+  }
+
   async function handleUserMessage(text, attachments = []) {
     setAiBusy(true);
     try {
@@ -845,7 +898,7 @@ function App() {
           <button className="nav-item is-active"><SunMedium size={18} /> 今天 <span className="nav-dot" /></button>
           <button className="nav-item" onClick={() => setShowHistory(true)}><MessageCircle size={18} /> 所有对话</button>
           <button className="nav-item" onClick={openVault}><Brain size={18} /> 记忆库 <span className={`vault-dot ${vault.connected ? 'connected' : ''}`} /></button>
-          <button className="nav-item" onClick={() => setShowHistory(true)}><ListChecks size={18} /> 计划历史</button>
+          <button className="nav-item" onClick={() => setShowLongTasks(true)}><ListChecks size={18} /> 长期任务 <span className="nav-count">{longTasks.filter((item) => item.status === 'active').length}</span></button>
         </nav>
         <div className="side-section">
           <div className="side-label"><button className="side-label-link" onClick={() => setShowProjects(true)}>目标与项目</button> <button aria-label="添加项目" onClick={() => setShowNewProject(true)}><Plus size={15} /></button></div>
@@ -899,8 +952,8 @@ function App() {
             <section className="day-intro">
               <div className="date-kicker"><span className="pulse-dot" /> {dateKicker()}</div>
               {leadProject && <button className="lead-project-card" onClick={() => { setProjectDetailId(leadProject.id); setShowProjectDetail(true); }}><span className={`project-dot ${leadProject.color}`} /><span><small>当前主线 · {leadProject.kind === 'goal' ? '目标' : '项目'}</small><strong>{leadProject.name}</strong><em>{leadProject.daysLeft === null ? '持续推进' : leadProject.daysLeft < 0 ? '已逾期' : `还有 ${leadProject.daysLeft} 天`} · 完成 {leadProject.progress}%</em></span><ChevronRight size={17} /></button>}
-              <div className="day-heading-row"><h1>今天，先把最重要的事做下去。</h1><button className="new-task-button" type="button" onClick={() => setShowNewTask(true)}><Plus size={16} /> 新建任务</button></div>
-              <p>现在 <strong>{planner?.now?.slice(-5) || now}</strong> · 可自主调整 <strong>{planner ? formatMinutes(planner.free_minutes) : '加载中'}</strong> · 已安排 <strong>{planner ? formatMinutes(planner.scheduled_minutes) : formatMinutes(scheduleMinutes)}</strong></p>
+              <div className="day-heading-row"><h1>今天，先把最重要的事做下去。</h1><span className="day-heading-actions"><button className="new-task-button secondary" type="button" onClick={() => setShowLongTasks(true)}><Target size={15} /> 长期任务</button><button className="new-task-button" type="button" onClick={() => setShowNewTask(true)}><Plus size={16} /> 新建任务</button></span></div>
+              <p>{planner?.is_sleeping ? <>现在 <strong>{planner?.now?.slice(-5) || now}</strong> · 正在睡眠时段 · <strong>{planner?.sleep_window?.end?.time || planner?.wake_time}</strong> 后恢复安排</> : <>现在 <strong>{planner?.now?.slice(-5) || now}</strong> · 可自主调整 <strong>{planner ? formatMinutes(planner.free_minutes) : '加载中'}</strong> · 已安排 <strong>{planner ? formatMinutes(planner.scheduled_minutes) : formatMinutes(scheduleMinutes)}</strong></>}</p>
             </section>
 
             <section className="mobile-plan" aria-label="今日计划概览">
@@ -966,6 +1019,8 @@ function App() {
 
       {showNewConversation && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="新建对话"><button className="modal-backdrop" onClick={() => setShowNewConversation(false)} aria-label="关闭新建对话" /><section className="new-conversation-modal"><div className="modal-header"><div><span>新建对话</span><p>选择 AI 本次可以了解什么。</p></div><button className="icon-button" onClick={() => setShowNewConversation(false)} aria-label="关闭"><X size={20} /></button></div><div className="new-mode-list">{modes.map((item) => { const Icon = item.icon; return <button key={item.id} onClick={() => selectMode(item.id)}><span className={`new-mode-icon ${item.id}`}><Icon size={20} /></span><span><strong>{item.label}</strong><small>{item.description}</small></span><ChevronRight size={18} /></button>; })}</div></section></div>}
       {showNewTask && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="新建任务"><button className="modal-backdrop" onClick={() => setShowNewTask(false)} aria-label="关闭新建任务" /><section className="task-modal"><div className="modal-header"><div><span>新建任务</span><p>设置完成它所需的时间和优先级。</p></div><button className="icon-button" type="button" onClick={() => setShowNewTask(false)} aria-label="关闭"><X size={20} /></button></div><form className="task-form" onSubmit={createTaskManually}><label>任务内容<input autoFocus value={newTask.title} onChange={(event) => setNewTask((current) => ({ ...current, title: event.target.value }))} placeholder="例如：复习高等数学错题" maxLength={120} required /></label><div className="task-form-grid"><label>预计时长（分钟）<input type="number" min="5" max="720" step="5" value={newTask.estimated_minutes} onChange={(event) => setNewTask((current) => ({ ...current, estimated_minutes: event.target.value }))} /></label><label>所属项目<select value={newTask.project_id} onChange={(event) => setNewTask((current) => ({ ...current, project_id: event.target.value }))}><option value="">不指定项目</option>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label></div><label>截止日期（可选）<input type="datetime-local" value={newTask.due_at} onChange={(event) => setNewTask((current) => ({ ...current, due_at: event.target.value }))} /></label><fieldset className="priority-field"><legend>优先级</legend><div className="priority-options">{[{ value: '5', label: '高', tone: 'high', detail: '优先安排' }, { value: '3', label: '中', tone: 'medium', detail: '正常推进' }, { value: '1', label: '低', tone: 'low', detail: '有空再做' }].map((item) => <label className={`priority-option ${item.tone}`} key={item.value}><input type="radio" name="task-priority" value={item.value} checked={newTask.priority === item.value} onChange={(event) => setNewTask((current) => ({ ...current, priority: event.target.value }))} /><span className="priority-swatch" /><span><strong>{item.label}</strong><small>{item.detail}</small></span></label>)}</div></fieldset><label>备注（可选）<textarea rows="3" value={newTask.notes} onChange={(event) => setNewTask((current) => ({ ...current, notes: event.target.value }))} placeholder="补充范围、完成标准或提醒" maxLength={500} /></label><div className="task-form-actions"><button className="text-command" type="button" onClick={() => setShowNewTask(false)}>取消</button><button className="primary-command" type="submit" disabled={taskBusy || !newTask.title.trim()}>{taskBusy ? '正在创建…' : '创建任务'}</button></div></form></section></div>}
+      {showLongTasks && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="长期任务"><button className="modal-backdrop" onClick={() => setShowLongTasks(false)} aria-label="关闭长期任务" /><section className="history-modal project-modal"><div className="modal-header"><div><span>长期任务</span><p>主任务持续存在，每个计划日自动生成一条独立执行项。</p></div><div className="modal-header-actions"><button className="secondary-command" onClick={() => setShowNewLongTask(true)}><Plus size={15} /> 新建</button><button className="icon-button" onClick={() => setShowLongTasks(false)} aria-label="关闭"><X size={20} /></button></div></div><div className="long-task-list">{longTasks.length ? longTasks.map((task) => <div className="long-task-row" key={task.id}><span className={`priority-swatch ${task.priority >= 5 ? 'high' : task.priority <= 1 ? 'low' : 'medium'}`} /><span><strong>{task.title}</strong><small>每天 {task.daily_minutes} 分钟 · {task.due_at ? `截止 ${new Date(task.due_at).toLocaleDateString('zh-CN')}` : '无限期'} · {task.status === 'active' ? '进行中' : '已暂停'}</small></span><button className="text-command" type="button" onClick={() => toggleLongTask(task)} disabled={taskBusy}>{task.status === 'active' ? '暂停' : '恢复'}</button></div>) : <p className="empty-state">还没有长期任务。适合每天都要推进、但不应被一次完成的事项。</p>}</div></section></div>}
+      {showNewLongTask && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="新建长期任务"><button className="modal-backdrop" onClick={() => setShowNewLongTask(false)} aria-label="关闭新建长期任务" /><section className="task-modal"><div className="modal-header"><div><span>新建长期任务</span><p>它不会被单日完成；每天会生成一条可计时、可复盘的执行项。</p></div><button className="icon-button" type="button" onClick={() => setShowNewLongTask(false)} aria-label="关闭"><X size={20} /></button></div><form className="task-form" onSubmit={createLongTaskManually}><label>长期任务名称<input autoFocus value={longTaskDraft.title} onChange={(event) => setLongTaskDraft((current) => ({ ...current, title: event.target.value }))} placeholder="例如：补考复习" maxLength={120} required /></label><div className="task-form-grid"><label>每天预计分钟数<input type="number" min="5" max="720" step="5" value={longTaskDraft.daily_minutes} onChange={(event) => setLongTaskDraft((current) => ({ ...current, daily_minutes: event.target.value }))} /></label><label>所属项目<select value={longTaskDraft.project_id} onChange={(event) => setLongTaskDraft((current) => ({ ...current, project_id: event.target.value }))}><option value="">不指定项目</option>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label></div><label>最终截止日期（可选）<input type="datetime-local" value={longTaskDraft.due_at} onChange={(event) => setLongTaskDraft((current) => ({ ...current, due_at: event.target.value }))} /></label><fieldset className="priority-field"><legend>优先级</legend><div className="priority-options">{[{ value: '5', label: '高', tone: 'high', detail: '优先安排' }, { value: '3', label: '中', tone: 'medium', detail: '正常推进' }, { value: '1', label: '低', tone: 'low', detail: '有空再做' }].map((item) => <label className={`priority-option ${item.tone}`} key={item.value}><input type="radio" name="long-task-priority" value={item.value} checked={longTaskDraft.priority === item.value} onChange={(event) => setLongTaskDraft((current) => ({ ...current, priority: event.target.value }))} /><span className="priority-swatch" /><span><strong>{item.label}</strong><small>{item.detail}</small></span></label>)}</div></fieldset><label>备注（可选）<textarea rows="3" value={longTaskDraft.notes} onChange={(event) => setLongTaskDraft((current) => ({ ...current, notes: event.target.value }))} placeholder="例如：按错题本复习并计时" maxLength={500} /></label><div className="task-form-actions"><button className="text-command" type="button" onClick={() => setShowNewLongTask(false)}>取消</button><button className="primary-command" type="submit" disabled={taskBusy || !longTaskDraft.title.trim()}>{taskBusy ? '正在创建…' : '创建长期任务'}</button></div></form></section></div>}
       {showProjects && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="目标与项目"><button className="modal-backdrop" onClick={() => setShowProjects(false)} aria-label="关闭目标与项目" /><section className="history-modal project-modal"><div className="modal-header"><div><span>目标与项目</span><p>长期目标负责方向，项目和截止任务负责推进。</p></div><div className="modal-header-actions"><button className="secondary-command" onClick={() => setShowNewProject(true)}><Plus size={15} /> 新建</button><button className="icon-button" onClick={() => setShowProjects(false)} aria-label="关闭"><X size={20} /></button></div></div><div className="project-overview-list">{projectSummaries.map((item) => <button className="project-overview-card" key={item.id} onClick={() => { setProjectDetailId(item.id); setShowProjects(false); setShowProjectDetail(true); }}><span className={`project-dot ${item.color}`} /><span><strong>{item.name}</strong><small>{item.kind === 'goal' ? '长期目标' : '项目'} · {item.daysLeft === null ? '持续推进' : item.daysLeft < 0 ? '已逾期' : `还有 ${item.daysLeft} 天`} · 剩余约 {formatMinutes(item.remainingMinutes)}</small><div className="project-progress"><i style={{ width: `${item.progress}%` }} /></div></span><em>{item.progress}%</em><ChevronRight size={17} /></button>)}</div></section></div>}
       {showNewProject && <div className="modal-layer" role="dialog" aria-modal="true" aria-label="新建目标或项目"><button className="modal-backdrop" onClick={() => setShowNewProject(false)} aria-label="关闭新建目标或项目" /><section className="task-modal"><div className="modal-header"><div><span>新建目标或项目</span><p>先确定方向，再把任务拆进今天。</p></div><button className="icon-button" onClick={() => setShowNewProject(false)} aria-label="关闭"><X size={20} /></button></div><form className="task-form" onSubmit={createProjectManually}><label>名称<input autoFocus value={projectDraft.name} onChange={(event) => setProjectDraft((current) => ({ ...current, name: event.target.value }))} placeholder="例如：通过 9 月 5 日补考" required /></label><label>类型<select value={projectDraft.kind} onChange={(event) => setProjectDraft((current) => ({ ...current, kind: event.target.value }))}><option value="goal">长期目标</option><option value="project">项目</option></select></label><label>截止日期（可选）<input type="datetime-local" value={projectDraft.due_at} onChange={(event) => setProjectDraft((current) => ({ ...current, due_at: event.target.value }))} /></label><label>说明（可选）<textarea rows="3" value={projectDraft.description} onChange={(event) => setProjectDraft((current) => ({ ...current, description: event.target.value }))} placeholder="想达成什么，为什么重要" /></label><div className="task-form-actions"><button className="text-command" type="button" onClick={() => setShowNewProject(false)}>取消</button><button className="primary-command" type="submit" disabled={taskBusy || !projectDraft.name.trim()}>{taskBusy ? '正在创建…' : '创建'}</button></div></form></section></div>}
       {showProjectDetail && projectDetail && <div className="modal-layer" role="dialog" aria-modal="true" aria-label={`${projectDetail.name}项目详情`}><button className="modal-backdrop" onClick={() => setShowProjectDetail(false)} aria-label="关闭项目详情" /><section className="history-modal project-detail-modal"><div className="modal-header"><div><span>{projectDetail.name}</span><p>{projectDetail.kind === 'goal' ? '长期目标' : '项目'} · {projectDetail.status === 'active' ? '进行中' : projectDetail.status}</p></div><button className="icon-button" onClick={() => setShowProjectDetail(false)} aria-label="关闭"><X size={20} /></button></div><div className="project-detail-hero"><div><small>项目进度</small><strong>{projectSummaries.find((item) => item.id === projectDetail.id)?.progress || 0}%</strong></div><div className="project-progress"><i style={{ width: `${projectSummaries.find((item) => item.id === projectDetail.id)?.progress || 0}%` }} /></div><p>{projectDetail.description || '还没有项目说明。'}</p><div className="project-detail-meta"><span><Target size={14} />{projectDetail.due_at ? `截止 ${new Date(projectDetail.due_at).toLocaleDateString('zh-CN')}` : '持续推进'}</span><span><ListChecks size={14} />{projectDetailTasks.length} 项任务</span></div></div><div className="project-detail-actions"><button className="secondary-command" onClick={() => { setShowProjectDetail(false); setProjectId(projectDetail.id); selectMode('project', projectDetail.id); }}><MessageCircle size={15} /> 进入项目对话</button><button className="primary-command" onClick={() => { setShowProjectDetail(false); setNewTask((current) => ({ ...current, project_id: projectDetail.id })); setShowNewTask(true); }}><Plus size={15} /> 新建项目任务</button></div><div className="project-task-list"><div className="project-task-heading"><strong>项目任务</strong><small>{projectDetailTasks.filter((task) => !['done', 'cancelled'].includes(task.status)).length} 项待推进</small></div>{projectDetailTasks.length ? projectDetailTasks.map((task) => <div className="project-task-row" key={task.id}><span className={`priority-swatch ${task.priority >= 5 ? 'high' : task.priority <= 1 ? 'low' : 'medium'}`} /><span><strong>{task.title}</strong><small>{task.status === 'done' ? '已完成' : task.status === 'deferred' ? '已顺延' : task.status === 'cancelled' ? '已取消' : `${task.estimated_minutes} 分钟`}{task.notes ? ` · ${task.notes}` : ''}</small></span><em>{task.status === 'done' ? '完成' : task.status === 'in_progress' ? '进行中' : '待办'}</em></div>) : <p className="empty-state">这个项目还没有任务，可以让 AI 或你手动添加。</p>}</div></section></div>}

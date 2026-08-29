@@ -22,7 +22,7 @@ test('usage activity creates a candidate sleep/wake record without changing plan
     assert.equal(candidate.wake_time, '08:03');
     assert.equal(candidate.gap_minutes, 531);
     assert.equal(state.settings.sleep_time, '01:00');
-    assert.equal(state.settings.wake_time, '08:00');
+    assert.equal(state.settings.wake_time, '09:00');
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
