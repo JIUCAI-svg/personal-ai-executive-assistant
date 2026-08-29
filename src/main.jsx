@@ -4,7 +4,7 @@ import { createClient } from '@supabase/supabase-js';
 import {
   Bell, Bot, Brain, CalendarDays, Check, ChevronDown, ChevronRight, Circle,
   Clock3, Cloud, CloudOff, Command, FileText, Flame, FolderKanban, HeartPulse, ListChecks, LogIn, LogOut, Menu,
-  MessageCircle, Mic, MoreHorizontal, MoveRight, PenLine, Plus, RefreshCw, Send, Settings2,
+  MessageCircle, Image, Camera, MoreHorizontal, MoveRight, PenLine, Plus, RefreshCw, Send, Settings2,
   Sparkles, SunMedium, Target, X, Zap
 } from 'lucide-react';
 import './styles.css';
@@ -104,6 +104,7 @@ function App() {
   const [saveTranscript, setSaveTranscript] = useState(true);
   const [distillMemory, setDistillMemory] = useState(false);
   const [input, setInput] = useState('');
+  const [pendingImages, setPendingImages] = useState([]);
   const [notice, setNotice] = useState('');
   const [notificationStatus, setNotificationStatus] = useState(
     'Notification' in window ? Notification.permission : 'unsupported'
@@ -613,13 +614,14 @@ function App() {
     finally { setTaskBusy(false); }
   }
 
-  async function handleUserMessage(text) {
+  async function handleUserMessage(text, attachments = []) {
     setAiBusy(true);
     try {
       const response = await apiFetch('/api/assistant/respond', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: text,
+          attachments,
           thread_id: threadId,
           conversation_mode: conversationMode,
           project_id: projectId,
@@ -651,10 +653,18 @@ function App() {
   function submitMessage(event) {
     event.preventDefault();
     const text = input.trim();
-    if (!text) return;
-    setMessages((items) => [...items, { id: Date.now(), role: 'user', time: timeNow(), text }]);
+    if (!text && pendingImages.length === 0) return;
+    const attachments = pendingImages.map((item) => ({ name: item.name, type: item.type, data_url: item.dataUrl }));
+    setMessages((items) => [...items, { id: Date.now(), role: 'user', time: timeNow(), text, attachments }]);
     setInput('');
-    handleUserMessage(text);
+    setPendingImages([]);
+    handleUserMessage(text || '请查看我上传的图片。', attachments);
+  }
+
+  function addImages(event) {
+    const files = Array.from(event.target.files || []).filter((file) => file.type.startsWith('image/')).slice(0, 4);
+    files.forEach((file) => { const reader = new FileReader(); reader.onload = () => setPendingImages((items) => [...items, { name: file.name, type: file.type, dataUrl: reader.result }]); reader.readAsDataURL(file); });
+    event.target.value = '';
   }
 
   function conversationDefaults(selected) {
@@ -903,7 +913,7 @@ function App() {
               {messages.map((message) => (
                 <article className={`message ${message.role}`} key={message.id}>
                   {message.role === 'assistant' && <div className="message-avatar"><Bot size={16} /></div>}
-                  <div><div className="message-meta">{message.role === 'assistant' ? '向前' : '你'} <time>{message.time}</time></div><p>{message.text}</p></div>
+                  <div><div className="message-meta">{message.role === 'assistant' ? '向前' : '你'} <time>{message.time}</time></div>{message.text && <p>{message.text}</p>}{message.attachments?.map((image) => <img className="message-image" key={image.data_url} src={image.data_url} alt={image.name || '上传图片'} />)}</div>
                 </article>
               ))}
               {notice && <div className="change-note"><Sparkles size={15} /><span>{notice}</span></div>}
@@ -911,8 +921,9 @@ function App() {
             </div>
 
             <form className="composer" onSubmit={submitMessage}>
+              {pendingImages.length > 0 && <div className="pending-images">{pendingImages.map((image) => <div className="pending-image" key={image.dataUrl}><img src={image.dataUrl} alt={image.name} /><button type="button" onClick={() => setPendingImages((items) => items.filter((item) => item.dataUrl !== image.dataUrl))} aria-label="移除图片"><X size={13} /></button></div>)}</div>}
               <textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder="说说你刚做了什么，或发生了什么变化…" rows="2" />
-              <div className="composer-actions"><button type="button" className="tool-button" aria-label="语音输入"><Mic size={18} /></button><span>试试："下午要出门"、"这个任务做完了"、"我累了"</span><button type="submit" className="send-button" disabled={!input.trim()} aria-label="发送消息"><Send size={17} /></button></div>
+              <div className="composer-actions"><label className="tool-button" aria-label="从图库选择图片"><Image size={18} /><input type="file" accept="image/*" multiple hidden onChange={addImages} /></label><label className="tool-button" aria-label="拍照上传"><Camera size={18} /><input type="file" accept="image/*" capture="environment" hidden onChange={addImages} /></label><span>试试："下午要出门"、"这个任务做完了"、"我累了"</span><button type="submit" className="send-button" disabled={!input.trim() && pendingImages.length === 0} aria-label="发送消息"><Send size={17} /></button></div>
             </form>
           </div>
 
