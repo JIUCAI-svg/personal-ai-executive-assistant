@@ -76,6 +76,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
@@ -706,6 +708,7 @@ private fun ForwardApp(activity: MainActivity) {
         var remoteMemories by remember { mutableStateOf(emptyList<RemoteMemory>()) }
         var memoryStatus by remember { mutableStateOf<MemoryRunStatus?>(null) }
         var remoteProjects by remember { mutableStateOf(emptyList<RemoteProject>()) }
+        var remoteTasks by remember { mutableStateOf(emptyList<RemoteTask>()) }
         var remoteThreadId by remember { mutableStateOf<String?>(null) }
         var conversationOptions by remember { mutableStateOf(defaultConversationOptions("assistant")) }
         var threads by remember { mutableStateOf(emptyList<ConversationThread>()) }
@@ -714,6 +717,15 @@ private fun ForwardApp(activity: MainActivity) {
         var messages by remember { mutableStateOf(emptyList<ChatMessage>()) }
         var showProjects by remember { mutableStateOf(false) }
         var showCreateProject by remember { mutableStateOf(false) }
+        var drawerOpen by remember { mutableStateOf(false) }
+        var projectPageId by remember { mutableStateOf<String?>(null) }
+        val drawerState = androidx.compose.material3.rememberDrawerState(androidx.compose.material3.DrawerValue.Closed)
+        LaunchedEffect(drawerOpen) {
+            if (drawerOpen) drawerState.open() else drawerState.close()
+        }
+        LaunchedEffect(drawerState.currentValue) {
+            if (drawerState.currentValue == androidx.compose.material3.DrawerValue.Closed) drawerOpen = false
+        }
         LaunchedEffect(breakTimer?.running) {
             while (breakTimer?.running == true) {
                 delay(1000)
@@ -734,6 +746,7 @@ private fun ForwardApp(activity: MainActivity) {
                 remotePlan = state.plan
                 remoteMemories = state.memories
                 remoteProjects = state.projects
+                remoteTasks = state.tasks
                 runCatching { gatewayMemoryStatus(activity) }.onSuccess { memoryStatus = it }
                 parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
                 parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
@@ -772,6 +785,7 @@ private fun ForwardApp(activity: MainActivity) {
                         remotePlan = state.plan
                         remoteMemories = state.memories
                         remoteProjects = state.projects
+                        remoteTasks = state.tasks
                         parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
                         parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
                     }
@@ -800,7 +814,7 @@ private fun ForwardApp(activity: MainActivity) {
             }
         }
 
-        fun startConversation(options: ConversationOptions) {
+        fun startConversation(options: ConversationOptions, destinationTab: Int = 1) {
             if (aiBusy || threadLoading) return
             scope.launch {
                 threadLoading = true
@@ -813,7 +827,7 @@ private fun ForwardApp(activity: MainActivity) {
                         if (thread.saveFullConversation) {
                             threads = listOf(thread) + threads.filterNot { it.id == thread.id }
                         }
-                        tab = 1
+                        tab = destinationTab
                     }
                     .onFailure { snackbar.showSnackbar(it.message ?: "新建对话失败") }
                 threadLoading = false
@@ -853,7 +867,7 @@ private fun ForwardApp(activity: MainActivity) {
         fun createProject(name: String, kind: String, description: String, priority: Int, dueAt: String?) {
             scope.launch {
                 runCatching { gatewayCreateProject(activity, name, kind, description, priority, dueAt) }
-                    .onSuccess { state -> remotePlan = state.plan; remoteMemories = state.memories; remoteProjects = state.projects; showCreateProject = false; snackbar.showSnackbar("目标或项目已创建") }
+                    .onSuccess { state -> remotePlan = state.plan; remoteMemories = state.memories; remoteProjects = state.projects; remoteTasks = state.tasks; showCreateProject = false; snackbar.showSnackbar("目标或项目已创建") }
                     .onFailure { snackbar.showSnackbar(it.message ?: "新建项目失败") }
             }
         }
@@ -861,7 +875,7 @@ private fun ForwardApp(activity: MainActivity) {
         fun completeTask() {
             scope.launch {
                 runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "complete_current_task").put("reason", "用户在移动端点击完成当前任务")) }
-                    .onSuccess { state -> remotePlan = state.plan?.copy(activeTimer = null); remoteMemories = state.memories; currentDone = false; beginBreak() }
+                    .onSuccess { state -> remotePlan = state.plan?.copy(activeTimer = null); remoteMemories = state.memories; remoteProjects = state.projects; remoteTasks = state.tasks; currentDone = false; beginBreak() }
                     .onFailure { snackbar.showSnackbar(it.message ?: "计划更新失败，本次未写入") }
             }
         }
@@ -869,44 +883,45 @@ private fun ForwardApp(activity: MainActivity) {
         fun startCurrentTimer() {
             val task = remotePlan?.currentTaskId ?: return
             scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "start_task_timer").put("task_id", task).put("mode", "stopwatch")) }
-                .onSuccess { state -> remotePlan = state.plan }
+                .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks }
                 .onFailure { snackbar.showSnackbar(it.message ?: "开始计时失败") } }
         }
 
         fun pauseCurrentTimer() {
             val task = remotePlan?.activeTimer?.taskId ?: return
             scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "pause_task_timer").put("task_id", task)) }
-                .onSuccess { state -> remotePlan = state.plan }
+                .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks }
                 .onFailure { snackbar.showSnackbar(it.message ?: "暂停计时失败") } }
         }
 
         fun reopenTask(taskId: String) {
             scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "reopen_task").put("task_id", taskId)) }
-                .onSuccess { state -> remotePlan = state.plan; snackbar.showSnackbar("任务已重新打开") }
+                .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks; snackbar.showSnackbar("任务已重新打开") }
                 .onFailure { snackbar.showSnackbar(it.message ?: "重新打开失败") } }
         }
 
         fun editTask(item: RemotePlanItem) {
             scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "update_task").put("task_id", item.id).put("title", item.title).put("estimated_minutes", item.minutes).put("priority", item.priority)) }
-                .onSuccess { state -> remotePlan = state.plan; snackbar.showSnackbar("任务已保存") }
+                .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks; snackbar.showSnackbar("任务已保存") }
                 .onFailure { snackbar.showSnackbar(it.message ?: "保存任务失败") } }
         }
 
         fun removeTask(item: RemotePlanItem) {
             scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "cancel_task").put("task_id", item.id).put("reason", "用户在移动端手动移除任务")) }
-                .onSuccess { state -> remotePlan = state.plan }
+                .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks }
                 .onFailure { snackbar.showSnackbar(it.message ?: "移除任务失败") } }
         }
 
-        fun createTask(title: String, minutes: Int, priority: Int) {
+        fun createTask(title: String, minutes: Int, priority: Int, projectId: String? = null) {
             scope.launch { runCatching {
                 gatewayExecuteAction(activity, remoteThreadId, JSONObject()
                     .put("type", "create_task")
                     .put("title", title)
                     .put("estimated_minutes", minutes)
                     .put("priority", priority)
+                    .apply { remoteProjects.firstOrNull { it.id == projectId }?.name?.let { put("project", it) } }
                     .put("reason", "用户在移动端手动新建任务"))
-            }.onSuccess { state -> remotePlan = state.plan }
+            }.onSuccess { state -> remotePlan = state.plan; remoteProjects = state.projects; remoteTasks = state.tasks }
                 .onFailure { snackbar.showSnackbar(it.message ?: "新建任务失败") } }
         }
 
@@ -914,8 +929,17 @@ private fun ForwardApp(activity: MainActivity) {
             val ids = taskIds.filter(String::isNotBlank)
             if (ids.size < 2) return
             scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "reorder_tasks").put("task_ids", JSONArray(ids)))}
-                .onSuccess { state -> remotePlan = state.plan }
+                .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks }
                 .onFailure { snackbar.showSnackbar(it.message ?: "排序失败") } }
+        }
+
+        fun addTaskToToday(task: RemoteTask) {
+            if (task.status == "open" || task.status == "in_progress") return
+            scope.launch {
+                runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "reopen_task").put("task_id", task.id)) }
+                    .onSuccess { state -> remotePlan = state.plan; remoteProjects = state.projects; remoteTasks = state.tasks }
+                    .onFailure { snackbar.showSnackbar(it.message ?: "加入今日计划失败") }
+            }
         }
 
         fun applyActions(actions: List<AssistantAction>) {
@@ -1045,7 +1069,7 @@ private fun ForwardApp(activity: MainActivity) {
                 if (result.plan == null) applyActions(result.actions)
                 val deviceResults = applyDeviceActions(result.deviceActions.ifEmpty { result.actions })
                 result.plan?.let { remotePlan = it }
-                result.state?.let { remoteMemories = it.memories; if (it.plan != null) remotePlan = it.plan }
+                result.state?.let { remoteMemories = it.memories; remoteProjects = it.projects; remoteTasks = it.tasks; if (it.plan != null) remotePlan = it.plan }
                 result.threadId?.let { id ->
                     remoteThreadId = id
                     if (conversationOptions.saveFullConversation) {
@@ -1063,6 +1087,31 @@ private fun ForwardApp(activity: MainActivity) {
             }
         }
 
+        ModalNavigationDrawer(
+            drawerState = drawerState,
+            gesturesEnabled = true,
+            drawerContent = {
+                ModalDrawerSheet(drawerContainerColor = Color(0xFFF5F6F2)) {
+                    Column(Modifier.fillMaxSize().padding(20.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.size(34.dp).clip(RoundedCornerShape(9.dp)).background(Cream), contentAlignment = Alignment.Center) { Icon(Icons.Default.ArrowForward, null, tint = Green, modifier = Modifier.size(21.dp)) }
+                            Spacer(Modifier.width(10.dp)); Column { Text("向前", color = Green, fontWeight = FontWeight.Bold, fontSize = 17.sp); Text("你的执行助手", color = Muted, fontSize = 10.sp) }
+                        }
+                        Spacer(Modifier.height(24.dp))
+                        TextButton(onClick = { drawerOpen = false; projectPageId = null; tab = 0 }, modifier = Modifier.fillMaxWidth()) { Text("今日计划", color = Green, fontSize = 14.sp) }
+                        Text("人生主线与支线", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 18.dp, bottom = 8.dp))
+                        remoteProjects.forEach { project ->
+                            TextButton(onClick = { drawerOpen = false; projectPageId = project.id; startConversation(defaultConversationOptions("project", project.id), 4) }, modifier = Modifier.fillMaxWidth()) {
+                                Icon(Icons.Default.FolderOpen, null, tint = Green, modifier = Modifier.size(17.dp)); Spacer(Modifier.width(8.dp)); Text(project.name, color = Ink, fontSize = 13.sp, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                        Spacer(Modifier.height(12.dp)); TextButton(onClick = { drawerOpen = false; tab = 1 }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.SmartToy, null, tint = Green, modifier = Modifier.size(17.dp)); Spacer(Modifier.width(8.dp)); Text("所有对话", color = Ink, fontSize = 13.sp) }
+                        TextButton(onClick = { drawerOpen = false; tab = 2 }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Lightbulb, null, tint = Green, modifier = Modifier.size(17.dp)); Spacer(Modifier.width(8.dp)); Text("记忆库", color = Ink, fontSize = 13.sp) }
+                        TextButton(onClick = { drawerOpen = false; tab = 3 }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Settings, null, tint = Green, modifier = Modifier.size(17.dp)); Spacer(Modifier.width(8.dp)); Text("设置", color = Ink, fontSize = 13.sp) }
+                    }
+                }
+            }
+        ) {
         Scaffold(
             containerColor = Canvas,
             snackbarHost = { SnackbarHost(snackbar) },
@@ -1070,9 +1119,10 @@ private fun ForwardApp(activity: MainActivity) {
                 TopAppBar(
                     title = {
                         Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(onClick = { drawerOpen = true }) {
                             Box(Modifier.size(32.dp).clip(RoundedCornerShape(8.dp)).background(Cream), contentAlignment = Alignment.Center) {
                                 Icon(Icons.Default.ArrowForward, null, tint = Green, modifier = Modifier.size(20.dp))
-                            }
+                            } }
                             Spacer(Modifier.width(9.dp))
                             Column { Text("向前", color = Green, fontWeight = FontWeight.Bold, fontSize = 16.sp); Text("你的执行助手", color = Muted, fontSize = 10.sp) }
                         }
@@ -1121,9 +1171,31 @@ private fun ForwardApp(activity: MainActivity) {
                         remoteMemories = state.memories
                         remotePlan = state.plan ?: remotePlan
                         remoteProjects = state.projects
+                        remoteTasks = state.tasks
                         scope.launch { runCatching { gatewayMemoryStatus(activity) }.onSuccess { memoryStatus = it } }
                     },
                     onStatusChanged = { memoryStatus = it }
+                )
+                4 -> ProjectScreen(
+                    padding = padding,
+                    project = remoteProjects.firstOrNull { it.id == projectPageId },
+                    plan = remotePlan,
+                    tasks = remoteTasks,
+                    messages = messages,
+                    input = input,
+                    aiBusy = aiBusy,
+                    threadLoading = threadLoading,
+                    conversationOptions = conversationOptions,
+                    projects = remoteProjects,
+                    threads = threads,
+                    onInput = { input = it },
+                    onSend = ::sendMessage,
+                    onLoadThread = ::loadThread,
+                    onStartConversation = { startConversation(it, 4) },
+                    onUpdateConversationOptions = ::updateConversationOptions,
+                    onCreateTask = { title, minutes, priority, projectId -> createTask(title, minutes, priority, projectId) },
+                    onAddTaskToToday = ::addTaskToToday,
+                    onBack = { projectPageId = null; tab = 0 }
                 )
                 else -> SettingsScreen(
                     padding,
@@ -1141,7 +1213,7 @@ private fun ForwardApp(activity: MainActivity) {
                     selectedModel = selectedModel,
                     onAiSelection = { providerId, model -> selectedProviderId = providerId; selectedModel = model; activity.saveAiSelection(providerId, model) },
                     onUsageSnapshotChanged = { usageSnapshot = activity.usageSnapshot() },
-                    onRemoteState = { state -> remotePlan = state.plan; remoteMemories = state.memories; remoteProjects = state.projects },
+                    onRemoteState = { state -> remotePlan = state.plan; remoteMemories = state.memories; remoteProjects = state.projects; remoteTasks = state.tasks },
                     onThreadsRefresh = {
                         scope.launch {
                             runCatching { gatewayListThreads(activity) }
@@ -1161,6 +1233,7 @@ private fun ForwardApp(activity: MainActivity) {
                     }
                 )
             }
+        }
         }
         if (showProjects) {
             ProjectOverviewDialog(
@@ -1668,7 +1741,8 @@ private fun ChatScreen(
     threads: List<ConversationThread>,
     onLoadThread: (ConversationThread) -> Unit,
     onStartConversation: (ConversationOptions) -> Unit,
-    onUpdateConversationOptions: (ConversationOptions) -> Unit
+    onUpdateConversationOptions: (ConversationOptions) -> Unit,
+    modifier: Modifier = Modifier
 ) {
     val listState = rememberLazyListState()
     var showHistory by remember { mutableStateOf(false) }
@@ -1679,7 +1753,7 @@ private fun ChatScreen(
         ?: threads.firstOrNull { it.projectId == conversationOptions.projectId }?.projectName.orEmpty()
     LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex) }
 
-    Column(Modifier.fillMaxSize().padding(padding)) {
+    Column(modifier.fillMaxSize().padding(padding)) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 13.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -1777,6 +1851,113 @@ private fun ChatScreen(
             onSave = { options -> showConversationOptions = false; onUpdateConversationOptions(options) }
         )
     }
+}
+
+@Composable
+private fun ProjectScreen(
+    padding: PaddingValues,
+    project: RemoteProject?,
+    plan: RemotePlan?,
+    tasks: List<RemoteTask>,
+    messages: List<ChatMessage>,
+    input: TextFieldValue,
+    aiBusy: Boolean,
+    threadLoading: Boolean,
+    conversationOptions: ConversationOptions,
+    projects: List<RemoteProject>,
+    threads: List<ConversationThread>,
+    onInput: (TextFieldValue) -> Unit,
+    onSend: () -> Unit,
+    onLoadThread: (ConversationThread) -> Unit,
+    onStartConversation: (ConversationOptions) -> Unit,
+    onUpdateConversationOptions: (ConversationOptions) -> Unit,
+    onCreateTask: (String, Int, Int, String?) -> Unit,
+    onAddTaskToToday: (RemoteTask) -> Unit,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val projectName = project?.name.orEmpty()
+    val projectTasks = tasks.filter { it.projectId == project?.id }
+    val completedCount = projectTasks.count { it.status == "done" }
+    var showTaskDialog by remember { mutableStateOf(false) }
+    Column(modifier.fillMaxSize().padding(padding)) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onBack, contentPadding = PaddingValues(0.dp)) { Text("‹ 今日", color = Green, fontSize = 12.sp) }
+            Spacer(Modifier.width(12.dp)); Text(projectName.ifBlank { "项目" }, color = Green, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        project?.let {
+            Card(Modifier.fillMaxWidth().padding(horizontal = 16.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF1EC)), shape = RoundedCornerShape(10.dp)) {
+                Column(Modifier.padding(12.dp)) {
+                    Text(it.description.ifBlank { "还没有项目说明。" }, color = Color(0xFF4C7168), fontSize = 11.sp, lineHeight = 16.sp)
+                    Text("${if (it.kind == "goal") "长期目标" else "项目"} · ${completedCount}/${projectTasks.size} 项完成 · ${it.dueAt?.takeUnless { value -> value == "null" } ?: "持续推进"}", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 6.dp))
+                    if (projectTasks.isNotEmpty()) {
+                        LinearProgressIndicator(progress = { completedCount.toFloat() / projectTasks.size.toFloat() }, modifier = Modifier.fillMaxWidth().padding(top = 9.dp), color = Green, trackColor = Color(0xFFD3E1D8))
+                    }
+                }
+            }
+        }
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("项目任务", color = Green, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+            TextButton(onClick = { showTaskDialog = true }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) { Icon(Icons.Default.Add, null, tint = Green, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(4.dp)); Text("新建任务", color = Green, fontSize = 11.sp) }
+        }
+        if (projectTasks.isEmpty()) {
+            Text("还没有这个项目的任务，可以先新建一项。", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
+        } else {
+            LazyColumn(Modifier.fillMaxWidth().heightIn(max = 190.dp).padding(horizontal = 16.dp)) {
+                items(projectTasks, key = { it.id }) { task ->
+                    val progress = (task.actualMinutes.toFloat() / task.minutes.coerceAtLeast(1)).coerceIn(0f, 1f)
+                    Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(task.title, color = if (task.status == "done") Muted else Ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, textDecoration = if (task.status == "done") androidx.compose.ui.text.style.TextDecoration.LineThrough else null, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("${task.minutes} 分钟 · ${when (task.status) { "done" -> "已完成"; "deferred" -> "已顺延"; "cancelled" -> "已取消"; else -> "待完成" }}", color = Muted, fontSize = 10.sp)
+                            LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth().padding(top = 4.dp), color = if (task.status == "done") Color(0xFF74A99A) else Coral, trackColor = Color(0xFFE5ECE7))
+                        }
+                        if (task.status == "deferred" || task.status == "cancelled") {
+                            TextButton(onClick = { onAddTaskToToday(task) }, contentPadding = PaddingValues(horizontal = 5.dp)) { Text("加入今日", color = Green, fontSize = 10.sp) }
+                        }
+                    }
+                }
+            }
+        }
+        ChatScreen(
+            padding = PaddingValues(0.dp), messages = messages, input = input, onInput = onInput, onSend = onSend,
+            aiBusy = aiBusy, threadLoading = threadLoading, conversationOptions = conversationOptions, projects = projects,
+            threads = threads, onLoadThread = onLoadThread, onStartConversation = onStartConversation, onUpdateConversationOptions = onUpdateConversationOptions,
+            modifier = Modifier.weight(1f)
+        )
+    }
+    if (showTaskDialog) {
+        CreateProjectTaskDialog(
+            projectId = project?.id,
+            onDismiss = { showTaskDialog = false },
+            onCreate = { title, minutes, priority -> showTaskDialog = false; onCreateTask(title, minutes, priority, project?.id) }
+        )
+    }
+}
+
+@Composable
+private fun CreateProjectTaskDialog(
+    projectId: String?,
+    onDismiss: () -> Unit,
+    onCreate: (String, Int, Int) -> Unit
+) {
+    var title by remember { mutableStateOf("") }
+    var minutes by remember { mutableStateOf("45") }
+    var priority by remember { mutableStateOf(3) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("新建项目任务", color = Green, fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("任务内容") }, singleLine = true)
+                OutlinedTextField(value = minutes, onValueChange = { minutes = it.filter(Char::isDigit) }, label = { Text("预计分钟") }, singleLine = true)
+                Text("优先级", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 10.dp, bottom = 4.dp))
+                Row { listOf(1 to "低", 3 to "中", 5 to "高").forEach { (value, label) -> TextButton(onClick = { priority = value }) { Text(if (priority == value) "✓ $label" else label, color = if (priority == value) Green else Muted) } } }
+            }
+        },
+        confirmButton = { TextButton(onClick = { if (title.isNotBlank()) onCreate(title.trim(), minutes.toIntOrNull()?.coerceIn(5, 720) ?: 45, priority) }) { Text("创建", color = Green) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消", color = Muted) } }
+    )
 }
 
 @Composable

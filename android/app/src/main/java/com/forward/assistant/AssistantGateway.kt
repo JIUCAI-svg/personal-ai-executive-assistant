@@ -52,10 +52,22 @@ data class RemoteProject(
     val priority: Int = 3,
     val description: String = ""
 )
+data class RemoteTask(
+    val id: String,
+    val projectId: String? = null,
+    val title: String,
+    val notes: String = "",
+    val status: String = "open",
+    val priority: Int = 3,
+    val minutes: Int = 45,
+    val actualMinutes: Int = 0,
+    val dueAt: String? = null
+)
 data class RemoteState(
     val plan: RemotePlan?,
     val memories: List<RemoteMemory>,
-    val projects: List<RemoteProject> = emptyList()
+    val projects: List<RemoteProject> = emptyList(),
+    val tasks: List<RemoteTask> = emptyList()
 )
 
 /** Conversation metadata is deliberately independent from the selected mode. */
@@ -109,6 +121,18 @@ private fun remoteProject(item: JSONObject): RemoteProject = RemoteProject(
     priority = item.optInt("priority", 3), description = item.optString("description")
 )
 
+private fun remoteTask(item: JSONObject): RemoteTask = RemoteTask(
+    id = item.optString("id"),
+    projectId = item.optString("project_id").ifBlank { null },
+    title = item.optString("title"),
+    notes = item.optString("notes"),
+    status = item.optString("status", "open"),
+    priority = item.optInt("priority", 3),
+    minutes = item.optInt("estimated_minutes", 45),
+    actualMinutes = item.optInt("actual_minutes", 0),
+    dueAt = item.optString("due_at").takeUnless { it.isBlank() || it == "null" }
+)
+
 fun parseRemotePlan(json: JSONObject?): RemotePlan? {
     if (json == null) return null
     fun items(name: String): List<RemotePlanItem> {
@@ -135,7 +159,10 @@ fun parseRemoteState(json: JSONObject?): RemoteState {
     val projects = state.optJSONArray("projects")?.let { array ->
         (0 until array.length()).mapNotNull { index -> array.optJSONObject(index)?.let(::remoteProject) }
     }.orEmpty()
-    return RemoteState(parseRemotePlan(state.optJSONObject("plan")), memories, projects)
+    val tasks = state.optJSONArray("tasks")?.let { array ->
+        (0 until array.length()).mapNotNull { index -> array.optJSONObject(index)?.let(::remoteTask) }
+    }.orEmpty()
+    return RemoteState(parseRemotePlan(state.optJSONObject("plan")), memories, projects, tasks)
 }
 
 private fun remoteThread(item: JSONObject): ConversationThread = ConversationThread(
