@@ -1421,6 +1421,13 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       now: planBefore.now,
       conversation_mode: hydratedThread.mode,
       project: projectName || null,
+      projects: stateBefore.projects.map((item) => ({
+        id: item.id, name: item.name, kind: item.kind, status: item.status,
+        priority: item.priority, due_at: item.due_at, description: item.description
+      })),
+      project_tasks: (stateBefore.tasks || [])
+        .filter((item) => !hydratedThread.project_id || item.project_id === hydratedThread.project_id)
+        .slice(0, 20),
       sleep_time: planBefore.sleep_time,
       wake_time: planBefore.wake_time,
       today_plan: planBefore.scheduled.slice(0, 12),

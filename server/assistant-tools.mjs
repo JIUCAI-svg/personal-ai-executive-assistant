@@ -55,6 +55,16 @@ export const ASSISTANT_TOOLS = Object.freeze([
       project: '可选项目名', due_at: '可选 ISO 时间', date: '可选 YYYY-MM-DD', reason: '创建原因'
     }
   },
+  {
+    name: 'create_project',
+    description: '创建一个人生主线、支线或具体项目，并可设置说明、优先级和截止时间。',
+    parameters: { name: '目标或项目名称', kind: 'goal 或 project', description: '项目说明', priority: '1-5', due_at: '可选 ISO 截止时间', reason: '创建原因' }
+  },
+  {
+    name: 'update_project',
+    description: '修改项目名称、说明、类型、优先级、截止时间或状态；项目状态可设为 active、paused、completed、archived。',
+    parameters: { project: '项目名称', project_id: '可选项目 ID', name: '新名称', kind: 'goal 或 project', description: '新说明', priority: '1-5', due_at: '截止时间 ISO', status: 'active、paused、completed 或 archived', reason: '修改原因' }
+  },
   { name: 'start_task_timer', description: '开始一项任务的正计时或倒计时；同一时间只运行一个任务。', parameters: { task: '任务名称', task_id: '可选任务 ID', mode: '可选 stopwatch 或 countdown', target_minutes: '倒计时分钟数' } },
   { name: 'pause_task_timer', description: '暂停任务计时并累计已用时间。', parameters: { task: '任务名称', task_id: '可选任务 ID' } },
   { name: 'stop_task_timer', description: '停止任务计时并保存本次时间。', parameters: { task: '任务名称', task_id: '可选任务 ID' } },
@@ -90,6 +100,8 @@ const REQUIRED_PARAMETERS = {
   cancel_task: ['task'],
   defer_task: ['task'],
   create_task: ['title'],
+  create_project: ['name'],
+  update_project: ['project'],
   set_unavailable_period: ['start', 'end'],
   capture_memory: ['title']
 };
@@ -104,6 +116,11 @@ export const ASSISTANT_SKILLS = Object.freeze([
     name: 'task_management',
     description: '创建、编辑、排序、计时、完成、取消和顺延任务。',
     tools: ['create_task', 'update_task', 'reorder_tasks', 'start_task_timer', 'pause_task_timer', 'stop_task_timer', 'complete_task', 'reopen_task', 'complete_current_task', 'cancel_task', 'cancel_all_tasks', 'defer_task']
+  },
+  {
+    name: 'project_management',
+    description: '创建、查看和调整人生主线、支线与项目。',
+    tools: ['create_project', 'update_project', 'create_task', 'update_task']
   },
   {
     name: 'dynamic_planning',
@@ -172,9 +189,9 @@ export function assistantSkillCatalog() {
 export function assistantSkillPrompt(mode = 'assistant') {
   const modeSkills = {
     temporary: ['daily_assistant'],
-    assistant: ['daily_assistant', 'task_management', 'dynamic_planning', 'knowledge_memory'],
-    project: ['daily_assistant', 'task_management', 'knowledge_memory'],
-    daily_planning: ['daily_assistant', 'task_management', 'dynamic_planning', 'daily_review']
+    assistant: ['daily_assistant', 'task_management', 'project_management', 'dynamic_planning', 'knowledge_memory'],
+    project: ['daily_assistant', 'task_management', 'project_management', 'knowledge_memory'],
+    daily_planning: ['daily_assistant', 'task_management', 'project_management', 'dynamic_planning', 'daily_review']
   };
   const selected = new Set(modeSkills[mode] || modeSkills.assistant);
   return ASSISTANT_SKILLS

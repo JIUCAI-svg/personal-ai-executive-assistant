@@ -83,3 +83,15 @@ test('goals and projects support deadlines and task estimates', async () => {
   const updated = await store.updateTask(task.id, { due_at: '2026-09-04T18:00:00+08:00' });
   assert.equal(updated.due_at, '2026-09-04T18:00:00+08:00');
 });
+
+test('AI project actions create and update projects', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'forward-project-actions-'));
+  const store = new AssistantStateStore(root);
+  await store.bootstrap();
+  let result = await store.executeActions([{ type: 'create_project', name: '人生支线：内容创作', kind: 'project', description: '持续推进短剧与直播', priority: 3 }]);
+  assert.equal(result.results[0].ok, true);
+  const project = result.results[0].project;
+  result = await store.executeActions([{ type: 'update_project', project_id: project.id, status: 'paused', description: '本周暂缓，补考后恢复' }]);
+  assert.equal(result.results[0].project.status, 'paused');
+  assert.equal((await store.bootstrap()).projects.find((item) => item.id === project.id).description, '本周暂缓，补考后恢复');
+});

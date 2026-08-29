@@ -65,6 +65,10 @@ function normalizeText(value, limit = 240) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
 }
 
+function projectKey(value) {
+  return normalizeText(value, 120).toLocaleLowerCase('zh-CN').replace(/[\s·•，,。.:：-]/g, '');
+}
+
 function memoryKey(value) {
   return normalizeText(value, 220)
     .toLocaleLowerCase('zh-CN')
@@ -994,6 +998,37 @@ export class AssistantStateStore {
               id: requestedId || '', time: requestedTime || '', date: requestedDate, label: requestedLabel || ''
             }, reason: '没有找到匹配的待处理闹钟。' };
           }
+        } else if (type === 'create_project') {
+          const name = normalizeText(action.name, 120);
+          if (name) {
+            const existing = state.projects.find((item) => projectKey(item.name) === projectKey(name));
+            if (existing) {
+              result = { type, ok: true, project: existing, reason: '同名项目已经存在，继续使用现有项目。' };
+            } else {
+              const project = {
+                id: id(), name, description: normalizeText(action.description, 500),
+                kind: action.kind === 'goal' ? 'goal' : 'project', status: 'active',
+                priority: taskPriority(action.priority), due_at: normalizeText(action.due_at, 48) || null,
+                created_at: timestamp, updated_at: timestamp
+              };
+              state.projects.push(project);
+              result = { type, ok: true, project, reason: action.reason || '目标或项目已创建。' };
+            }
+          }
+        } else if (type === 'update_project') {
+          const project = action.project_id
+            ? state.projects.find((item) => item.id === action.project_id)
+            : state.projects.find((item) => projectKey(item.name) === projectKey(action.project));
+          if (project) {
+            if (action.name !== undefined) project.name = normalizeText(action.name, 120) || project.name;
+            if (action.description !== undefined) project.description = normalizeText(action.description, 500);
+            if (action.kind !== undefined) project.kind = action.kind === 'goal' ? 'goal' : 'project';
+            if (action.priority !== undefined) project.priority = taskPriority(action.priority);
+            if (action.due_at !== undefined) project.due_at = normalizeText(action.due_at, 48) || null;
+            if (['active', 'paused', 'completed', 'archived'].includes(action.status)) project.status = action.status;
+            project.updated_at = timestamp;
+            result = { type, ok: true, project, reason: action.reason || '项目已更新。' };
+          } else result = { type, ok: false, reason: '没有找到匹配的项目。' };
         } else if (type === 'create_task') {
           const title = normalizeText(action.title, 120);
           if (title) {
