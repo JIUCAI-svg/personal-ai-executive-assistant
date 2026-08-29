@@ -339,3 +339,18 @@ suspend fun gatewayInitializeCloud(context: Context): RemoteState = kotlinx.coro
         parseRemoteState(connection.readJsonOrThrow("初始化云端同步失败").optJSONObject("state"))
     } finally { connection.disconnect() }
 }
+
+suspend fun gatewayCreateProject(context: Context, name: String, kind: String, description: String, priority: Int = 3, dueAt: String? = null): RemoteState = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val request = JSONObject().apply {
+        put("name", name)
+        put("kind", if (kind == "goal") "goal" else "project")
+        put("description", description)
+        put("priority", priority)
+        put("due_at", dueAt ?: JSONObject.NULL)
+    }.toString().toByteArray(Charsets.UTF_8)
+    val connection = gatewayConnection(context, "/api/assistant/projects", "POST", request)
+    try {
+        connection.outputStream.use { it.write(request) }
+        parseRemoteState(connection.readJsonOrThrow("新建项目失败").optJSONObject("state"))
+    } finally { connection.disconnect() }
+}

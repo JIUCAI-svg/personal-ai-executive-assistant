@@ -713,6 +713,7 @@ private fun ForwardApp(activity: MainActivity) {
         var now by remember { mutableStateOf(LocalDateTime.now()) }
         var messages by remember { mutableStateOf(emptyList<ChatMessage>()) }
         var showProjects by remember { mutableStateOf(false) }
+        var showCreateProject by remember { mutableStateOf(false) }
         LaunchedEffect(breakTimer?.running) {
             while (breakTimer?.running == true) {
                 delay(1000)
@@ -847,6 +848,14 @@ private fun ForwardApp(activity: MainActivity) {
 
         fun beginBreak() {
             breakTimer = BreakTimerState()
+        }
+
+        fun createProject(name: String, kind: String, description: String, priority: Int, dueAt: String?) {
+            scope.launch {
+                runCatching { gatewayCreateProject(activity, name, kind, description, priority, dueAt) }
+                    .onSuccess { state -> remotePlan = state.plan; remoteMemories = state.memories; remoteProjects = state.projects; showCreateProject = false; snackbar.showSnackbar("目标或项目已创建") }
+                    .onFailure { snackbar.showSnackbar(it.message ?: "新建项目失败") }
+            }
         }
 
         fun completeTask() {
@@ -1156,7 +1165,14 @@ private fun ForwardApp(activity: MainActivity) {
         if (showProjects) {
             ProjectOverviewDialog(
                 projects = remoteProjects,
-                onDismiss = { showProjects = false }
+                onDismiss = { showProjects = false },
+                onCreateProject = { showCreateProject = true }
+            )
+        }
+        if (showCreateProject) {
+            CreateProjectDialog(
+                onDismiss = { showCreateProject = false },
+                onCreate = ::createProject
             )
         }
     }
@@ -1165,7 +1181,8 @@ private fun ForwardApp(activity: MainActivity) {
 @Composable
 private fun ProjectOverviewDialog(
     projects: List<RemoteProject>,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onCreateProject: () -> Unit
 ) {
     var selectedProjectId by remember { mutableStateOf<String?>(null) }
     val selectedProject = projects.firstOrNull { it.id == selectedProjectId }
@@ -1175,9 +1192,12 @@ private fun ProjectOverviewDialog(
         containerColor = Color(0xFFFFFEFA),
         tonalElevation = 0.dp,
         title = {
-            Column {
-                Text("目标与项目", color = Green, fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
-                Text(if (selectedProject == null) "长期目标和项目截止日期" else "项目详情", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("目标与项目", color = Green, fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
+                    Text(if (selectedProject == null) "长期目标和项目截止日期" else "项目详情", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+                }
+                if (selectedProject == null) TextButton(onClick = onCreateProject) { Icon(Icons.Default.Add, null, tint = Green, modifier = Modifier.size(16.dp)); Text("新建", color = Green, fontSize = 12.sp) }
             }
         },
         text = {
@@ -1239,6 +1259,45 @@ private fun ProjectOverviewDialog(
         confirmButton = {
             TextButton(onClick = onDismiss) { Text("关闭", color = Green) }
         }
+    )
+}
+
+@Composable
+private fun CreateProjectDialog(
+    onDismiss: () -> Unit,
+    onCreate: (String, String, String, Int, String?) -> Unit
+) {
+    var name by remember { mutableStateOf("") }
+    var kind by remember { mutableStateOf("project") }
+    var description by remember { mutableStateOf("") }
+    var priority by remember { mutableStateOf(3) }
+    var dueAt by remember { mutableStateOf("") }
+    val priorityChoices = listOf(Triple(5, "高", Color(0xFFE17E5D)), Triple(3, "中", Color(0xFF55A496)), Triple(1, "低", Color(0xFF968BD0)))
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        shape = RoundedCornerShape(22.dp),
+        containerColor = Color(0xFFFFFEFA),
+        title = { Text("新建目标或项目", color = Green, fontSize = 20.sp, fontWeight = FontWeight.SemiBold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(name, { name = it }, label = { Text("名称") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    listOf("goal" to "长期目标", "project" to "项目").forEach { (value, label) ->
+                        TextButton(onClick = { kind = value }, modifier = Modifier.weight(1f)) { Text(if (kind == value) "✓ $label" else label, color = if (kind == value) Green else Muted) }
+                    }
+                }
+                OutlinedTextField(description, { description = it }, label = { Text("说明（可选）") }, minLines = 2, maxLines = 4, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(dueAt, { dueAt = it }, label = { Text("截止时间（可选）") }, placeholder = { Text("例如 2026-09-05T23:59:00+08:00") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Text("优先级", color = Muted, fontSize = 11.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(7.dp), modifier = Modifier.fillMaxWidth()) {
+                    priorityChoices.forEach { (value, label, color) ->
+                        TextButton(onClick = { priority = value }, modifier = Modifier.weight(1f)) { Text(if (priority == value) "● $label" else label, color = if (priority == value) color else Muted, fontSize = 12.sp) }
+                    }
+                }
+            }
+        },
+        confirmButton = { Button(onClick = { onCreate(name.trim(), kind, description.trim(), priority, dueAt.trim().takeIf { it.isNotBlank() }) }, enabled = name.trim().isNotBlank(), colors = ButtonDefaults.buttonColors(containerColor = Green)) { Text("创建") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消", color = Muted) } }
     )
 }
 
