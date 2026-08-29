@@ -19,6 +19,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -900,6 +901,15 @@ private fun ForwardApp(activity: MainActivity) {
                 .onFailure { snackbar.showSnackbar(it.message ?: "重新打开失败") } }
         }
 
+        fun completeSpecificTask(item: RemotePlanItem) {
+            if (item.id.isBlank()) return
+            scope.launch {
+                runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "complete_task").put("task_id", item.id).put("reason", "用户双击今日计划任务完成")) }
+                    .onSuccess { state -> remotePlan = state.plan?.copy(activeTimer = null); remoteProjects = state.projects; remoteTasks = state.tasks }
+                    .onFailure { snackbar.showSnackbar(it.message ?: "完成任务失败") }
+            }
+        }
+
         fun editTask(item: RemotePlanItem) {
             scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "update_task").put("task_id", item.id).put("title", item.title).put("estimated_minutes", item.minutes).put("priority", item.priority)) }
                 .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks; snackbar.showSnackbar("任务已保存") }
@@ -1150,7 +1160,7 @@ private fun ForwardApp(activity: MainActivity) {
                 0 -> TodayScreen(padding, now, sleepTime, currentDone, unavailablePeriod, breakTimer, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), remotePlan, remoteProjects, { showProjects = true }, ::completeTask, ::startCurrentTimer, ::pauseCurrentTimer, { breakTimer = breakTimer?.copy(running = !breakTimer!!.running) }, { breakTimer = null; currentDone = false }, ::reopenTask, ::editTask, ::removeTask, ::createTask, { parent, title, minutes, priority ->
                     val projectId = remoteProjects.firstOrNull { it.name == parent.project }?.id
                     createTask(title, minutes, priority, projectId, parent.id)
-                }, ::reorderTasks, ::sendMessage, input, { value -> input = value }, aiBusy)
+                }, ::completeSpecificTask, ::reorderTasks, ::sendMessage, input, { value -> input = value }, aiBusy)
                 1 -> ChatScreen(
                     padding = padding,
                     messages = messages,
@@ -1402,6 +1412,7 @@ private fun TodayScreen(
     removeTask: (RemotePlanItem) -> Unit,
     createTask: (String, Int, Int) -> Unit,
     createSubtask: (RemotePlanItem, String, Int, Int) -> Unit,
+    completeSpecificTask: (RemotePlanItem) -> Unit,
     reorderTasks: (List<String>) -> Unit,
     sendMessage: () -> Unit,
     input: TextFieldValue,
@@ -1492,6 +1503,7 @@ private fun TodayScreen(
                 scheduled = item,
                 editTask = { task -> editingTask = task; editTitle = task.title; editMinutes = task.minutes.toString(); editPriority = task.priority.toString() },
                 removeTask = removeTask,
+                completeTask = completeSpecificTask,
                 createSubtask = { item ->
                     val source = remotePlan?.scheduled.orEmpty().firstOrNull { it.id == item.item.id }
                         ?: remotePlan?.deferred.orEmpty().firstOrNull { it.id == item.item.id }
@@ -1717,6 +1729,7 @@ private fun PlanRow(
     scheduled: ScheduledPlanItem,
     editTask: (RemotePlanItem) -> Unit,
     removeTask: (RemotePlanItem) -> Unit = {},
+    completeTask: (RemotePlanItem) -> Unit = {},
     createSubtask: (ScheduledPlanItem) -> Unit = {},
     isDragging: Boolean = false,
     dragOffset: Float = 0f,
@@ -1743,7 +1756,7 @@ private fun PlanRow(
             onDrag = { _, amount -> onDrag(amount.y) }
         )
     } else Modifier
-    Row(dragModifier.graphicsLayer { translationY = if (isDragging) dragOffset else 0f; alpha = if (isDragging) 0.86f else 1f }.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalAlignment = Alignment.Top) { Text(time, color = Muted, fontSize = 10.sp, modifier = Modifier.width(39.dp)); Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(18.dp)) { Box(Modifier.size(9.dp).border(2.dp, item.tone, CircleShape).clip(CircleShape).background(Rail)); Box(Modifier.width(1.dp).height(39.dp).background(Color(0xFFD2DAD1))) }; Spacer(Modifier.width(7.dp)); Column(Modifier.weight(1f).clickable { if (item.id.isNotBlank()) editTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes)) }) { Text(item.title, color = if (item.done || scheduled.deferredByCapacity) Muted else Ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, textDecoration = if (item.done) androidx.compose.ui.text.style.TextDecoration.LineThrough else null, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(note, color = Muted, fontSize = 10.sp) }; if (!item.done && item.id.isNotBlank()) TextButton(onClick = { createSubtask(scheduled) }, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)) { Text("子任务", color = Muted, fontSize = 10.sp) }; if (item.done) Icon(Icons.Default.TaskAlt, null, tint = Color(0xFF4A897D), modifier = Modifier.size(17.dp)) }
+    Row(dragModifier.graphicsLayer { translationY = if (isDragging) dragOffset else 0f; alpha = if (isDragging) 0.86f else 1f }.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalAlignment = Alignment.Top) { Text(time, color = Muted, fontSize = 10.sp, modifier = Modifier.width(39.dp)); Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(18.dp)) { Box(Modifier.size(9.dp).border(2.dp, item.tone, CircleShape).clip(CircleShape).background(Rail)); Box(Modifier.width(1.dp).height(39.dp).background(Color(0xFFD2DAD1))) }; Spacer(Modifier.width(7.dp)); Column(Modifier.weight(1f).combinedClickable(onClick = { if (item.id.isNotBlank()) editTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes)) }, onDoubleClick = { if (!item.done && item.id.isNotBlank()) completeTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes)) })) { Text(item.title, color = if (item.done || scheduled.deferredByCapacity) Muted else Ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, textDecoration = if (item.done) androidx.compose.ui.text.style.TextDecoration.LineThrough else null, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(note, color = Muted, fontSize = 10.sp) }; if (!item.done && item.id.isNotBlank()) TextButton(onClick = { createSubtask(scheduled) }, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)) { Text("子任务", color = Muted, fontSize = 10.sp) }; if (item.done) Icon(Icons.Default.TaskAlt, null, tint = Color(0xFF4A897D), modifier = Modifier.size(17.dp)) }
 }
 
 @Composable
