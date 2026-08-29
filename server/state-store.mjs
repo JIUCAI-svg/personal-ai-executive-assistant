@@ -11,7 +11,8 @@ const DEFAULT_SETTINGS = {
   wake_time: '08:00',
   focus_minutes: 50,
   break_minutes: 10,
-  buffer_minutes: 60
+  buffer_minutes: 60,
+  clear_completed_at_sleep: true
 };
 
 function id() {
@@ -63,6 +64,17 @@ function isoAt(date, time) {
 
 function normalizeText(value, limit = 240) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+
+function completedSinceSleep(task, current, sleepTime) {
+  if (!task.completed_at) return false;
+  const sleepMinutes = minutes(sleepTime);
+  if (sleepMinutes === null) return true;
+  const currentMinutes = minutes(current.time) ?? 0;
+  const boundaryDate = currentMinutes >= sleepMinutes ? current.date : plusDays(current.date, -1);
+  const boundary = Date.parse(`${isoAt(boundaryDate, sleepTime)}`);
+  const completed = Date.parse(String(task.completed_at));
+  return Number.isFinite(completed) && completed >= boundary;
 }
 
 function projectKey(value) {
@@ -163,7 +175,11 @@ export function repairAssistantState(source) {
   return {
     ...base,
     ...state,
-    settings: { ...DEFAULT_SETTINGS, ...(state.settings || {}) },
+    settings: {
+      ...DEFAULT_SETTINGS,
+      ...(state.settings || {}),
+      clear_completed_at_sleep: state.settings?.clear_completed_at_sleep !== false
+    },
     projects: (Array.isArray(state.projects) ? state.projects : base.projects).map((project, index) => ({
       ...project,
       kind: project.kind === 'goal' ? 'goal' : 'project',
@@ -364,7 +380,7 @@ function buildPlan(state, current = nowParts()) {
     next_task: scheduled[1] || null,
     active_timer: activeTimer,
     scheduled,
-    completed: state.tasks.filter((task) => task.status === 'done').slice().sort((a, b) => String(b.completed_at || '').localeCompare(String(a.completed_at || ''))).map((task) => ({
+    completed: state.tasks.filter((task) => task.status === 'done' && (!state.settings.clear_completed_at_sleep || completedSinceSleep(task, current, state.settings.sleep_time))).slice().sort((a, b) => String(b.completed_at || '').localeCompare(String(a.completed_at || ''))).map((task) => ({
       id: task.id, title: task.title, project: taskProject(task, state.projects)?.name || '未归类', priority: task.priority,
       parent_task_id: task.parent_task_id || null,
       estimated_minutes: task.estimated_minutes, actual_minutes: task.actual_minutes || 0, status: task.status, completed_at: task.completed_at || '', notes: task.notes || ''

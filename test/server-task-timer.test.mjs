@@ -22,6 +22,21 @@ test('task timer lifecycle keeps completed tasks and supports reopen', async () 
   assert.equal(result.results[0].task.status, 'open');
 });
 
+test('completed tasks auto-clear from the daily plan after the sleep boundary while history remains', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'forward-task-completed-clear-'));
+  const store = new AssistantStateStore(root);
+  const state = await store.bootstrap();
+  const task = state.tasks[0];
+  await store.mutate((draft) => {
+    const item = draft.tasks.find((entry) => entry.id === task.id);
+    item.status = 'done';
+    item.completed_at = '2020-01-01T01:05:00+08:00';
+  });
+  const refreshed = await store.bootstrap();
+  assert.equal(refreshed.plan.completed.some((item) => item.id === task.id), false);
+  assert.equal((await store.listTasks()).find((item) => item.id === task.id).status, 'done');
+});
+
 test('mobile action timer keeps sub-minute precision when paused', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'forward-task-timer-precision-'));
   const store = new AssistantStateStore(root);
