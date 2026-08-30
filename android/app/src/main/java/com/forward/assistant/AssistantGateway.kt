@@ -35,6 +35,7 @@ data class RemotePlan(
     val wakeTime: String,
     val sleepDurationMinutes: Int = 480,
     val isSleeping: Boolean = false,
+    val showSleepPlan: Boolean = false,
     val availableMinutes: Int,
     val scheduledMinutes: Int,
     val bufferMinutes: Int,
@@ -43,6 +44,7 @@ data class RemotePlan(
     val adjustmentReason: String,
     val scheduled: List<RemotePlanItem>,
     val deferred: List<RemotePlanItem>,
+    val sleeping: List<RemotePlanItem> = emptyList(),
     val completed: List<RemotePlanItem> = emptyList(),
     val currentTaskId: String?,
     val activeTimer: RemoteActiveTimer? = null
@@ -176,10 +178,10 @@ fun parseRemotePlan(json: JSONObject?): RemotePlan? {
     }
     val active = json.optJSONObject("active_timer")?.let { timer -> RemoteActiveTimer(timer.optString("task_id"), timer.optString("mode", "stopwatch"), timer.optInt("target_minutes"), timer.optLong("elapsed_seconds")) }
     return RemotePlan(
-        now = json.optString("now"), sleepTime = json.optString("sleep_time", "01:00"), wakeTime = json.optString("wake_time", "08:00"), sleepDurationMinutes = json.optInt("sleep_duration_minutes", 480), isSleeping = json.optBoolean("is_sleeping", false),
+        now = json.optString("now"), sleepTime = json.optString("sleep_time", "01:00"), wakeTime = json.optString("wake_time", "08:00"), sleepDurationMinutes = json.optInt("sleep_duration_minutes", 480), isSleeping = json.optBoolean("is_sleeping", false), showSleepPlan = json.optBoolean("show_sleep_plan", false),
         availableMinutes = json.optInt("available_minutes"), scheduledMinutes = json.optInt("scheduled_minutes"),
         bufferMinutes = json.optInt("buffer_minutes"), configuredBufferMinutes = json.optInt("configured_buffer_minutes", json.optInt("buffer_minutes")), freeMinutes = json.optInt("free_minutes"),
-        adjustmentReason = json.optString("adjustment_reason"), scheduled = items("scheduled"), deferred = items("deferred"),
+        adjustmentReason = json.optString("adjustment_reason"), scheduled = items("scheduled"), deferred = items("deferred"), sleeping = items("sleeping_tasks"),
         currentTaskId = json.optJSONObject("current_task")?.optString("id")?.ifBlank { null }, completed = items("completed"), activeTimer = active
     )
 }

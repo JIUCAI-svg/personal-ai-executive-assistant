@@ -608,6 +608,7 @@ function normalizeActions(actions) {
       ...(Number.isFinite(Number(action.priority)) ? { priority: Math.max(1, Math.min(5, Number(action.priority))) } : {}),
       ...(Number.isFinite(Number(action.target_minutes)) ? { target_minutes: Math.max(1, Math.min(720, Number(action.target_minutes))) } : {}),
       ...(Number.isFinite(Number(action.minutes)) ? { minutes: Math.max(0, Math.min(1440, Number(action.minutes))) } : {}),
+      ...(typeof action.visible === 'boolean' ? { visible: action.visible } : {}),
       ...(stringValue(action.project, 80) ? { project: stringValue(action.project, 80) } : {}),
       ...(stringValue(action.due_at, 40) ? { due_at: stringValue(action.due_at, 40) } : {}),
       ...(stringValue(action.date, 10) ? { date: stringValue(action.date, 10) } : {}),

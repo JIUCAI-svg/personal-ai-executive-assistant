@@ -239,6 +239,7 @@ data class AssistantAction(
     val alarmId: String? = null,
     val dueAt: String? = null,
     val projectId: String? = null
+    , val visible: Boolean? = null
 )
 data class DeviceActionResult(val action: AssistantAction, val result: AlarmOperationResult)
 data class AssistantResult(
@@ -404,13 +405,13 @@ private fun remoteScheduledItem(item: RemotePlanItem, deferred: Boolean): Schedu
 }
 
 private fun normalizeRemotePlanItems(remote: RemotePlan, now: LocalDateTime): List<ScheduledPlanItem> {
-    val source = remote.scheduled + remote.deferred
+    val source = remote.scheduled + remote.sleeping + remote.deferred
     val hasMissingTimes = remote.scheduled.any { it.start.isBlank() || it.end.isBlank() } ||
         (remote.scheduled.isEmpty() && remote.deferred.isNotEmpty())
     // If the gateway gives task totals but no actual slots, the slots are stale
     // regardless of the cached capacity number. Rebuild them for the live view.
     if (!hasMissingTimes) {
-        return remote.scheduled.map { remoteScheduledItem(it, false) } + remote.deferred.map { remoteScheduledItem(it, true) }
+        return remote.scheduled.map { remoteScheduledItem(it, false) } + remote.sleeping.map { remoteScheduledItem(it, true) } + remote.deferred.map { remoteScheduledItem(it, true) }
     }
     // A stale snapshot can contain the right totals but blank schedule fields.
     // Keep the server order and rebuild only the visual time slots locally.
@@ -573,6 +574,7 @@ private suspend fun requestAssistant(
                         label = action.optString("label").ifBlank { null },
                         repeat = action.optString("repeat").ifBlank { null },
                         alarmId = action.optString("alarm_id").ifBlank { null }
+                        , visible = if (action.has("visible")) action.optBoolean("visible") else null
                     )
                 }
             }.orEmpty(),
@@ -777,6 +779,7 @@ private fun ForwardApp(activity: MainActivity) {
         var remoteTasks by remember { mutableStateOf(emptyList<RemoteTask>()) }
         var remoteLongTasks by remember { mutableStateOf(emptyList<RemoteLongTask>()) }
         var remoteThreadId by remember { mutableStateOf<String?>(null) }
+        var showSleepPlan by remember { mutableStateOf(false) }
         var initialStateLoading by remember { mutableStateOf(true) }
         var conversationOptions by remember { mutableStateOf(defaultConversationOptions("assistant")) }
         var threads by remember { mutableStateOf(emptyList<ConversationThread>()) }
@@ -817,6 +820,7 @@ private fun ForwardApp(activity: MainActivity) {
                     remoteProjects = state.projects
                     remoteTasks = state.tasks
                     remoteLongTasks = state.longTasks
+                    showSleepPlan = state.plan?.showSleepPlan ?: showSleepPlan
                     runCatching { gatewayMemoryStatus(activity) }.onSuccess { memoryStatus = it }
                     parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
                     parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
@@ -861,6 +865,7 @@ private fun ForwardApp(activity: MainActivity) {
                         remoteProjects = state.projects
                         remoteTasks = state.tasks
                         remoteLongTasks = state.longTasks
+                        showSleepPlan = state.plan?.showSleepPlan ?: showSleepPlan
                         parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
                         parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
                     }
@@ -1326,6 +1331,8 @@ private fun ForwardApp(activity: MainActivity) {
                     onSleepTime = { time -> sleepTime = time; activity.savePlannerTime("sleep_time", time); scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_sleep_time").put("time", formatClock(time)).put("reason", "用户在移动端设置睡觉时间")) }.onSuccess { remotePlan = it.plan; remoteMemories = it.memories } } },
                     onWakeTime = { time -> wakeTime = time; activity.savePlannerTime("wake_time", time); scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_wake_time").put("time", formatClock(time)).put("reason", "用户在移动端设置起床时间")) }.onSuccess { remotePlan = it.plan; remoteMemories = it.memories } } },
                     onBufferMinutes = { minutes -> scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_buffer_minutes").put("minutes", minutes).put("reason", "用户在移动端设置缓冲时间")) }.onSuccess { state -> remotePlan = state.plan; remoteMemories = state.memories }.onFailure { snackbar.showSnackbar(it.message ?: "缓冲时间保存失败") } } },
+                    showSleepPlan = showSleepPlan,
+                    onSleepPlanVisibility = { visible -> showSleepPlan = visible; scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_sleep_plan_visibility").put("visible", visible).put("reason", "用户调整睡眠时段计划显示")) }.onSuccess { state -> remotePlan = state.plan; remoteMemories = state.memories }.onFailure { snackbar.showSnackbar(it.message ?: "睡眠时段显示设置保存失败") } } },
                     aiProviders = aiProviders,
                     selectedProviderId = selectedProviderId,
                     selectedModel = selectedModel,
@@ -2497,6 +2504,8 @@ private fun SettingsScreen(
     sleepTime: LocalTime,
     wakeTime: LocalTime,
     bufferMinutes: Int,
+    showSleepPlan: Boolean,
+    onSleepPlanVisibility: (Boolean) -> Unit,
     usageSnapshot: UsageMonitorSnapshot,
     onSleepTime: (LocalTime) -> Unit,
     onWakeTime: (LocalTime) -> Unit,
@@ -2534,6 +2543,7 @@ private fun SettingsScreen(
             TimePickerDialog(activity, { _, hour, minute -> onWakeTime(LocalTime.of(hour, minute)) }, wakeTime.hour, wakeTime.minute, true).show()
         }) }
         item { BufferSettingRow(bufferMinutes, onBufferMinutes) }
+        item { SettingRow(Icons.Default.Bedtime, "睡眠时段显示计划", if (showSleepPlan) "显示任务但不安排" else "隐藏待安排任务", showSleepPlan, onToggle = onSleepPlanVisibility) }
         item { SettingRow(Icons.Default.NotificationsNone, "任务提醒", "安卓通知通道已准备", true) }
         item { CloudSyncCard(activity, snackbar, onRemoteState, onThreadsRefresh) }
         item {
@@ -2898,7 +2908,8 @@ private fun SettingRow(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     title: String,
     detail: String,
-    enabled: Boolean
+    enabled: Boolean,
+    onToggle: ((Boolean) -> Unit)? = null
 ) {
     Row(Modifier.fillMaxWidth().padding(vertical = 13.dp), verticalAlignment = Alignment.CenterVertically) {
         Icon(icon, null, tint = if (enabled) Color(0xFF277267) else Muted, modifier = Modifier.size(20.dp))
@@ -2907,6 +2918,10 @@ private fun SettingRow(
             Text(title, color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
             Text(detail, color = Muted, fontSize = 10.sp)
         }
-        Box(Modifier.size(8.dp).clip(CircleShape).background(if (enabled) Color(0xFF58AE9D) else Color(0xFFD0A07C)))
+        if (onToggle != null) {
+            Switch(checked = enabled, onCheckedChange = onToggle)
+        } else {
+            Box(Modifier.size(8.dp).clip(CircleShape).background(if (enabled) Color(0xFF58AE9D) else Color(0xFFD0A07C)))
+        }
     }
 }

@@ -13,6 +13,7 @@ const DEFAULT_SETTINGS = {
   break_minutes: 10,
   buffer_minutes: 60,
   sleep_duration_minutes: 8 * 60,
+  show_sleep_plan: false,
   clear_completed_at_sleep: true
 };
 
@@ -219,6 +220,7 @@ export function repairAssistantState(source) {
   };
   settings.sleep_time = clock(settings.sleep_time) || DEFAULT_SETTINGS.sleep_time;
   settings.sleep_duration_minutes = Math.max(60, Math.min(900, Number(settings.sleep_duration_minutes) || DEFAULT_SETTINGS.sleep_duration_minutes));
+  settings.show_sleep_plan = settings.show_sleep_plan === true;
   // Wake time is derived from bedtime and sleep duration so the planner has
   // one unambiguous overnight block instead of two unrelated settings.
   settings.wake_time = addClockMinutes(nowParts().date, settings.sleep_time, settings.sleep_duration_minutes).time;
@@ -416,11 +418,10 @@ function buildPlan(state, current = nowParts()) {
     return currentTask?.id === task.id ? '' : (currentTask?.id || task.parent_task_id || '');
   };
   const planningParent = (task) => taskById.get(rootParentId(task)) || task;
-  const baseTaskItems = state.tasks
+  const candidateTaskItems = state.tasks
     // Container tasks organize sub-plans; only leaf tasks consume calendar time.
     .filter((task) => ['open', 'in_progress'].includes(task.status) && !parentIds.has(task.id))
     .filter((task) => !task.long_task_id || task.occurrence_date === window.planning_date)
-    .filter(() => !window.is_sleeping)
     // A child follows its parent project's priority/deadline, so adding a
     // subtask to an urgent parent does not strand it behind unrelated work.
     .sort((left, right) => (planningParent(right).priority - planningParent(left).priority)
@@ -429,6 +430,7 @@ function buildPlan(state, current = nowParts()) {
         - (Number(planningParent(right).sort_order ?? right.sort_order) || 0))
       || ((Number(left.sort_order) || 0) - (Number(right.sort_order) || 0))
       || left.created_at.localeCompare(right.created_at));
+  const baseTaskItems = candidateTaskItems.filter(() => !window.is_sleeping);
   // Keep each parent's leaf tasks together while retaining the original
   // priority/deadline ordering between groups.
   const groups = new Map();
@@ -477,6 +479,24 @@ function buildPlan(state, current = nowParts()) {
     if (runningSession?.task_id === taskId && activeTimer) return Math.max(stored, activeTimer.elapsed_seconds);
     return stored;
   };
+  const sleepingTasks = window.is_sleeping && state.settings.show_sleep_plan
+    ? candidateTaskItems.map((task) => ({
+      id: task.id,
+      title: task.title,
+      project: taskProject(task, state.projects)?.name || '未归类',
+      priority: task.priority,
+      estimated_minutes: Math.max(5, Math.min(720, Number(task.estimated_minutes) || 45)),
+      start: '', end: '', date: window.planning_date, status: task.status,
+      due_at: task.due_at, notes: task.notes || '',
+      parent_task_id: task.parent_task_id || null,
+      parent_title: parentTitle(task) || null,
+      long_task_id: task.long_task_id || null,
+      occurrence_date: task.occurrence_date || null,
+      actual_minutes: task.actual_minutes || 0,
+      actual_seconds: elapsedSecondsForTask(task.id),
+      sleeping: true
+    }))
+    : [];
   const deferred = state.tasks
     .filter((task) => task.status === 'deferred' && (!task.long_task_id || task.occurrence_date === window.planning_date))
     .map((task) => ({ ...task, reason: '已按你的要求顺延，等待下次安排' }));
@@ -527,6 +547,7 @@ function buildPlan(state, current = nowParts()) {
     now: `${current.date} ${current.time}`,
     sleep_time: state.settings.sleep_time,
     wake_time: state.settings.wake_time,
+    show_sleep_plan: state.settings.show_sleep_plan === true,
     sleep_duration_minutes: window.sleep_duration_minutes,
     sleep_window: { start: window.sleep_start, end: window.sleep_end, is_sleeping: window.is_sleeping },
     planning_date: window.planning_date,
@@ -542,6 +563,7 @@ function buildPlan(state, current = nowParts()) {
     next_task: scheduled[1] || null,
     active_timer: activeTimer,
     scheduled,
+    sleeping_tasks: sleepingTasks,
     completed: state.tasks.filter((task) => task.status === 'done' && (!task.long_task_id || task.occurrence_date === window.planning_date) && (!state.settings.clear_completed_at_sleep || completedSinceSleep(task, current, state.settings.sleep_time))).slice().sort((a, b) => String(b.completed_at || '').localeCompare(String(a.completed_at || ''))).map((task) => ({
       id: task.id, title: task.title, project: taskProject(task, state.projects)?.name || '未归类', priority: task.priority,
       parent_task_id: task.parent_task_id || null,
@@ -1259,6 +1281,13 @@ export class AssistantStateStore {
             result = { type, ok: true, value: state.settings.buffer_minutes, reason: action.reason || '已更新每日缓冲时间。' };
           } else {
             result = { type, ok: false, reason: '缓冲时间必须是 0 到 1440 分钟之间的数字。' };
+          }
+        } else if (type === 'set_sleep_plan_visibility') {
+          if (typeof action.visible === 'boolean') {
+            state.settings.show_sleep_plan = action.visible;
+            result = { type, ok: true, value: action.visible, reason: action.visible ? '睡眠时段仍显示待安排任务。' : '睡眠时段隐藏待安排任务。' };
+          } else {
+            result = { type, ok: false, reason: '睡眠时段显示设置必须是布尔值。' };
           }
         } else if (type === 'set_alarm') {
           const value = clock(action.time);

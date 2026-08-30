@@ -18,6 +18,11 @@ export const ASSISTANT_TOOLS = Object.freeze([
     parameters: { minutes: '缓冲分钟数，0-1440', reason: '调整原因' }
   },
   {
+    name: 'set_sleep_plan_visibility',
+    description: '设置睡眠时段是否仍显示待安排任务；显示仅供查看，不会占用睡眠时间。',
+    parameters: { visible: '是否显示，true 或 false', reason: '设置原因' }
+  },
+  {
     name: 'set_alarm',
     description: '在用户的安卓手机上设置一个闹钟或提醒。需要明确的时间。',
     parameters: { time: 'HH:mm', date: '可选 YYYY-MM-DD', label: '闹钟标签', repeat: '可选 none 或 daily', reason: '设置原因' }
