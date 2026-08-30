@@ -113,6 +113,10 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -143,6 +147,45 @@ private val Rail = Color(0xFFF0F2ED)
 private val Cream = Color(0xFFF1E4C9)
 private val Coral = Color(0xFFE99C68)
 private val Muted = Color(0xFF7A8984)
+
+private fun AnnotatedString.Builder.appendMarkdownInline(value: String, color: Color) {
+    val pattern = Regex("(`[^`\\n]+`|\\*\\*[^*\\n]+?\\*\\*|__[^_\\n]+?__)")
+    var cursor = 0
+    pattern.findAll(value).forEach { match ->
+        if (match.range.first > cursor) append(value.substring(cursor, match.range.first).replace("**", "").replace("__", ""))
+        val token = match.value
+        if (token.startsWith("`")) {
+            withStyle(SpanStyle(color = Color(0xFF5A5035), background = Color(0xFFF3EAD5))) { append(token.substring(1, token.length - 1)) }
+        } else {
+            withStyle(SpanStyle(color = color, fontWeight = FontWeight.Bold)) { append(token.substring(2, token.length - 2)) }
+        }
+        cursor = match.range.last + 1
+    }
+    if (cursor < value.length) append(value.substring(cursor).replace("**", "").replace("__", ""))
+}
+
+@Composable
+private fun MarkdownText(value: String, color: Color, fontSize: androidx.compose.ui.unit.TextUnit, lineHeight: androidx.compose.ui.unit.TextUnit) {
+    Text(
+        text = buildAnnotatedString {
+            value.replace("\r", "").split('\n').forEachIndexed { index, line ->
+                if (index > 0) append("\n")
+                val trimmed = line.trim()
+                if (trimmed.isEmpty()) return@forEachIndexed
+                val heading = Regex("^#{1,3}\\s+(.+)$").matchEntire(trimmed)
+                val bullet = Regex("^[-*+]\\s+(.+)$").matchEntire(trimmed)
+                when {
+                    heading != null -> withStyle(SpanStyle(color = Color(0xFF245D54), fontWeight = FontWeight.Bold)) { appendMarkdownInline(heading.groupValues[1], color) }
+                    bullet != null -> { append("• "); appendMarkdownInline(bullet.groupValues[1], color) }
+                    else -> appendMarkdownInline(line, color)
+                }
+            }
+        },
+        color = color,
+        fontSize = fontSize,
+        lineHeight = lineHeight
+    )
+}
 
 data class PlanItem(
     val title: String,
@@ -1964,7 +2007,10 @@ private fun ChatScreen(
                                 Spacer(Modifier.height(5.dp))
                             }
                         }
-                        if (message.text.isNotBlank()) Text(message.text, color = if (message.fromAssistant) Ink else Color.White, fontSize = 13.sp, lineHeight = 21.sp)
+                        if (message.text.isNotBlank()) {
+                            if (message.fromAssistant) MarkdownText(message.text, Ink, 13.sp, 21.sp)
+                            else Text(message.text, color = Color.White, fontSize = 13.sp, lineHeight = 21.sp)
+                        }
                     }
                 }
             }

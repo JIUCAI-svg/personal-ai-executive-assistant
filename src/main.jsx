@@ -39,6 +39,35 @@ function messageTime(value) {
   return Number.isNaN(parsed.getTime()) ? timeNow() : parsed.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
+function renderInlineMarkdown(value, keyPrefix) {
+  const source = String(value || '');
+  const tokens = /(`[^`\n]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__)/g;
+  const children = [];
+  let cursor = 0;
+  let match;
+  while ((match = tokens.exec(source))) {
+    if (match.index > cursor) children.push(source.slice(cursor, match.index).replace(/\*\*|__/g, ''));
+    const token = match[0];
+    if (token.startsWith('`')) children.push(<code key={`${keyPrefix}-code-${match.index}`}>{token.slice(1, -1)}</code>);
+    else children.push(<strong key={`${keyPrefix}-bold-${match.index}`}>{token.slice(2, -2)}</strong>);
+    cursor = match.index + token.length;
+  }
+  if (cursor < source.length) children.push(source.slice(cursor).replace(/\*\*|__/g, ''));
+  return children.length ? children : source.replace(/\*\*|__/g, '');
+}
+
+function renderAssistantMarkdown(value) {
+  return String(value || '').split(/\r?\n/).map((line, index) => {
+    const trimmed = line.trim();
+    if (!trimmed) return <div className="markdown-spacer" key={`blank-${index}`} />;
+    const heading = trimmed.match(/^#{1,3}\s+(.+)$/);
+    if (heading) return <div className="markdown-heading" key={`heading-${index}`}>{renderInlineMarkdown(heading[1], `heading-${index}`)}</div>;
+    const bullet = trimmed.match(/^[-*+]\s+(.+)$/);
+    if (bullet) return <div className="markdown-list-item" key={`bullet-${index}`}><span aria-hidden="true">•</span><span>{renderInlineMarkdown(bullet[1], `bullet-${index}`)}</span></div>;
+    return <div className="markdown-line" key={`line-${index}`}>{renderInlineMarkdown(line, `line-${index}`)}</div>;
+  });
+}
+
 function dateKicker() {
   return new Intl.DateTimeFormat('zh-CN', { weekday: 'long', month: 'long', day: 'numeric' }).format(new Date());
 }
@@ -970,7 +999,7 @@ function App() {
               {messages.map((message) => (
                 <article className={`message ${message.role}`} key={message.id}>
                   {message.role === 'assistant' && <div className="message-avatar"><Bot size={16} /></div>}
-                  <div><div className="message-meta">{message.role === 'assistant' ? '向前' : '你'} <time>{message.time}</time></div>{message.text && <p>{message.text}</p>}{message.attachments?.map((image) => <img className="message-image" key={image.data_url} src={image.data_url} alt={image.name || '上传图片'} />)}</div>
+                  <div><div className="message-meta">{message.role === 'assistant' ? '向前' : '你'} <time>{message.time}</time></div>{message.text && (message.role === 'assistant' ? <div className="message-markdown">{renderAssistantMarkdown(message.text)}</div> : <p>{message.text}</p>)}{message.attachments?.map((image) => <img className="message-image" key={image.data_url} src={image.data_url} alt={image.name || '上传图片'} />)}</div>
                 </article>
               ))}
               {notice && <div className="change-note"><Sparkles size={15} /><span>{notice}</span></div>}
