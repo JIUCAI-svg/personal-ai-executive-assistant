@@ -423,6 +423,8 @@ function buildPlan(state, current = nowParts()) {
     // subtask to an urgent parent does not strand it behind unrelated work.
     .sort((left, right) => (planningParent(right).priority - planningParent(left).priority)
       || (dueWeight(planningParent(left)) - dueWeight(planningParent(right)))
+      || ((Number(planningParent(left).sort_order ?? left.sort_order) || 0)
+        - (Number(planningParent(right).sort_order ?? right.sort_order) || 0))
       || ((Number(left.sort_order) || 0) - (Number(right.sort_order) || 0))
       || left.created_at.localeCompare(right.created_at));
   // Keep each parent's leaf tasks together while retaining the original
