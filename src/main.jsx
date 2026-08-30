@@ -717,7 +717,9 @@ function App() {
   }
 
   function addImages(event) {
-    const files = Array.from(event.target.files || []).filter((file) => file.type.startsWith('image/')).slice(0, 4);
+    const files = Array.from(event.target.files || [])
+      .filter((file) => file.type.startsWith('image/'))
+      .slice(0, Math.max(0, 4 - pendingImages.length));
     files.forEach((file) => { const reader = new FileReader(); reader.onload = () => setPendingImages((items) => [...items, { name: file.name, type: file.type, dataUrl: reader.result }]); reader.readAsDataURL(file); });
     event.target.value = '';
   }

@@ -264,12 +264,12 @@ suspend fun gatewayLoadThread(context: Context, threadId: String, limit: Int = 2
         val messages = rawThread.optJSONArray("messages")?.let { array ->
             (0 until array.length()).mapNotNull { index -> array.optJSONObject(index)?.let { message ->
                 val content = message.optString("content").trim()
-                val imageData = message.optJSONArray("attachments")
-                    ?.optJSONObject(0)
-                    ?.optString("data_url")
-                    ?.trim()
-                    ?.takeIf(String::isNotBlank)
-                if (content.isNotBlank() || imageData != null) {
+                val imageData = message.optJSONArray("attachments")?.let { attachments ->
+                    (0 until attachments.length()).mapNotNull { attachmentIndex ->
+                        attachments.optJSONObject(attachmentIndex)?.optString("data_url")?.trim()?.takeIf(String::isNotBlank)
+                    }
+                }.orEmpty()
+                if (content.isNotBlank() || imageData.isNotEmpty()) {
                     ChatMessage(message.optString("role") == "assistant", content, imageData)
                 } else null
             } }

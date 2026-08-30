@@ -167,7 +167,7 @@ data class ScheduledPlanItem(
     val deferredByCapacity: Boolean = false
 )
 
-data class ChatMessage(val fromAssistant: Boolean, val text: String, val imageData: String? = null)
+data class ChatMessage(val fromAssistant: Boolean, val text: String, val imageData: List<String> = emptyList())
 
 private fun decodeImageData(data: String?): Bitmap? = runCatching {
     val encoded = data?.substringAfter(',', "")?.takeIf { it.isNotBlank() } ?: return null
@@ -733,7 +733,7 @@ private fun ForwardApp(activity: MainActivity) {
         var threadLoading by remember { mutableStateOf(false) }
         var now by remember { mutableStateOf(LocalDateTime.now()) }
         var messages by remember { mutableStateOf(emptyList<ChatMessage>()) }
-        var pendingImageData by remember { mutableStateOf<String?>(null) }
+        var pendingImageData by remember { mutableStateOf<List<String>>(emptyList()) }
         var showProjects by remember { mutableStateOf(false) }
         var showCreateProject by remember { mutableStateOf(false) }
         var drawerOpen by remember { mutableStateOf(false) }
@@ -884,12 +884,16 @@ private fun ForwardApp(activity: MainActivity) {
         fun beginBreak() {
             breakTimer = BreakTimerState()
         }
-        val galleryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
-            uri ?: return@rememberLauncherForActivityResult
-            pendingImageData = runCatching { activity.contentResolver.openInputStream(uri)?.use { Base64.encodeToString(it.readBytes(), Base64.NO_WRAP) } }.getOrNull()?.let { "data:image/*;base64,$it" }
+        val galleryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris: List<Uri> ->
+            val additions = uris.take((4 - pendingImageData.size).coerceAtLeast(0)).mapNotNull { uri ->
+                runCatching { activity.contentResolver.openInputStream(uri)?.use { Base64.encodeToString(it.readBytes(), Base64.NO_WRAP) } }
+                    .getOrNull()?.let { "data:image/*;base64,$it" }
+            }
+            pendingImageData = (pendingImageData + additions).take(4)
         }
         val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicturePreview()) { bitmap: Bitmap? ->
-            pendingImageData = bitmap?.let { output -> java.io.ByteArrayOutputStream().use { stream -> output.compress(Bitmap.CompressFormat.JPEG, 88, stream); "data:image/jpeg;base64,${Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)}" } }
+            val image = bitmap?.let { output -> java.io.ByteArrayOutputStream().use { stream -> output.compress(Bitmap.CompressFormat.JPEG, 88, stream); "data:image/jpeg;base64,${Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)}" } }
+            if (image != null && pendingImageData.size < 4) pendingImageData = pendingImageData + image
         }
 
         fun refreshThreads() { scope.launch { runCatching { gatewayListThreads(activity) }.onSuccess { threads = it }.onFailure { snackbar.showSnackbar(it.message ?: "刷新历史失败") } } }
@@ -1102,16 +1106,16 @@ private fun ForwardApp(activity: MainActivity) {
 
         fun sendMessage() {
             val text = input.text.trim()
-            if ((text.isEmpty() && pendingImageData.isNullOrBlank()) || aiBusy) return
+            if ((text.isEmpty() && pendingImageData.isEmpty()) || aiBusy) return
             val priorConversation = messages
-            val image = pendingImageData
-            pendingImageData = null
-            messages = messages + ChatMessage(false, text, image)
+            val images = pendingImageData
+            pendingImageData = emptyList()
+            messages = messages + ChatMessage(false, text, images)
             input = TextFieldValue()
             aiBusy = true
             scope.launch {
                 val result = runCatching {
-                    requestAssistant(activity, text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel, remoteThreadId, conversationOptions, listOfNotNull(image))
+                    requestAssistant(activity, text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel, remoteThreadId, conversationOptions, images)
                 }.getOrElse { error -> AssistantResult("这次没有连上服务，内容没有写入任务、计划或记忆。请稍后重试。", emptyList()).also { scope.launch { snackbar.showSnackbar(error.message ?: "AI 服务连接失败") } } }
                 if (result.plan == null) applyActions(result.actions)
                 val deviceResults = applyDeviceActions(result.deviceActions.ifEmpty { result.actions })
@@ -1215,7 +1219,7 @@ private fun ForwardApp(activity: MainActivity) {
                     onSetThreadLocked = ::setThreadLocked,
                     onDeleteThreads = ::deleteThreads
                     ,onGallery = { galleryLauncher.launch("image/*") },
-                    onCamera = { cameraLauncher.launch(null) }, imageData = pendingImageData, onClearImage = { pendingImageData = null }
+                    onCamera = { cameraLauncher.launch(null) }, imageData = pendingImageData, onRemoveImage = { index -> pendingImageData = pendingImageData.filterIndexed { position, _ -> position != index } }, onClearImage = { pendingImageData = emptyList() }
                 )
                 2 -> MemoryScreen(
                     padding = padding,
@@ -1841,8 +1845,8 @@ private fun PlanRow(
 private fun AdjustmentCard(title: String, body: String) { Card(Modifier.padding(horizontal = 20.dp, vertical = 10.dp).fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color(0xFFE1EDE6)), shape = RoundedCornerShape(7.dp)) { Row(Modifier.padding(10.dp), horizontalArrangement = Arrangement.spacedBy(7.dp)) { Icon(Icons.Default.AutoAwesome, null, tint = Color(0xFF2C655B), modifier = Modifier.size(16.dp)); Column { Text(title, color = Color(0xFF2C655B), fontSize = 11.sp, fontWeight = FontWeight.Bold); Text(body, color = Color(0xFF56756D), fontSize = 10.sp, lineHeight = 15.sp) } } } }
 
 @Composable
-private fun Composer(input: TextFieldValue, onInput: (TextFieldValue) -> Unit, onSend: () -> Unit, aiBusy: Boolean = false, onGallery: () -> Unit = {}, onCamera: () -> Unit = {}, imageData: String? = null) {
-    val canSend = (input.text.isNotBlank() || !imageData.isNullOrBlank()) && !aiBusy
+private fun Composer(input: TextFieldValue, onInput: (TextFieldValue) -> Unit, onSend: () -> Unit, aiBusy: Boolean = false, onGallery: () -> Unit = {}, onCamera: () -> Unit = {}, imageSelected: Boolean = false) {
+    val canSend = (input.text.isNotBlank() || imageSelected) && !aiBusy
     Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp).fillMaxWidth().clip(RoundedCornerShape(9.dp)).background(Color.White).border(1.dp, Color(0xFFD6DED4), RoundedCornerShape(9.dp)).padding(8.dp), verticalAlignment = Alignment.Bottom) {
         OutlinedTextField(value = input, onValueChange = onInput, enabled = !aiBusy, placeholder = { Text(if (aiBusy) "向前正在思考…" else "说进展、临时安排，或直接聊天…", color = Color(0xFF94A19C), fontSize = 12.sp) }, modifier = Modifier.weight(1f), minLines = 1, maxLines = 3, colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = Color.Transparent))
         IconButton(onClick = onGallery, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.Image, "图库", tint = Muted) }
@@ -1871,7 +1875,8 @@ private fun ChatScreen(
     onDeleteThreads: (List<ConversationThread>) -> Unit = {},
     onGallery: () -> Unit = {},
     onCamera: () -> Unit = {},
-    imageData: String? = null,
+    imageData: List<String> = emptyList(),
+    onRemoveImage: (Int) -> Unit = {},
     onClearImage: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
@@ -1948,26 +1953,33 @@ private fun ChatScreen(
                             .background(if (message.fromAssistant) Color(0xFFE9EFEA) else Green)
                             .padding(11.dp)
                     ) {
-                        decodeImageData(message.imageData)?.let { bitmap ->
-                            Image(
-                                bitmap = bitmap.asImageBitmap(),
-                                contentDescription = "已发送图片",
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.size(150.dp, 110.dp).clip(RoundedCornerShape(6.dp))
-                            )
-                            if (message.text.isNotBlank()) Spacer(Modifier.height(6.dp))
+                        message.imageData.forEach { imageData ->
+                            decodeImageData(imageData)?.let { bitmap ->
+                                Image(
+                                    bitmap = bitmap.asImageBitmap(),
+                                    contentDescription = "已发送图片",
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.size(150.dp, 110.dp).clip(RoundedCornerShape(6.dp))
+                                )
+                                Spacer(Modifier.height(5.dp))
+                            }
                         }
                         if (message.text.isNotBlank()) Text(message.text, color = if (message.fromAssistant) Ink else Color.White, fontSize = 13.sp, lineHeight = 21.sp)
                     }
                 }
             }
         }
-        if (!imageData.isNullOrBlank()) Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            decodeImageData(imageData)?.let { bitmap -> Image(bitmap = bitmap.asImageBitmap(), contentDescription = "待发送图片", contentScale = ContentScale.Crop, modifier = Modifier.size(56.dp).clip(RoundedCornerShape(6.dp))) }
-            Spacer(Modifier.width(8.dp)); Text("已选择图片", color = Green, fontSize = 10.sp); Spacer(Modifier.weight(1f)); TextButton(onClick = onClearImage) { Text("移除", color = Coral, fontSize = 10.sp) }
+        if (imageData.isNotEmpty()) Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            imageData.forEachIndexed { index, image ->
+                Box(Modifier.size(56.dp).padding(end = 4.dp)) {
+                    decodeImageData(image)?.let { bitmap -> Image(bitmap = bitmap.asImageBitmap(), contentDescription = "待发送图片", contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(6.dp))) }
+                    IconButton(onClick = { onRemoveImage(index) }, modifier = Modifier.size(20.dp).align(Alignment.TopEnd).clip(CircleShape).background(Color.Black.copy(alpha = 0.55f))) { Icon(Icons.Default.Close, "移除图片", tint = Color.White, modifier = Modifier.size(13.dp)) }
+                }
+            }
+            Spacer(Modifier.width(4.dp)); Text("已选择 ${imageData.size} 张", color = Green, fontSize = 10.sp); Spacer(Modifier.weight(1f)); TextButton(onClick = onClearImage) { Text("清空", color = Coral, fontSize = 10.sp) }
         }
 
-        Composer(input, onInput, onSend, aiBusy || threadLoading, onGallery, onCamera, imageData)
+        Composer(input, onInput, onSend, aiBusy || threadLoading, onGallery, onCamera, imageData.isNotEmpty())
     }
 
     if (showHistory) {
