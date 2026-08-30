@@ -154,3 +154,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 .priority-option small { margin-top: 2px; color: #82918a; font-size: 9px; font-weight: 400; }
 .task-form-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 2px; }
 @media (max-width: 600px) { .day-heading-row { display: block; }.day-heading-row h1 { margin-bottom: 12px; }.new-task-button { margin-bottom: 0; }.task-form-grid { grid-template-columns: 1fr; }.priority-options { gap: 5px; }.priority-option { padding: 8px 6px; }.priority-option small { font-size: 8px; } }
+/* Parent/child plan hierarchy */
+.schedule-item.subtask { padding-left: 18px; }
+.schedule-item.subtask .schedule-body strong { color: #56756d; font-weight: 500; }
+.subtask-mark { display: inline-block; margin-right: 5px; color: #9aaa9f; font-size: 13px; }

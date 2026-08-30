@@ -200,7 +200,9 @@ data class PlanItem(
     val id: String = "",
     val priority: Int = 3,
     val actualMinutes: Int = 0,
-    val actualSeconds: Long = 0
+    val actualSeconds: Long = 0,
+    val isSubtask: Boolean = false,
+    val parentTitle: String = ""
 )
 
 data class ScheduledPlanItem(
@@ -393,7 +395,7 @@ private fun remoteTone(priority: Int): Color = when {
 }
 
 private fun remoteScheduledItem(item: RemotePlanItem, deferred: Boolean): ScheduledPlanItem {
-    val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), flexible = deferred, deferred = deferred, id = item.id, priority = item.priority, actualMinutes = item.actualMinutes, actualSeconds = item.actualSeconds)
+    val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), flexible = deferred, deferred = deferred, id = item.id, priority = item.priority, actualMinutes = item.actualMinutes, actualSeconds = item.actualSeconds, isSubtask = item.parentTaskId != null, parentTitle = item.parentTitle)
     if (deferred || item.start.isBlank() || item.end.isBlank()) return ScheduledPlanItem(planItem, deferredByCapacity = true)
     val date = runCatching { LocalDate.parse(item.date) }.getOrDefault(LocalDate.now())
     val start = parseClock(item.start) ?: return ScheduledPlanItem(planItem, deferredByCapacity = true)
@@ -417,7 +419,7 @@ private fun normalizeRemotePlanItems(remote: RemotePlan, now: LocalDateTime): Li
         val start = cursor
         val end = cursor.plusMinutes(item.minutes.toLong())
         cursor = end
-        val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), id = item.id, priority = item.priority, actualMinutes = item.actualMinutes, actualSeconds = item.actualSeconds)
+        val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), id = item.id, priority = item.priority, actualMinutes = item.actualMinutes, actualSeconds = item.actualSeconds, isSubtask = item.parentTaskId != null, parentTitle = item.parentTitle)
         ScheduledPlanItem(planItem, start, end)
     }
 }
@@ -1898,7 +1900,7 @@ private fun PlanRow(
             onDrag = { _, amount -> onDrag(amount.y) }
         )
     } else Modifier
-    Row(dragModifier.graphicsLayer { translationY = if (isDragging) dragOffset else 0f; alpha = if (isDragging) 0.86f else 1f }.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalAlignment = Alignment.Top) { Text(time, color = Muted, fontSize = 10.sp, modifier = Modifier.width(39.dp)); Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(18.dp)) { Box(Modifier.size(9.dp).border(2.dp, item.tone, CircleShape).clip(CircleShape).background(Rail)); Box(Modifier.width(1.dp).height(39.dp).background(Color(0xFFD2DAD1))) }; Spacer(Modifier.width(7.dp)); Column(Modifier.weight(1f).combinedClickable(onClick = { if (item.id.isNotBlank()) editTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes)) }, onDoubleClick = { if (!item.done && item.id.isNotBlank()) completeTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes)) })) { Text(item.title, color = if (item.done || scheduled.deferredByCapacity) Muted else Ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, textDecoration = if (item.done) androidx.compose.ui.text.style.TextDecoration.LineThrough else null, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(note, color = Muted, fontSize = 10.sp) }; if (!item.done && item.id.isNotBlank()) TextButton(onClick = { createSubtask(scheduled) }, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)) { Text("子任务", color = Muted, fontSize = 10.sp) }; if (item.done) Icon(Icons.Default.TaskAlt, null, tint = Color(0xFF4A897D), modifier = Modifier.size(17.dp)) }
+    Row(dragModifier.graphicsLayer { translationY = if (isDragging) dragOffset else 0f; alpha = if (isDragging) 0.86f else 1f }.fillMaxWidth().padding(start = if (item.isSubtask) 40.dp else 20.dp, end = 20.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.Top) { Text(time, color = Muted, fontSize = 10.sp, modifier = Modifier.width(39.dp)); Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(18.dp)) { Box(Modifier.size(9.dp).border(2.dp, item.tone, CircleShape).clip(CircleShape).background(Rail)); Box(Modifier.width(1.dp).height(39.dp).background(Color(0xFFD2DAD1))) }; Spacer(Modifier.width(7.dp)); Column(Modifier.weight(1f).combinedClickable(onClick = { if (item.id.isNotBlank()) editTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes, parentTaskId = null)) }, onDoubleClick = { if (!item.done && item.id.isNotBlank()) completeTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes, parentTaskId = null)) })) { if (item.isSubtask) Text("↳ ${item.parentTitle}", color = Muted, fontSize = 9.sp); Text(item.title, color = if (item.done || scheduled.deferredByCapacity) Muted else Ink, fontSize = if (item.isSubtask) 11.sp else 12.sp, fontWeight = if (item.isSubtask) FontWeight.Medium else FontWeight.SemiBold, textDecoration = if (item.done) androidx.compose.ui.text.style.TextDecoration.LineThrough else null, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(note, color = Muted, fontSize = 10.sp) }; if (!item.done && item.id.isNotBlank()) TextButton(onClick = { createSubtask(scheduled) }, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)) { Text("子任务", color = Muted, fontSize = 10.sp) }; if (item.done) Icon(Icons.Default.TaskAlt, null, tint = Color(0xFF4A897D), modifier = Modifier.size(17.dp)) }
 }
 
 @Composable

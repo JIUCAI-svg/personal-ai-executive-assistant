@@ -390,13 +390,36 @@ function mergeIntervals(intervals) {
 
 function buildPlan(state, current = nowParts()) {
   const window = todayPlanningWindow(state.settings, current);
-  const parentIds = new Set(state.tasks.map((task) => task.parent_task_id).filter(Boolean));
-  const taskItems = state.tasks
+  const activeStatuses = new Set(['open', 'in_progress']);
+  const parentIds = new Set(state.tasks.filter((task) => activeStatuses.has(task.status)).map((task) => task.parent_task_id).filter(Boolean));
+  const taskById = new Map(state.tasks.map((task) => [task.id, task]));
+  const baseTaskItems = state.tasks
     // Container tasks organize sub-plans; only leaf tasks consume calendar time.
     .filter((task) => ['open', 'in_progress'].includes(task.status) && !parentIds.has(task.id))
     .filter((task) => !task.long_task_id || task.occurrence_date === window.planning_date)
     .filter(() => !window.is_sleeping)
     .sort((left, right) => (right.priority - left.priority) || (dueWeight(left) - dueWeight(right)) || ((Number(left.sort_order) || 0) - (Number(right.sort_order) || 0)) || left.created_at.localeCompare(right.created_at));
+  // Keep each parent's leaf tasks together while retaining the original
+  // priority/deadline ordering between groups.
+  const rootParentId = (task) => {
+    let currentTask = task;
+    const seen = new Set();
+    while (currentTask?.parent_task_id && !seen.has(currentTask.parent_task_id)) {
+      seen.add(currentTask.parent_task_id);
+      const parent = taskById.get(currentTask.parent_task_id);
+      if (!parent) break;
+      currentTask = parent;
+    }
+    return currentTask?.id === task.id ? '' : (currentTask?.id || task.parent_task_id || '');
+  };
+  const groups = new Map();
+  baseTaskItems.forEach((task, index) => {
+    const key = rootParentId(task) || `task:${task.id}`;
+    if (!groups.has(key)) groups.set(key, { firstIndex: index, items: [] });
+    groups.get(key).items.push(task);
+  });
+  const taskItems = [...groups.values()].sort((left, right) => left.firstIndex - right.firstIndex).flatMap((group) => group.items);
+  const parentTitle = (task) => task?.parent_task_id ? (taskById.get(task.parent_task_id)?.title || '') : '';
   const blocks = state.unavailable_blocks
     .filter((block) => block.date === current.date || block.date === window.end_date)
     .map((block) => ({
@@ -472,6 +495,7 @@ function buildPlan(state, current = nowParts()) {
       due_at: task.due_at,
       notes: task.notes || '',
       parent_task_id: task.parent_task_id || null,
+      parent_title: parentTitle(task) || null,
       long_task_id: task.long_task_id || null,
       occurrence_date: task.occurrence_date || null,
       actual_minutes: task.actual_minutes || 0,
@@ -506,7 +530,7 @@ function buildPlan(state, current = nowParts()) {
       occurrence_date: task.occurrence_date || null,
       estimated_minutes: task.estimated_minutes, actual_minutes: task.actual_minutes || 0, status: task.status, completed_at: task.completed_at || '', notes: task.notes || ''
     })),
-    deferred,
+    deferred: deferred.map((task) => ({ ...task, parent_title: parentTitle(task) || null })),
     adjustment_reason: window.is_sleeping
       ? `当前处于睡眠时间，计划将在 ${window.sleep_end.time} 后恢复安排。`
       : deferred.length

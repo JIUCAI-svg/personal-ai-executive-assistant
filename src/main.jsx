@@ -86,6 +86,9 @@ function dynamicPlanToUi(dynamicPlan) {
     end: item.end,
     title: item.title,
     project: item.project,
+    parentTaskId: item.parent_task_id || null,
+    parentTitle: item.parent_title || '',
+    isSubtask: Boolean(item.parent_task_id),
     tone: item.priority >= 5 ? 'urgent' : item.priority >= 3 ? 'work' : 'creative',
     state: item.id === dynamicPlan.current_task?.id ? 'current' : index === 1 ? 'next' : 'planned',
     note: [item.long_task_id ? '长期' : '', item.due_at ? `截止 ${item.due_at.slice(5, 10)}` : '', item.notes || '按当前节奏推进'].filter(Boolean).join(' · '),
@@ -97,6 +100,9 @@ function dynamicPlanToUi(dynamicPlan) {
     end: '',
     title: item.title,
     project: item.project || '未归类',
+    parentTaskId: item.parent_task_id || null,
+    parentTitle: item.parent_title || '',
+    isSubtask: Boolean(item.parent_task_id),
     tone: 'creative',
     state: 'deferred',
     note: item.reason || '等待重新安排',
@@ -1024,8 +1030,8 @@ function App() {
               <div className="time-budget"><div><span>已安排</span><strong>{formatMinutes(planner?.scheduled_minutes ?? scheduleMinutes)}</strong></div><div><span>保留缓冲</span><strong>{planner ? formatMinutes(planner.buffer_minutes) : '加载中'}</strong></div><div><span>自主可用</span><strong>{planner ? formatMinutes(planner.free_minutes) : '加载中'}</strong></div></div>
               <div className="schedule-list">
                 {plan.filter((item) => item.state !== 'deferred').map((item) => (
-                  <div className={`schedule-item ${item.state} ${item.tone}`} key={item.id}>
-                    <time>{item.start}</time><div className="schedule-line"><span /></div><div className="schedule-body"><strong>{item.title}</strong><small>{item.note}</small></div>{item.state === 'current' && <button className="done-button" onClick={markCurrentDone} aria-label={`完成${item.title}`}><Check size={16} /></button>}{item.state === 'done' && <Check size={16} className="done-check" />}
+                  <div className={`schedule-item ${item.state} ${item.tone} ${item.isSubtask ? 'subtask' : ''}`} key={item.id}>
+                    <time>{item.start}</time><div className="schedule-line"><span /></div><div className="schedule-body"><strong>{item.isSubtask && <span className="subtask-mark" aria-label={`父任务：${item.parentTitle}`}>↳</span>}{item.title}</strong><small>{item.isSubtask && item.parentTitle ? `${item.parentTitle} · ` : ''}{item.note}</small></div>{item.state === 'current' && <button className="done-button" onClick={markCurrentDone} aria-label={`完成${item.title}`}><Check size={16} /></button>}{item.state === 'done' && <Check size={16} className="done-check" />}
                   </div>
                 ))}
               </div>
