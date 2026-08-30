@@ -445,6 +445,7 @@ private suspend fun requestAssistant(
     usageSnapshot: UsageMonitorSnapshot,
     providerId: String,
     model: String,
+    agentEngine: String,
     threadId: String?,
     conversationOptions: ConversationOptions,
     attachments: List<String> = emptyList()
@@ -466,6 +467,7 @@ private suspend fun requestAssistant(
         })
         if (providerId.isNotBlank()) put("provider_id", providerId)
         if (model.isNotBlank()) put("model", model)
+        if (agentEngine.isNotBlank()) put("agent_engine", agentEngine)
         put("conversation", JSONArray().apply {
             conversation.takeLast(12).forEach { entry ->
                 put(JSONObject().apply {
@@ -669,9 +671,10 @@ class MainActivity : ComponentActivity() {
 
     fun aiProviderId(): String = getSharedPreferences("ai", Context.MODE_PRIVATE).getString("provider_id", "").orEmpty()
     fun aiModel(): String = getSharedPreferences("ai", Context.MODE_PRIVATE).getString("model", "").orEmpty()
-    fun saveAiSelection(providerId: String, model: String) {
+    fun aiAgentEngine(): String = getSharedPreferences("ai", Context.MODE_PRIVATE).getString("agent_engine", "legacy").orEmpty()
+    fun saveAiSelection(providerId: String, model: String, agentEngine: String = aiAgentEngine()) {
         getSharedPreferences("ai", Context.MODE_PRIVATE).edit()
-            .putString("provider_id", providerId).putString("model", model).apply()
+            .putString("provider_id", providerId).putString("model", model).putString("agent_engine", agentEngine).apply()
     }
 
     fun plannerSet(key: String): Set<String> = getSharedPreferences("planner", Context.MODE_PRIVATE)
@@ -764,6 +767,7 @@ private fun ForwardApp(activity: MainActivity) {
         var aiProviders by remember { mutableStateOf(emptyList<AiProviderOption>()) }
         var selectedProviderId by remember { mutableStateOf(activity.aiProviderId()) }
         var selectedModel by remember { mutableStateOf(activity.aiModel()) }
+        var agentEngine by remember { mutableStateOf(activity.aiAgentEngine()) }
         var remotePlan by remember { mutableStateOf<RemotePlan?>(null) }
         var remoteMemories by remember { mutableStateOf(emptyList<RemoteMemory>()) }
         var memoryStatus by remember { mutableStateOf<MemoryRunStatus?>(null) }
@@ -1159,7 +1163,7 @@ private fun ForwardApp(activity: MainActivity) {
             aiBusy = true
             scope.launch {
                 val result = runCatching {
-                    requestAssistant(activity, text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel, remoteThreadId, conversationOptions, images)
+                    requestAssistant(activity, text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel, agentEngine, remoteThreadId, conversationOptions, images)
                 }.getOrElse { error -> AssistantResult("这次没有连上服务，内容没有写入任务、计划或记忆。请稍后重试。", emptyList()).also { scope.launch { snackbar.showSnackbar(error.message ?: "AI 服务连接失败") } } }
                 if (result.plan == null) applyActions(result.actions)
                 val deviceResults = applyDeviceActions(result.deviceActions.ifEmpty { result.actions })
@@ -1316,7 +1320,9 @@ private fun ForwardApp(activity: MainActivity) {
                     aiProviders = aiProviders,
                     selectedProviderId = selectedProviderId,
                     selectedModel = selectedModel,
-                    onAiSelection = { providerId, model -> selectedProviderId = providerId; selectedModel = model; activity.saveAiSelection(providerId, model) },
+                    agentEngine = agentEngine,
+                    onAgentEngine = { value -> agentEngine = value; activity.saveAiSelection(selectedProviderId, selectedModel, value) },
+                    onAiSelection = { providerId, model -> selectedProviderId = providerId; selectedModel = model; activity.saveAiSelection(providerId, model, agentEngine) },
                     onUsageSnapshotChanged = { usageSnapshot = activity.usageSnapshot() },
                     onRemoteState = { state -> remotePlan = state.plan; remoteMemories = state.memories; remoteProjects = state.projects; remoteTasks = state.tasks },
                     onThreadsRefresh = {
@@ -2488,6 +2494,8 @@ private fun SettingsScreen(
     aiProviders: List<AiProviderOption>,
     selectedProviderId: String,
     selectedModel: String,
+    agentEngine: String,
+    onAgentEngine: (String) -> Unit,
     onAiSelection: (String, String) -> Unit,
     onUsageSnapshotChanged: () -> Unit,
     onRemoteState: (RemoteState) -> Unit,
@@ -2523,6 +2531,8 @@ private fun SettingsScreen(
                 providers = aiProviders,
                 selectedProviderId = selectedProviderId,
                 selectedModel = selectedModel,
+                agentEngine = agentEngine,
+                onAgentEngine = onAgentEngine,
                 onSelection = onAiSelection
             )
         }
@@ -2602,6 +2612,8 @@ private fun AiProviderSettingsCard(
     providers: List<AiProviderOption>,
     selectedProviderId: String,
     selectedModel: String,
+    agentEngine: String,
+    onAgentEngine: (String) -> Unit,
     onSelection: (String, String) -> Unit
 ) {
     Card(
@@ -2621,6 +2633,14 @@ private fun AiProviderSettingsCard(
             if (providers.isEmpty()) {
                 Text("正在读取云端提供商列表…", color = Muted, fontSize = 11.sp)
             } else {
+                Text("Agent 引擎", color = Green, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("legacy" to "标准 AI", "claude_code" to "Claude Code", "codex" to "Codex").forEach { (id, label) ->
+                        TextButton(onClick = { onAgentEngine(id) }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                            Text(if (agentEngine == id) "✓ $label" else label, fontSize = 10.sp, color = if (agentEngine == id) Green else Ink)
+                        }
+                    }
+                }
                 Text("中转站", color = Green, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 LazyColumn(
                     modifier = Modifier.fillMaxWidth().heightIn(max = 180.dp)

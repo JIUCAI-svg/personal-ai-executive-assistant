@@ -179,7 +179,7 @@ export function createDefaultAssistantState() {
     alarms: [],
     followups: [],
     ai_preferences: {
-      provider_id: '', model: '', reasoning_effort: '',
+      provider_id: '', model: '', reasoning_effort: '', agent_engine: 'legacy',
       memory_provider_id: '', memory_model: '', memory_reasoning_effort: '',
       memory_auto_daily: true, memory_daily_time: '22:00'
     },
@@ -193,7 +193,7 @@ export function repairAssistantState(source) {
   const base = createDefaultAssistantState();
   const state = source && typeof source === 'object' ? source : {};
   const aiPreferences = {
-    provider_id: '', model: '', reasoning_effort: '',
+    provider_id: '', model: '', reasoning_effort: '', agent_engine: 'legacy',
     memory_provider_id: '', memory_model: '', memory_reasoning_effort: '',
     memory_auto_daily: true, memory_daily_time: '22:00',
     ...(state.ai_preferences || {})
@@ -730,7 +730,7 @@ export class AssistantStateStore {
   async updateAiPreferences(preferences = {}) {
     return this.mutate((state) => {
       for (const key of [
-        'provider_id', 'model', 'reasoning_effort',
+        'provider_id', 'model', 'reasoning_effort', 'agent_engine',
         'memory_provider_id', 'memory_model', 'memory_reasoning_effort', 'memory_daily_time'
       ]) {
         if (typeof preferences[key] === 'string') {

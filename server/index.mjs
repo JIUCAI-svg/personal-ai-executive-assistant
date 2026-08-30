@@ -19,6 +19,7 @@ import {
   assistantToolCatalog,
   assistantToolPrompt
 } from './assistant-tools.mjs';
+import { agentEngineCatalog, runAgentEngine } from './agent-adapters.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(__dirname, '..');
@@ -829,8 +830,14 @@ app.get('/api/assistant/status', (request, response) => {
     provider: 'OpenAI-compatible relay',
     configured: true,
     tools: assistantToolCatalog(),
-    skills: assistantSkillCatalog()
+    skills: assistantSkillCatalog(),
+    agent_engines: agentEngineCatalog()
   });
+});
+
+app.get('/api/assistant/agents', (request, response) => {
+  if (!assistantAuthorized(request, response)) return;
+  response.json({ ok: true, agents: agentEngineCatalog() });
 });
 
 // Read-only catalog for diagnostics and future MCP/Skill clients.
@@ -1159,7 +1166,7 @@ app.patch('/api/assistant/preferences', async (request, response, next) => {
     const body = request.body || {};
     const preferencesInput = {};
     for (const [key, limit] of Object.entries({
-      provider_id: 120, model: 160, reasoning_effort: 20,
+      provider_id: 120, model: 160, reasoning_effort: 20, agent_engine: 40,
       memory_provider_id: 120, memory_model: 160, memory_reasoning_effort: 20, memory_daily_time: 20
     })) {
       if (typeof body[key] === 'string') preferencesInput[key] = stringValue(body[key], limit);
@@ -1450,6 +1457,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
 
     const thread = await resolveConversationThread(store, body);
     const stateBefore = await store.bootstrap();
+    const selectedAgent = stringValue(body.agent_engine || stateBefore.ai_preferences?.agent_engine || 'legacy', 40).toLowerCase();
     const projectName = threadProjectName(thread, stateBefore);
     const hydratedThread = { ...thread, project_name: projectName };
     const userMessage = await store.appendMessage(hydratedThread, 'user', message, null, attachments);
@@ -1557,6 +1565,29 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         plan: execution.plan, transcriptPath, messageIds: { user: userMessage?.id || null, assistant: assistantMessage?.id || null },
         state: await store.bootstrap()
       });
+    }
+
+    if (['claude_code', 'codex'].includes(selectedAgent)) {
+      try {
+        const accessToken = accessTokenFromRequest(request);
+        const routePrefix = String(request.originalUrl || '').startsWith('/forward-assistant/') ? '/forward-assistant' : '';
+        const mcpUrl = `${String(request.protocol || 'http')}://${String(request.get('host') || '127.0.0.1')}${routePrefix}/api/mcp?thread_id=${encodeURIComponent(hydratedThread.id)}${hydratedThread.project_id ? `&project_id=${encodeURIComponent(hydratedThread.project_id)}` : ''}`;
+        const agentPrompt = [
+          `你是个人 AI 执行助手“向前”，当前引擎为 ${selectedAgent}。`,
+          `当前对话线程 ID：${hydratedThread.id}。项目 ID：${hydratedThread.project_id || '无'}。`,
+          '请理解用户意图，必要时直接调用 forward_assistant MCP 工具完成任务、项目、记忆、计划、作息和闹钟操作。',
+          '工具调用完成后，用自然中文简洁说明做了什么、结果和调整原因。普通聊天直接回答。不要输出 JSON，不要假装完成未执行的操作。',
+          `当前真实上下文：${contextText}`,
+          `用户消息：${message}`
+        ].join('\n\n');
+        const agentResult = await runAgentEngine({
+          engine: selectedAgent, prompt: agentPrompt, provider, appRoot, mcpUrl,
+          mcpToken: aiGatewayToken, accessToken
+        });
+        return finishAssistantResponse({ reply: agentResult.content || '我已经处理好了。', actions: [], memoryCandidates: [] });
+      } catch (error) {
+        console.error(`Agent ${selectedAgent} failed; falling back to standard AI`, error?.message || 'unknown');
+      }
     }
 
     try {
