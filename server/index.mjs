@@ -589,6 +589,7 @@ function normalizeActions(actions) {
       ...(stringValue(action.task, 120) ? { task: stringValue(action.task, 120) } : {}),
       ...(stringValue(action.title, 120) ? { title: stringValue(action.title, 120) } : {}),
       ...(stringValue(action.task_id, 80) ? { task_id: stringValue(action.task_id, 80) } : {}),
+      ...(stringValue(action.parent_task_id, 80) ? { parent_task_id: stringValue(action.parent_task_id, 80) } : {}),
       ...(stringValue(action.mode, 20) ? { mode: stringValue(action.mode, 20) } : {}),
       ...(Array.isArray(action.task_ids) ? { task_ids: action.task_ids.map((id) => stringValue(id, 80)).filter(Boolean).slice(0, 200) } : {}),
       ...(stringValue(action.notes, 500) ? { notes: stringValue(action.notes, 500) } : {}),
@@ -742,6 +743,7 @@ ${assistantToolPrompt()}
 - 用户说“叫我起床”“提醒我”“设置闹钟”时，使用 set_alarm；时间必须明确，日期不明确时设置为下一次即将到来的时间。用户说“取消闹钟”时使用 cancel_alarm。手机执行结果会单独返回，只有收到设备结果后才能说已经设置成功。
 - 当用户要求“过一会儿再提醒我”“多少分钟后再看一下”时，使用 schedule_followup；只记录需要重新判断的事项，不预设固定提醒文案或必然动作。到时间后由 AI 自己决定是否提醒、重排或保持安静。
 - 用户新增一件事时，使用 create_task；不要直接声称它已经加入计划而没有 action。若未给预计时长，按合理的最小可执行时长估计，并在回复中说明。
+- 用户说“子任务、下面安排、拆成一项”时，使用 create_task，并把 parent_task_id 设置为上下文中对应父任务的真实 ID；优先从 project_tasks、today_plan 或 current_task 中匹配，不要只把“子任务”写进标题。只有用户明确要求独立新任务时才不要设置 parent_task_id。
 - 上下文中的 app_usage 是手机本地监控提供的真实使用摘要和每日记录，不是可选工具。若 current 或 daily_history 存在，必须把它们视为当前事实；可以根据今日累计时长、连续时长、历史趋势和上限解释提醒或重排计划，但不要推断用户在应用中看了什么，也不要把每一次使用记录自动沉淀为长期记忆。
 - sleep_wake_from_phone 是根据前一日最后一次、当日第一次前台应用活动计算出的“候选作息”，仅用于提醒、复盘和在用户追问时说明；它不是确认后的作息，绝对不要自动调用 set_sleep_time 或 set_wake_time 覆盖用户设置。要明确说明候选、证据边界和置信度。
 - 长期记忆只提取稳定偏好、明确决定、项目里程碑或重要事实；不要把普通闲聊自动写入。

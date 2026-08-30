@@ -22,6 +22,24 @@ test('task timer lifecycle keeps completed tasks and supports reopen', async () 
   assert.equal(result.results[0].task.status, 'open');
 });
 
+test('AI-created child tasks keep their parent relationship', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'forward-task-subtask-'));
+  const store = new AssistantStateStore(root);
+  const state = await store.bootstrap();
+  const parent = state.tasks[0];
+  const result = await store.executeActions([{
+    type: 'create_task',
+    title: '完成第一组错题',
+    estimated_minutes: 25,
+    parent_task_id: parent.id
+  }]);
+  const child = result.results[0].task;
+  assert.equal(child.parent_task_id, parent.id);
+  assert.equal((await store.listTasks()).find((item) => item.id === child.id).parent_task_id, parent.id);
+  assert.equal((await store.bootstrap()).plan.scheduled.some((item) => item.id === parent.id), false);
+  assert.equal((await store.bootstrap()).plan.scheduled.some((item) => item.id === child.id), true);
+});
+
 test('completed tasks auto-clear from the daily plan after the sleep boundary while history remains', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'forward-task-completed-clear-'));
   const store = new AssistantStateStore(root);

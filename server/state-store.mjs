@@ -1329,8 +1329,15 @@ export class AssistantStateStore {
               project = { id: id(), name: projectName, description: '', kind: 'project', status: 'active', priority: 3, due_at: null, created_at: timestamp, updated_at: timestamp };
               state.projects.push(project);
             }
+            // Accept the canonical parent ID from the model, but also resolve a
+            // parent title when a compatible provider returns the human label.
+            // This keeps child tasks nested and prevents dangling relationships.
+            const requestedParent = normalizeText(action.parent_task_id, 120);
+            const parent = requestedParent
+              ? state.tasks.find((item) => item.id === requestedParent) || state.tasks.find((item) => taskMatches(item, requestedParent))
+              : null;
             const task = {
-              id: id(), project_id: project?.id || context.project_id || null, parent_task_id: action.parent_task_id || null, title,
+              id: id(), project_id: project?.id || context.project_id || null, parent_task_id: parent?.id || null, title,
               notes: normalizeText(action.reason, 500), status: 'open', priority: taskPriority(action.priority),
               estimated_minutes: Math.max(5, Math.min(720, Number(action.estimated_minutes) || 45)),
               actual_minutes: 0, sort_order: (state.tasks.length + 1) * 10, due_at: action.due_at || null, created_at: timestamp, updated_at: timestamp
