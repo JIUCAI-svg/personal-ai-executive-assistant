@@ -26,6 +26,7 @@ test('AI-created child tasks keep their parent relationship', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'forward-task-subtask-'));
   const store = new AssistantStateStore(root);
   const state = await store.bootstrap();
+  await store.mutate((draft) => { draft.settings.show_sleep_plan = true; });
   const parent = state.tasks[0];
   const result = await store.executeActions([{
     type: 'create_task',
@@ -36,8 +37,22 @@ test('AI-created child tasks keep their parent relationship', async () => {
   const child = result.results[0].task;
   assert.equal(child.parent_task_id, parent.id);
   assert.equal((await store.listTasks()).find((item) => item.id === child.id).parent_task_id, parent.id);
-  assert.equal((await store.bootstrap()).plan.scheduled.some((item) => item.id === parent.id), false);
-  assert.equal((await store.bootstrap()).plan.scheduled.some((item) => item.id === child.id), true);
+  const plan = (await store.bootstrap()).plan;
+  const displayed = [...plan.scheduled, ...plan.sleeping_tasks];
+  assert.equal(displayed.some((item) => item.id === parent.id), false);
+  assert.equal(displayed.some((item) => item.id === child.id), true);
+});
+
+test('subtasks cannot create another nested task', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'forward-task-depth-'));
+  const store = new AssistantStateStore(root);
+  const parent = (await store.bootstrap()).tasks[0];
+  const childResult = await store.executeActions([{ type: 'create_task', title: '一级子任务', parent_task_id: parent.id }]);
+  const child = childResult.results[0].task;
+  const nestedResult = await store.executeActions([{ type: 'create_task', title: '不应创建的子子任务', parent_task_id: child.id }]);
+  assert.equal(nestedResult.results[0].ok, false);
+  assert.match(nestedResult.results[0].reason, /子任务不能继续创建子任务/);
+  assert.equal((await store.listTasks()).some((task) => task.title === '不应创建的子子任务'), false);
 });
 
 test('completed tasks auto-clear from the daily plan after the sleep boundary while history remains', async () => {

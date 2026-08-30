@@ -1408,11 +1408,6 @@ export class AssistantStateStore {
           const title = normalizeText(action.title, 120);
           if (title) {
             const projectName = normalizeText(action.project, 80);
-            let project = state.projects.find((item) => item.name === projectName);
-            if (!project && projectName) {
-              project = { id: id(), name: projectName, description: '', kind: 'project', status: 'active', priority: 3, due_at: null, created_at: timestamp, updated_at: timestamp };
-              state.projects.push(project);
-            }
             // Accept the canonical parent ID from the model, but also resolve a
             // parent title when a compatible provider returns the human label.
             // This keeps child tasks nested and prevents dangling relationships.
@@ -1420,14 +1415,23 @@ export class AssistantStateStore {
             const parent = requestedParent
               ? state.tasks.find((item) => item.id === requestedParent) || state.tasks.find((item) => taskMatches(item, requestedParent))
               : null;
-            const task = {
-              id: id(), project_id: project?.id || context.project_id || null, parent_task_id: parent?.id || null, title,
-              notes: normalizeText(action.reason, 500), status: 'open', priority: taskPriority(action.priority),
-              estimated_minutes: Math.max(5, Math.min(720, Number(action.estimated_minutes) || 45)),
-              actual_minutes: 0, sort_order: (state.tasks.length + 1) * 10, due_at: action.due_at || null, created_at: timestamp, updated_at: timestamp
-            };
-            state.tasks.push(task);
-            result = { type, ok: true, task, reason: '任务已加入真实任务库。' };
+            if (parent?.parent_task_id) {
+              result = { type, ok: false, reason: '子任务不能继续创建子任务，请将新事项添加到一级任务下。' };
+            } else {
+              let project = state.projects.find((item) => item.name === projectName);
+              if (!project && projectName) {
+                project = { id: id(), name: projectName, description: '', kind: 'project', status: 'active', priority: 3, due_at: null, created_at: timestamp, updated_at: timestamp };
+                state.projects.push(project);
+              }
+              const task = {
+                id: id(), project_id: project?.id || context.project_id || null, parent_task_id: parent?.id || null, title,
+                notes: normalizeText(action.reason, 500), status: 'open', priority: taskPriority(action.priority),
+                estimated_minutes: Math.max(5, Math.min(720, Number(action.estimated_minutes) || 45)),
+                actual_minutes: 0, sort_order: (state.tasks.length + 1) * 10, due_at: action.due_at || null, created_at: timestamp, updated_at: timestamp
+              };
+              state.tasks.push(task);
+              result = { type, ok: true, task, reason: '任务已加入真实任务库。' };
+            }
           }
         } else if (['start_task_timer', 'pause_task_timer', 'stop_task_timer', 'complete_task', 'reopen_task', 'update_task', 'reorder_tasks'].includes(type)) {
           if (type === 'reorder_tasks') {
