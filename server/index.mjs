@@ -135,7 +135,11 @@ async function authenticatedSupabaseUser(request) {
 
 async function requestStateStore(request) {
   const accessToken = accessTokenFromRequest(request);
-  if (!accessToken) return { store: stateStore, source: 'local', user: null };
+  // The private gateway token is used by local Agent/MCP subprocesses and is
+  // not a Supabase session token. Keep those requests on the local store.
+  if (!accessToken || (aiGatewayToken && accessToken === aiGatewayToken)) {
+    return { store: stateStore, source: 'local', user: null };
+  }
   const user = await authenticatedSupabaseUser(request);
   return {
     store: new SupabaseStateStore({ url: supabaseUrl, anonKey: supabaseAnonKey, accessToken: user.accessToken, userId: user.id }),
@@ -336,7 +340,10 @@ function browserSameOriginRequest(request) {
 
 function hasGatewayAccess(request) {
   if (!aiGatewayToken) return isLocalDirectRequest(request) || browserSameOriginRequest(request);
-  return isLocalDirectRequest(request) || browserSameOriginRequest(request) || request.get('x-forward-token') === aiGatewayToken;
+  const bearer = accessTokenFromRequest(request);
+  return isLocalDirectRequest(request) || browserSameOriginRequest(request)
+    || request.get('x-forward-token') === aiGatewayToken
+    || bearer === aiGatewayToken;
 }
 
 function requireGatewayAccess(request, response, message = 'AI 网关访问令牌不匹配。') {
@@ -1570,13 +1577,13 @@ app.post('/api/assistant/respond', async (request, response, next) => {
     if (['claude_code', 'codex'].includes(selectedAgent)) {
       try {
         const accessToken = accessTokenFromRequest(request);
-        const routePrefix = String(request.originalUrl || '').startsWith('/forward-assistant/') ? '/forward-assistant' : '';
-        const mcpUrl = `${String(request.protocol || 'http')}://${String(request.get('host') || '127.0.0.1')}${routePrefix}/api/mcp?thread_id=${encodeURIComponent(hydratedThread.id)}${hydratedThread.project_id ? `&project_id=${encodeURIComponent(hydratedThread.project_id)}` : ''}`;
+        const mcpUrl = `http://127.0.0.1:${port}/api/mcp?thread_id=${encodeURIComponent(hydratedThread.id)}${hydratedThread.project_id ? `&project_id=${encodeURIComponent(hydratedThread.project_id)}` : ''}`;
         const agentPrompt = [
           `你是个人 AI 执行助手“向前”，当前引擎为 ${selectedAgent}。`,
           `当前对话线程 ID：${hydratedThread.id}。项目 ID：${hydratedThread.project_id || '无'}。`,
           '请理解用户意图，必要时直接调用 forward_assistant MCP 工具完成任务、项目、记忆、计划、作息和闹钟操作。',
           '工具调用完成后，用自然中文简洁说明做了什么、结果和调整原因。普通聊天直接回答。不要输出 JSON，不要假装完成未执行的操作。',
+          '严格限制：除非用户明确说“这个任务完成了/做完了/标记为完成”并指向具体任务，否则绝对不要调用 complete_task 或 complete_current_task；“完成测试”“完成后告诉我”“工具调用完成”都只是流程描述，不是完成任务指令。',
           `当前真实上下文：${contextText}`,
           `用户消息：${message}`
         ].join('\n\n');
