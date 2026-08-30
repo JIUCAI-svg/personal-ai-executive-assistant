@@ -202,13 +202,13 @@ export function applyDailyMemoryResult(state, result, metadata = {}) {
   return { created, duplicate_ids: [...new Set(duplicates)], summary };
 }
 
-export function searchMemory(state, query, { projectId = '', limit = 12 } = {}) {
+export function searchMemory(state, query, { projectId = '', limit = 12, includePending = true } = {}) {
   const terms = tokens(query);
   const project = text(projectId, 100);
   if (!terms.length) return [];
   const score = (value) => terms.reduce((total, term) => total + (text(value, 4000).toLocaleLowerCase('zh-CN').includes(term) ? (term.length > 1 ? 4 : 1) : 0), 0);
   const items = (Array.isArray(state?.memory_items) ? state.memory_items : [])
-    .filter((item) => item.status !== 'archived' && (!project || item.project_id === project))
+    .filter((item) => (includePending ? item.status !== 'archived' : item.status === 'active') && (!project || item.project_id === project))
     .map((item) => ({ type: 'memory', score: score(`${item.content} ${(item.tags || []).join(' ')}`) + (Number(item.importance) || 0) * 0.1, item }))
     .filter((item) => item.score > 0);
   const summaries = (Array.isArray(state?.daily_memory_summaries) ? state.daily_memory_summaries : [])

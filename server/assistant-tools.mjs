@@ -3,6 +3,31 @@
 // deterministic and transactional.
 export const ASSISTANT_TOOLS = Object.freeze([
   {
+    name: 'get_now',
+    description: '读取当前日期、时间和计划日边界。',
+    parameters: {}
+  },
+  {
+    name: 'get_today_plan',
+    description: '读取指定日期的动态计划、当前任务和可顺延事项。',
+    parameters: { date: '可选 YYYY-MM-DD' }
+  },
+  {
+    name: 'list_tasks',
+    description: '按状态、项目或关键词查找任务。',
+    parameters: { query: '可选关键词', project_id: '可选项目 ID', status: '可选 open、in_progress、deferred、done、cancelled', limit: '最多返回条数' }
+  },
+  {
+    name: 'list_projects',
+    description: '读取人生主线、支线和项目列表。',
+    parameters: { status: '可选 active、paused、completed、archived', limit: '最多返回条数' }
+  },
+  {
+    name: 'get_app_usage',
+    description: '读取手机应用使用摘要和连续使用时长。',
+    parameters: { date: '可选 YYYY-MM-DD', limit: '最多返回条数' }
+  },
+  {
     name: 'set_sleep_time',
     description: '更新今晚的睡觉时间，并触发计划重排。',
     parameters: { time: 'HH:mm', reason: '调整原因' }
@@ -116,6 +141,26 @@ export const ASSISTANT_TOOLS = Object.freeze([
     parameters: { title: '记忆内容', project: '可选项目名', reason: '提取原因' }
   },
   {
+    name: 'search_memory',
+    description: '按关键词检索已确认的长期记忆和每日摘要；需要了解过去信息时再调用。',
+    parameters: { query: '检索关键词或问题', project_id: '可选项目 ID', limit: '最多返回条数' }
+  },
+  {
+    name: 'get_memory',
+    description: '读取一条记忆的完整内容。',
+    parameters: { memory_id: '记忆 ID，必填' }
+  },
+  {
+    name: 'search_vault',
+    description: '按关键词检索本地知识库文档；只返回相关文档摘要，不会自动读取整个知识库。',
+    parameters: { query: '检索关键词或问题', folder: '可选文件夹', limit: '最多返回条数' }
+  },
+  {
+    name: 'search_conversations',
+    description: '按关键词检索已保存的原始对话记录；需要追溯过去说过的话时调用。',
+    parameters: { query: '检索关键词或问题', limit: '最多返回条数' }
+  },
+  {
     name: 'replan_today',
     description: '按最新作息、任务和可用时间重新计算计划。',
     parameters: { reason: '重排原因' }
@@ -124,8 +169,9 @@ export const ASSISTANT_TOOLS = Object.freeze([
 
 export const ASSISTANT_TOOL_NAMES = new Set(ASSISTANT_TOOLS.map((tool) => tool.name));
 
-const NUMBER_PARAMETERS = new Set(['estimated_minutes', 'daily_minutes', 'priority', 'target_minutes', 'minutes', 'after_minutes']);
+const NUMBER_PARAMETERS = new Set(['estimated_minutes', 'daily_minutes', 'priority', 'target_minutes', 'minutes', 'after_minutes', 'limit']);
 const REQUIRED_PARAMETERS = {
+  get_now: [], get_today_plan: [], list_tasks: [], list_projects: [], get_app_usage: [],
   set_sleep_time: ['time'],
   set_wake_time: ['time'],
   set_buffer_minutes: ['minutes'],
@@ -139,7 +185,11 @@ const REQUIRED_PARAMETERS = {
   create_project: ['name'],
   update_project: ['project'],
   set_unavailable_period: ['start', 'end'],
-  capture_memory: ['title']
+  capture_memory: ['title'],
+  search_memory: ['query'],
+  get_memory: ['memory_id'],
+  search_vault: ['query'],
+  search_conversations: ['query']
 };
 
 export const ASSISTANT_SKILLS = Object.freeze([
@@ -166,7 +216,7 @@ export const ASSISTANT_SKILLS = Object.freeze([
   {
     name: 'knowledge_memory',
     description: '检索知识库并把重要信息放入待确认记忆。',
-    tools: ['capture_memory']
+    tools: ['search_memory', 'get_memory', 'search_vault', 'search_conversations', 'capture_memory']
   },
   {
     name: 'daily_review',

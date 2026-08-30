@@ -985,8 +985,6 @@ app.post('/api/mcp', async (request, response, next) => {
     if (!ASSISTANT_TOOL_NAMES.has(name)) {
       return response.status(400).json(mcpError(id, -32602, `未注册的工具：${name || '空工具名'}`));
     }
-    const action = normalizeActions([{ ...mcpArguments(params.arguments), type: name }])[0];
-    if (!action) return response.status(400).json(mcpError(id, -32602, '工具参数格式不正确。'));
     const { store, source } = await requestStateStore(request);
     const thread = await resolveConversationThread(store, {
       thread_id: params.thread_id,
@@ -994,6 +992,73 @@ app.post('/api/mcp', async (request, response, next) => {
       project_id: params.project_id,
       conversation_options: params.conversation_options
     });
+    const argumentsValue = mcpArguments(params.arguments);
+    const readLimit = Math.max(1, Math.min(30, Number(argumentsValue.limit) || 10));
+    if (['get_now', 'get_today_plan', 'list_tasks', 'list_projects', 'get_app_usage', 'search_memory', 'get_memory', 'search_vault', 'search_conversations'].includes(name)) {
+      const state = await store.bootstrap();
+      let data = [];
+      if (name === 'get_now') {
+        data = [{ now: state.plan?.now || new Date().toISOString(), planning_date: state.plan?.planning_date || '', sleep_time: state.plan?.sleep_time || '', wake_time: state.plan?.wake_time || '' }];
+      } else if (name === 'get_today_plan') {
+        data = [{ ...(state.plan || {}), scheduled: state.plan?.scheduled || [], deferred: state.plan?.deferred || [] }];
+      } else if (name === 'list_tasks') {
+        const query = stringValue(argumentsValue.query, 200).toLocaleLowerCase('zh-CN');
+        const status = stringValue(argumentsValue.status, 40);
+        data = (state.tasks || []).filter((task) => (!status || task.status === status) && (!argumentsValue.project_id || task.project_id === argumentsValue.project_id) && (!query || `${task.title} ${task.notes || ''}`.toLocaleLowerCase('zh-CN').includes(query))).slice(0, readLimit);
+      } else if (name === 'list_projects') {
+        const status = stringValue(argumentsValue.status, 40);
+        data = (state.projects || []).filter((project) => !status || project.status === status).slice(0, readLimit);
+      } else if (name === 'get_app_usage') {
+        const date = stringValue(argumentsValue.date, 10);
+        data = (state.app_usage_daily || []).filter((item) => !date || item.date === date).slice(0, readLimit);
+      } else if (name === 'search_memory') {
+        const query = stringValue(argumentsValue.query, 400);
+        data = query ? searchMemory(state, query, {
+          projectId: stringValue(argumentsValue.project_id || thread.project_id, 100),
+          limit: readLimit,
+          includePending: false
+        }).map((entry) => ({
+          type: entry.type,
+          id: entry.item.id,
+          title: entry.type === 'memory' ? entry.item.kind || '长期记忆' : `${entry.item.date} 每日摘要`,
+          content: entry.type === 'memory' ? entry.item.content : entry.item.summary,
+          tags: entry.item.tags || [],
+          source_message_ids: entry.item.source_message_ids || []
+        })) : [];
+      } else if (name === 'get_memory') {
+        const memoryId = stringValue(argumentsValue.memory_id, 100);
+        const memory = (state.memory_items || []).find((item) => item.id === memoryId && item.status !== 'archived');
+        data = memory ? [{ ...memory }] : [];
+      } else if (name === 'search_conversations') {
+        const query = stringValue(argumentsValue.query, 400).toLocaleLowerCase('zh-CN');
+        const searchableThreads = new Set((state.threads || [])
+          .filter((item) => item.mode !== 'temporary' && item.save_full_conversation !== false)
+          .map((item) => item.id));
+        data = (state.messages || []).filter((item) => {
+          if (!query) return false;
+          return searchableThreads.has(item.thread_id) && String(item.content || '').toLocaleLowerCase('zh-CN').includes(query);
+        }).slice(-readLimit).map((item) => ({
+          id: item.id, thread_id: item.thread_id, role: item.role,
+          content: stringValue(item.content, 1800), created_at: item.created_at
+        }));
+      } else {
+        const query = stringValue(argumentsValue.query, 400).toLocaleLowerCase('zh-CN');
+        const folder = stringValue(argumentsValue.folder, 120);
+        const documents = existsSync(vaultPath) ? await readVaultDocuments() : [];
+        data = documents.filter((document) => {
+          const haystack = `${document.title}\n${document.preview}\n${JSON.stringify(document.frontmatter)}`.toLocaleLowerCase('zh-CN');
+          return (!query || haystack.includes(query)) && (!folder || document.folder === folder);
+        }).slice(0, readLimit).map(({ content, ...document }) => document);
+      }
+      const payload = { source, thread_id: thread.id, requested: { type: name, ...argumentsValue }, results: data };
+      return response.json(mcpResponse(id, {
+        content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+        isError: false,
+        structuredContent: payload
+      }));
+    }
+    const action = normalizeActions([{ ...argumentsValue, type: name }])[0];
+    if (!action) return response.status(400).json(mcpError(id, -32602, '工具参数格式不正确。'));
     const execution = await store.executeActions([action], {
       thread_id: thread.id,
       project_id: thread.project_id,
@@ -1585,11 +1650,10 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         const agentPrompt = [
           `你是个人 AI 执行助手“向前”，当前引擎为 ${selectedAgent}。`,
           `当前对话线程 ID：${hydratedThread.id}。项目 ID：${hydratedThread.project_id || '无'}。`,
-          '请理解用户意图，必要时直接调用 forward_assistant MCP 工具完成任务、项目、记忆、计划、作息和闹钟操作。',
-          '工具调用完成后，用自然中文简洁说明做了什么、结果和调整原因。普通聊天直接回答。不要输出 JSON，不要假装完成未执行的操作。',
-          '严格限制：除非用户明确说“这个任务完成了/做完了/标记为完成”并指向具体任务，否则绝对不要调用 complete_task 或 complete_current_task；“完成测试”“完成后告诉我”“工具调用完成”都只是流程描述，不是完成任务指令。',
-          `当前线程的历史对话（按时间顺序；这是同一段对话的上下文，不要把其中的旧问题误当成新指令）：${JSON.stringify(conversation.map((entry) => ({ role: entry.role, content: entry.content })))}`,
-          `当前真实上下文：${contextText}`,
+          '保持原生 Agent 的推理和会话能力。需要了解任务、计划、项目、作息、手机状态、记忆、知识库或历史对话时，主动调用 forward_assistant MCP 工具；不要假设这些数据，也不要要求用户手动重复提供。',
+          '知识库、记忆和原始对话都是按需查询的工具，不会预先注入当前请求。只查询与当前问题相关的内容。',
+          '需要改变任务、计划、项目、记忆、作息、闹钟或提醒时直接调用对应工具。工具返回后继续完成工作，最后用自然中文明确说明结果、未完成事项和调整原因。普通聊天直接回答，不要输出 JSON，不要用“好的，我来处理”作为没有结果的结束语。',
+          '除非用户明确说某个任务已经完成/做完，否则不要调用 complete_task 或 complete_current_task。',
           `用户消息：${message}`
         ].join('\n\n');
         const agentResult = await runAgentEngine({
@@ -1618,7 +1682,6 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         messages: [
           { role: 'system', content: assistantSystemPrompt() },
           { role: 'system', content: `当前对话模式为 ${hydratedThread.mode}，可使用的 Skill：\n${assistantSkillPrompt(hydratedThread.mode)}` },
-          { role: 'system', content: `当前可用上下文（只使用其中真实内容）：${contextText}` },
           ...conversation,
           { role: 'user', content: multimodalUserContent(message, attachments) }
         ]
