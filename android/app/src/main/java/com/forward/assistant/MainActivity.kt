@@ -771,6 +771,7 @@ private fun ForwardApp(activity: MainActivity) {
         var remoteTasks by remember { mutableStateOf(emptyList<RemoteTask>()) }
         var remoteLongTasks by remember { mutableStateOf(emptyList<RemoteLongTask>()) }
         var remoteThreadId by remember { mutableStateOf<String?>(null) }
+        var initialStateLoading by remember { mutableStateOf(true) }
         var conversationOptions by remember { mutableStateOf(defaultConversationOptions("assistant")) }
         var threads by remember { mutableStateOf(emptyList<ConversationThread>()) }
         var threadLoading by remember { mutableStateOf(false) }
@@ -805,15 +806,15 @@ private fun ForwardApp(activity: MainActivity) {
         }
         LaunchedEffect(Unit) {
             runCatching { gatewayFetchState(activity) }.onSuccess { state ->
-                remotePlan = state.plan
-                remoteMemories = state.memories
-                remoteProjects = state.projects
-                remoteTasks = state.tasks
-                remoteLongTasks = state.longTasks
-                runCatching { gatewayMemoryStatus(activity) }.onSuccess { memoryStatus = it }
-                parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
-                parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
-            }
+                    remotePlan = state.plan
+                    remoteMemories = state.memories
+                    remoteProjects = state.projects
+                    remoteTasks = state.tasks
+                    remoteLongTasks = state.longTasks
+                    runCatching { gatewayMemoryStatus(activity) }.onSuccess { memoryStatus = it }
+                    parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
+                    parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
+                }.also { initialStateLoading = false }
             runCatching { gatewayListThreads(activity) }.onSuccess { loadedThreads ->
                 threads = loadedThreads
                 val resume = loadedThreads.firstOrNull { it.mode != "temporary" } ?: loadedThreads.firstOrNull()
@@ -1243,7 +1244,7 @@ private fun ForwardApp(activity: MainActivity) {
                 0 -> TodayScreen(padding, now, sleepTime, currentDone, unavailablePeriod, breakTimer, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), remotePlan, remoteProjects, { showProjects = true }, ::completeTask, ::startCurrentTimer, ::pauseCurrentTimer, { breakTimer = breakTimer?.copy(running = !breakTimer!!.running) }, { breakTimer = null; currentDone = false }, ::reopenTask, ::editTask, ::removeTask, ::createTask, { parent, title, minutes, priority ->
                     val projectId = remoteProjects.firstOrNull { it.name == parent.project }?.id
                     createTask(title, minutes, priority, projectId, parent.id)
-                }, ::completeSpecificTask, ::reorderTasks, ::sendMessage, input, { value -> input = value }, aiBusy)
+                }, ::completeSpecificTask, ::reorderTasks, ::sendMessage, input, { value -> input = value }, aiBusy, initialStateLoading)
                 1 -> ChatScreen(
                     padding = padding,
                     messages = messages,
@@ -1505,7 +1506,8 @@ private fun TodayScreen(
     sendMessage: () -> Unit,
     input: TextFieldValue,
     onInput: (TextFieldValue) -> Unit,
-    aiBusy: Boolean
+    aiBusy: Boolean,
+    initialStateLoading: Boolean = false
 ) {
     var editingTask by remember { mutableStateOf<RemotePlanItem?>(null) }
     var creatingTask by remember { mutableStateOf(false) }
@@ -1530,7 +1532,7 @@ private fun TodayScreen(
         while (remotePlan?.activeTimer != null) { delay(1000); timerSeconds += 1 }
     }
     val clock = formatClock(now.toLocalTime())
-    val serverPlan = remotePlan?.let { remote ->
+    val serverPlan = if (initialStateLoading && remotePlan == null) emptyList() else remotePlan?.let { remote ->
         normalizeRemotePlanItems(remote, now)
     } ?: schedulePlan(plan, now, sleepTime)
     var draggingTaskId by remember { mutableStateOf<String?>(null) }
@@ -1570,7 +1572,7 @@ private fun TodayScreen(
         item { Column(Modifier.padding(horizontal = 20.dp, vertical = 18.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) { Box(Modifier.size(7.dp).clip(CircleShape).background(Coral)); Spacer(Modifier.width(7.dp)); Text(dateLabel(now.toLocalDate()), color = Muted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
             Spacer(Modifier.height(10.dp)); Text("今天，先把最重要的事做下去。", color = Green, fontSize = 26.sp, fontWeight = FontWeight.Bold, lineHeight = 34.sp)
-            Spacer(Modifier.height(6.dp)); Text(if (remotePlan?.isSleeping == true) "现在 $clock · 正在睡眠时段 · ${remotePlan?.wakeTime.orEmpty()} 后恢复安排" else "现在 $clock · 今天排到 ${remotePlan?.sleepTime ?: formatClock(sleepTime)} · 还可用 ${formatDuration(availableMinutes)}", color = Muted, fontSize = 11.sp)
+            Spacer(Modifier.height(6.dp)); Text(if (initialStateLoading && remotePlan == null) "正在同步你的今日计划…" else if (remotePlan?.isSleeping == true) "现在 $clock · 正在睡眠时段 · ${remotePlan?.wakeTime.orEmpty()} 后恢复安排" else "现在 $clock · 今天排到 ${remotePlan?.sleepTime ?: formatClock(sleepTime)} · 还可用 ${formatDuration(availableMinutes)}", color = Muted, fontSize = 11.sp)
             if (remoteProjects.isNotEmpty()) {
                 Spacer(Modifier.height(12.dp))
                 val lead = remoteProjects.maxByOrNull { it.priority }
@@ -1583,7 +1585,16 @@ private fun TodayScreen(
                 }
             }
         } }
-        item { CurrentTaskCard(currentItem, currentDone, breakTimer, remotePlan?.completed?.firstOrNull()?.title, remotePlan?.activeTimer, timerSeconds, completeTask, startTimer, pauseTimer, toggleBreak, skipBreak) }
+        if (initialStateLoading && remotePlan == null) {
+            item {
+                Card(Modifier.padding(horizontal = 20.dp, vertical = 12.dp).fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F0E9)), shape = RoundedCornerShape(12.dp)) {
+                    Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        androidx.compose.material3.CircularProgressIndicator(Modifier.size(20.dp), color = Green, strokeWidth = 2.dp)
+                        Spacer(Modifier.width(10.dp)); Text("正在读取你的计划和作息…", color = Green, fontSize = 12.sp)
+                    }
+                }
+            }
+        } else item { CurrentTaskCard(currentItem, currentDone, breakTimer, remotePlan?.completed?.firstOrNull()?.title, remotePlan?.activeTimer, timerSeconds, completeTask, startTimer, pauseTimer, toggleBreak, skipBreak) }
         item { Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 15.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text("今日动态计划", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.Bold); Row(verticalAlignment = Alignment.CenterVertically) { Text("现在 $clock", color = Muted, fontSize = 10.sp); TextButton(onClick = { creatingTask = true; createTitle = ""; createMinutes = "45"; createPriority = "3" }, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)) { Icon(Icons.Default.Add, null, tint = Green, modifier = Modifier.size(16.dp)); Text("新建", color = Green, fontSize = 11.sp) } } } }
         item { BudgetRow(scheduledMinutes, bufferMinutes, freeMinutes) }
         // Some legacy/local tasks may not have an id yet; keep LazyColumn keys unique
