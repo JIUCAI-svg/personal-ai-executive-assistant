@@ -120,8 +120,13 @@ object AssistantSessionStore {
     private const val PREFS = "assistant_session"
     private const val ACCESS_TOKEN = "supabase_access_token"
     private const val EMAIL = "supabase_email"
+    private const val CURRENT_THREAD = "current_thread_id"
     fun token(context: Context): String = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(ACCESS_TOKEN, "").orEmpty()
     fun email(context: Context): String = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(EMAIL, "").orEmpty()
+    fun currentThread(context: Context): String = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(CURRENT_THREAD, "").orEmpty()
+    fun saveCurrentThread(context: Context, threadId: String?) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(CURRENT_THREAD, threadId.orEmpty()).apply()
+    }
     fun save(context: Context, accessToken: String, email: String) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(ACCESS_TOKEN, accessToken).putString(EMAIL, email).apply()
     }

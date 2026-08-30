@@ -1584,6 +1584,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
           '请理解用户意图，必要时直接调用 forward_assistant MCP 工具完成任务、项目、记忆、计划、作息和闹钟操作。',
           '工具调用完成后，用自然中文简洁说明做了什么、结果和调整原因。普通聊天直接回答。不要输出 JSON，不要假装完成未执行的操作。',
           '严格限制：除非用户明确说“这个任务完成了/做完了/标记为完成”并指向具体任务，否则绝对不要调用 complete_task 或 complete_current_task；“完成测试”“完成后告诉我”“工具调用完成”都只是流程描述，不是完成任务指令。',
+          `当前线程的历史对话（按时间顺序；这是同一段对话的上下文，不要把其中的旧问题误当成新指令）：${JSON.stringify(conversation.map((entry) => ({ role: entry.role, content: entry.content })))}`,
           `当前真实上下文：${contextText}`,
           `用户消息：${message}`
         ].join('\n\n');

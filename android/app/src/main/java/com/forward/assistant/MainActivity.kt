@@ -823,11 +823,15 @@ private fun ForwardApp(activity: MainActivity) {
                 }.also { initialStateLoading = false }
             runCatching { gatewayListThreads(activity) }.onSuccess { loadedThreads ->
                 threads = loadedThreads
-                val resume = loadedThreads.firstOrNull { it.mode != "temporary" } ?: loadedThreads.firstOrNull()
+                val savedThreadId = AssistantSessionStore.currentThread(activity)
+                val resume = loadedThreads.firstOrNull { it.id == savedThreadId }
+                    ?: loadedThreads.firstOrNull { it.mode != "temporary" }
+                    ?: loadedThreads.firstOrNull()
                 if (resume != null) {
                     threadLoading = true
                     runCatching { gatewayLoadThread(activity, resume.id) }.onSuccess { detail ->
                         remoteThreadId = detail.thread.id
+                        AssistantSessionStore.saveCurrentThread(activity, detail.thread.id)
                         conversationOptions = detail.thread.toConversationOptions()
                         messages = detail.messages
                     }
@@ -869,6 +873,7 @@ private fun ForwardApp(activity: MainActivity) {
 
         fun applyLoadedThread(detail: RemoteThreadDetail) {
             remoteThreadId = detail.thread.id
+            AssistantSessionStore.saveCurrentThread(activity, detail.thread.id)
             conversationOptions = detail.thread.toConversationOptions()
             messages = detail.messages
             input = TextFieldValue()
@@ -892,6 +897,7 @@ private fun ForwardApp(activity: MainActivity) {
                 runCatching { gatewayCreateThread(activity, options) }
                     .onSuccess { thread ->
                         remoteThreadId = thread.id
+                        AssistantSessionStore.saveCurrentThread(activity, thread.id)
                         conversationOptions = thread.toConversationOptions()
                         messages = emptyList()
                         input = TextFieldValue()
@@ -947,7 +953,7 @@ private fun ForwardApp(activity: MainActivity) {
         }
 
         fun refreshThreads() { scope.launch { runCatching { gatewayListThreads(activity) }.onSuccess { threads = it }.onFailure { snackbar.showSnackbar(it.message ?: "刷新历史失败") } } }
-        fun deleteThread(thread: ConversationThread) { scope.launch { runCatching { gatewayDeleteThread(activity, thread.id) }.onSuccess { refreshThreads(); if (remoteThreadId == thread.id) { remoteThreadId = null; messages = emptyList() } }.onFailure { snackbar.showSnackbar(it.message ?: "删除对话失败") } } }
+        fun deleteThread(thread: ConversationThread) { scope.launch { runCatching { gatewayDeleteThread(activity, thread.id) }.onSuccess { refreshThreads(); if (remoteThreadId == thread.id) { remoteThreadId = null; AssistantSessionStore.saveCurrentThread(activity, null); messages = emptyList() } }.onFailure { snackbar.showSnackbar(it.message ?: "删除对话失败") } } }
         fun setThreadLocked(thread: ConversationThread, locked: Boolean) { scope.launch { runCatching { gatewaySetThreadLocked(activity, thread.id, locked) }.onSuccess { saved -> threads = threads.map { if (it.id == saved.id) saved else it } }.onFailure { snackbar.showSnackbar(it.message ?: "更新锁定状态失败") } } }
         fun deleteThreads(selected: List<ConversationThread>) { scope.launch { runCatching { gatewayDeleteThreads(activity, selected.map { it.id }) }.onSuccess { (_, locked) -> refreshThreads(); snackbar.showSnackbar(if (locked.isEmpty()) "已删除 ${selected.size} 段对话" else "有 ${locked.size} 段对话已锁定，未删除") }.onFailure { snackbar.showSnackbar(it.message ?: "批量删除失败") } } }
 
@@ -1173,6 +1179,7 @@ private fun ForwardApp(activity: MainActivity) {
                 result.state?.let { remoteMemories = it.memories; remoteProjects = it.projects; remoteTasks = it.tasks; if (it.plan != null) remotePlan = it.plan }
                 result.threadId?.let { id ->
                     remoteThreadId = id
+                    AssistantSessionStore.saveCurrentThread(activity, id)
                     if (conversationOptions.saveFullConversation) {
                         runCatching { gatewayListThreads(activity) }.onSuccess { threads = it }
                     }
@@ -1337,6 +1344,7 @@ private fun ForwardApp(activity: MainActivity) {
                                         val resume = loaded.firstOrNull { it.mode != "temporary" } ?: loaded.firstOrNull()
                                         if (resume != null) loadThread(resume) else {
                                             remoteThreadId = null
+                                            AssistantSessionStore.saveCurrentThread(activity, null)
                                             messages = emptyList()
                                             conversationOptions = defaultConversationOptions("assistant")
                                         }

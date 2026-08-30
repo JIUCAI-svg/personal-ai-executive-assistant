@@ -123,7 +123,7 @@ function App() {
   const [plan, setPlan] = useState([]);
   const [planner, setPlanner] = useState(null);
   const [assistantState, setAssistantState] = useState(null);
-  const [threadId, setThreadId] = useState(null);
+  const [threadId, setThreadId] = useState(() => window.localStorage.getItem('forward.current.thread') || null);
   const [messages, setMessages] = useState([]);
   const [conversationMode, setConversationMode] = useState('daily_planning');
   const [projectId, setProjectId] = useState('');
@@ -259,8 +259,12 @@ function App() {
       if (!response.ok) throw new Error(payload.error || '读取对话历史失败');
       const nextThreads = payload.threads || [];
       setThreads(nextThreads);
-      if (restoreLatest && !threadId && nextThreads[0]?.id) {
-        await openThread(nextThreads[0].id, forceAuthentication);
+      if (restoreLatest) {
+        const savedThreadId = window.localStorage.getItem('forward.current.thread');
+        const resumeId = savedThreadId && nextThreads.some((item) => item.id === savedThreadId)
+          ? savedThreadId
+          : (!threadId ? nextThreads[0]?.id : null);
+        if (resumeId) await openThread(resumeId, forceAuthentication);
       }
     } catch (error) {
       setNotice(error.message || '读取对话历史失败');
@@ -445,7 +449,10 @@ function App() {
       setPlanner(dynamicPlan);
       setPlan(dynamicPlanToUi(dynamicPlan));
     }
-    if (payload.thread?.id) setThreadId(payload.thread.id);
+    if (payload.thread?.id) {
+      setThreadId(payload.thread.id);
+      window.localStorage.setItem('forward.current.thread', payload.thread.id);
+    }
     if (payload.state) setAssistantState(payload.state);
     if (Array.isArray(payload.memoryRead)) setMemoryRead(payload.memoryRead);
   }
@@ -788,6 +795,7 @@ function App() {
     setMessages([]);
     setMemoryRead([]);
     setThreadId(null);
+    window.localStorage.removeItem('forward.current.thread');
     setShowNewConversation(false);
     setShowConversationOptions(false);
     try {
@@ -802,6 +810,7 @@ function App() {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '创建新对话失败');
       setThreadId(payload.thread?.id || null);
+      if (payload.thread?.id) window.localStorage.setItem('forward.current.thread', payload.thread.id);
       setNotice(selected === 'temporary' ? '已打开临时聊天，本次不会读取或沉淀长期内容。' : '已打开新对话。');
       loadThreads();
     } catch (error) {
@@ -816,6 +825,7 @@ function App() {
       if (!response.ok) throw new Error(payload.error || '读取对话失败');
       const thread = payload.thread;
       setThreadId(thread.id);
+      window.localStorage.setItem('forward.current.thread', thread.id);
       setConversationMode(thread.mode);
       setProjectId(thread.project_id || '');
       setMemoryScope(Boolean(thread.memory_scope));
