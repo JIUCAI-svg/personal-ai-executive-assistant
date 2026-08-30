@@ -740,6 +740,7 @@ ${assistantToolPrompt()}
 - 用户说“今天不做、跳过、顺延、明天再做”时，使用 defer_task，该任务保留但移到之后；取消和顺延不能混用。
 - 用户说外出或某段时间不可用时，使用 set_unavailable_period；用户说疲惫时，使用 defer_task 推迟高消耗任务，并使用 replan_today。
 - 用户说“叫我起床”“提醒我”“设置闹钟”时，使用 set_alarm；时间必须明确，日期不明确时设置为下一次即将到来的时间。用户说“取消闹钟”时使用 cancel_alarm。手机执行结果会单独返回，只有收到设备结果后才能说已经设置成功。
+- 当用户要求“过一会儿再提醒我”“多少分钟后再看一下”时，使用 schedule_followup；只记录需要重新判断的事项，不预设固定提醒文案或必然动作。到时间后由 AI 自己决定是否提醒、重排或保持安静。
 - 用户新增一件事时，使用 create_task；不要直接声称它已经加入计划而没有 action。若未给预计时长，按合理的最小可执行时长估计，并在回复中说明。
 - 上下文中的 app_usage 是手机本地监控提供的真实使用摘要和每日记录，不是可选工具。若 current 或 daily_history 存在，必须把它们视为当前事实；可以根据今日累计时长、连续时长、历史趋势和上限解释提醒或重排计划，但不要推断用户在应用中看了什么，也不要把每一次使用记录自动沉淀为长期记忆。
 - sleep_wake_from_phone 是根据前一日最后一次、当日第一次前台应用活动计算出的“候选作息”，仅用于提醒、复盘和在用户追问时说明；它不是确认后的作息，绝对不要自动调用 set_sleep_time 或 set_wake_time 覆盖用户设置。要明确说明候选、证据边界和置信度。
@@ -1653,7 +1654,69 @@ app.use((error, _request, response, _next) => {
 const androidApkPath = path.join(appRoot, 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
 app.get('/download/forward.apk', (_request, response) => {
   if (!existsSync(androidApkPath)) return response.status(404).json({ error: 'Android 安装包尚未生成。' });
-  response.download(androidApkPath, 'forward-assistant-v0.6.4-planning-debug.apk');
+  response.download(androidApkPath, 'forward-assistant-v0.6.6-proactive-debug.apk');
+});
+
+app.get('/api/assistant/followups/due', async (request, response, next) => {
+  try {
+    if (!assistantAuthorized(request, response)) return;
+    const { store, source } = await requestStateStore(request);
+    const state = await store.bootstrap();
+    const now = Date.now();
+    const due = (state.followups || []).filter((item) => item.status === 'scheduled' && Date.parse(item.due_at) <= now);
+    if (due.length) {
+      await store.mutate((nextState) => {
+        nextState.followups = (nextState.followups || []).map((item) => due.some((entry) => entry.id === item.id)
+          ? { ...item, status: 'dispatched', dispatched_at: new Date().toISOString(), updated_at: new Date().toISOString() }
+          : item);
+        return nextState;
+      });
+    }
+    response.json({ ok: true, source, followups: due });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/assistant/proactive', async (request, response, next) => {
+  try {
+    if (!assistantAuthorized(request, response)) return;
+    const { store, source } = await requestStateStore(request);
+    const body = request.body || {};
+    const state = await store.bootstrap();
+    const usage = normalizeAppUsages(body.app_usage || []);
+    for (const entry of usage) await store.recordAppUsage(entry);
+    const current = await store.bootstrap();
+    const provider = selectAiProvider(aiProviderRegistry, current.ai_preferences?.provider_id, current.ai_preferences?.model, aiModel, current.ai_preferences?.reasoning_effort || aiReasoningEffort);
+    if (!provider) return response.status(503).json({ error: '尚未配置可用的 AI 提供商或模型。' });
+    const eventText = stringValue(body.event, 800) || '系统刚刚检测到一项需要重新判断的状态。';
+    const instruction = stringValue(body.instruction, 800);
+    const prompt = `${eventText}${instruction ? `\n需要重新判断：${instruction}` : ''}\n请自行判断是否需要主动提醒、调整计划或安排下一次检查。没有必要时保持安静，不要机械回复。`;
+    const plan = current.plan;
+    const result = await requestAssistantModel({
+      provider, model: provider.model, temperature: 0.45,
+      ...(provider.reasoning_effort ? { reasoning_effort: provider.reasoning_effort } : {}),
+      tools: toolDefinitionsForProvider(provider), tool_choice: 'auto',
+      messages: [
+        { role: 'system', content: assistantSystemPrompt() },
+        { role: 'system', content: '这是一个系统主动事件，不是用户普通发言。你拥有完整计划上下文，请根据事实自主决定是否行动；若不需要提醒，回复空内容且不调用工具。' },
+        { role: 'system', content: `当前上下文：${JSON.stringify({ now: plan.now, planning_date: plan.planning_date, today_plan: plan.scheduled, current_task: plan.current_task, sleep_time: plan.sleep_time, wake_time: plan.wake_time, app_usage: usage, followups: current.followups })}` },
+        { role: 'user', content: prompt }
+      ]
+    });
+    const execution = await store.executeActions(result.result.actions, { persist_action_log: true });
+    response.json({
+      ok: true,
+      source,
+      reply: result.result.reply || '',
+      actions: result.result.actions,
+      actionResults: execution.results,
+      // Device-only operations are returned separately so Android can execute
+      // them locally after the server has persisted the intent.
+      deviceActions: execution.results
+        .filter((item) => item.device_required)
+        .map((item) => ({ type: item.type, ...(item.alarm || {}) })),
+      plan: execution.plan
+    });
+  } catch (error) { next(error); }
 });
 
 app.delete('/api/assistant/threads/:id', async (request, response, next) => {

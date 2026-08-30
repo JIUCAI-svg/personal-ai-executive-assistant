@@ -177,6 +177,7 @@ export function createDefaultAssistantState() {
     app_usage_daily: [],
     device_activity_daily: [],
     alarms: [],
+    followups: [],
     ai_preferences: {
       provider_id: '', model: '', reasoning_effort: '',
       memory_provider_id: '', memory_model: '', memory_reasoning_effort: '',
@@ -261,6 +262,7 @@ export function repairAssistantState(source) {
     app_usage_daily: Array.isArray(state.app_usage_daily) ? state.app_usage_daily : [],
     device_activity_daily: Array.isArray(state.device_activity_daily) ? state.device_activity_daily : [],
     alarms: Array.isArray(state.alarms) ? state.alarms : [],
+    followups: Array.isArray(state.followups) ? state.followups : [],
     ai_preferences: aiPreferences,
     sleep_wake_events: Array.isArray(state.sleep_wake_events) ? state.sleep_wake_events : []
   };
@@ -1218,6 +1220,20 @@ export class AssistantStateStore {
             state.alarms = state.alarms.slice(-200);
             result = { type, ok: true, device_required: true, alarm, reason: action.reason || '已生成手机闹钟请求。' };
           }
+        } else if (type === 'schedule_followup') {
+          const afterMinutes = Number(action.after_minutes);
+          const instruction = normalizeText(action.instruction, 500);
+          if (Number.isFinite(afterMinutes) && afterMinutes >= 1 && afterMinutes <= 10080 && instruction) {
+            const followup = {
+              id: id(), due_at: new Date(Date.now() + Math.round(afterMinutes) * 60000).toISOString(),
+              after_minutes: Math.round(afterMinutes), instruction,
+              reason: normalizeText(action.reason, 300), status: 'scheduled',
+              thread_id: context.thread_id || null, created_at: timestamp, updated_at: timestamp
+            };
+            state.followups.push(followup);
+            state.followups = state.followups.filter((item) => item.status === 'scheduled').slice(-200);
+            result = { type, ok: true, followup, reason: action.reason || `已安排 ${afterMinutes} 分钟后重新判断。` };
+          } else result = { type, ok: false, reason: '延迟唤醒需要 1 到 10080 分钟，以及要重新判断的事项。' };
         } else if (type === 'cancel_alarm') {
           const requestedId = normalizeText(action.alarm_id, 80);
           const requestedLabel = normalizeText(action.label, 120);

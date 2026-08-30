@@ -40,6 +40,25 @@ import java.time.format.DateTimeFormatter
 private const val USAGE_CHECK_INTERVAL_MS = 5 * 60 * 1000L
 private const val USAGE_UPLOAD_INTERVAL_MS = 15 * 60 * 1000L
 
+private fun assistantDeviceActionsFromJson(array: JSONArray?): List<AssistantAction> {
+    if (array == null) return emptyList()
+    return (0 until array.length()).mapNotNull { index ->
+        val action = array.optJSONObject(index) ?: return@mapNotNull null
+        val type = action.optString("type").trim()
+        if (type != "set_alarm" && type != "cancel_alarm") return@mapNotNull null
+        AssistantAction(
+            type = type,
+            time = action.optString("time").ifBlank { null },
+            date = action.optString("date").ifBlank { null },
+            label = action.optString("label").ifBlank { null },
+            repeat = action.optString("repeat").ifBlank { null },
+            alarmId = action.optString("id").ifBlank {
+                action.optString("alarm_id").ifBlank { null }
+            }
+        )
+    }
+}
+
 data class InstalledUsageApp(
     val appName: String,
     val packageName: String
@@ -275,6 +294,13 @@ object UsageMonitorStore {
         prefs(context).edit().putLong("session_reminder_$packageName", sessionStart).apply()
     }
 
+    fun shouldSendAiProactive(context: Context, sessionStart: Long, packageName: String): Boolean =
+        sessionStart > 0L && prefs(context).getLong("ai_proactive_$packageName", 0L) != sessionStart
+
+    fun markAiProactiveSent(context: Context, sessionStart: Long, packageName: String) {
+        prefs(context).edit().putLong("ai_proactive_$packageName", sessionStart).apply()
+    }
+
     fun shouldUpload(context: Context): Boolean {
         val lastAttempt = prefs(context).getLong("usage_upload_attempt", 0L)
         return System.currentTimeMillis() - lastAttempt >= USAGE_UPLOAD_INTERVAL_MS
@@ -427,6 +453,88 @@ class UsageMonitorService : Service() {
         val snapshot = UsageMonitorStore.snapshot(this)
         if (UsageMonitorStore.shouldUpload(this)) uploadUsage(snapshot)
         sendTargetReminders(targetSnapshots)
+        evaluateAiProactive(targetSnapshots, snapshot)
+        evaluateDueFollowups(snapshot)
+    }
+
+    private suspend fun evaluateDueFollowups(snapshot: UsageMonitorSnapshot) = withContext(Dispatchers.IO) {
+        val configuredUrl = BuildConfig.AI_GATEWAY_URL.trim()
+        if (configuredUrl.isBlank()) return@withContext
+        val base = if (configuredUrl.endsWith("/api/assistant/respond")) configuredUrl.removeSuffix("/api/assistant/respond") else configuredUrl.trimEnd('/')
+        val connection = (URL("$base/api/assistant/followups/due").openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"; connectTimeout = 5_000; readTimeout = 8_000; useCaches = false
+            if (BuildConfig.AI_GATEWAY_TOKEN.isNotBlank()) setRequestProperty("x-forward-token", BuildConfig.AI_GATEWAY_TOKEN)
+            AssistantSessionStore.token(this@UsageMonitorService).takeIf { it.isNotBlank() }?.let { setRequestProperty("Authorization", "Bearer $it") }
+        }
+        try {
+            if (connection.responseCode !in 200..299) return@withContext
+            val body = connection.inputStream.bufferedReader().use { it.readText() }
+            val due = JSONObject(body).optJSONArray("followups") ?: return@withContext
+            for (index in 0 until due.length()) {
+                val item = due.optJSONObject(index) ?: continue
+                val event = item.optString("instruction").ifBlank { "到达了预定的主动检查时间。" }
+                val payload = JSONObject().apply {
+                    put("event", event); put("instruction", item.optString("instruction"));
+                    put("app_usage", JSONArray().apply { snapshot.targetApps.forEach { target -> put(JSONObject().apply { put("app", target.appName); put("package_name", target.packageName); put("today_minutes", target.dailyMinutes); put("current_session_minutes", target.currentSessionMinutes); put("in_foreground", target.isInForeground); put("date", LocalDate.now().toString()); put("source", "android-usage-monitor") }) } })
+                }.toString().toByteArray(Charsets.UTF_8)
+                val proactive = (URL("$base/api/assistant/proactive").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"; connectTimeout = 8_000; readTimeout = 60_000; doOutput = true; useCaches = false
+                    setFixedLengthStreamingMode(payload.size); setRequestProperty("Content-Type", "application/json; charset=utf-8"); setRequestProperty("Connection", "close")
+                    if (BuildConfig.AI_GATEWAY_TOKEN.isNotBlank()) setRequestProperty("x-forward-token", BuildConfig.AI_GATEWAY_TOKEN)
+                    AssistantSessionStore.token(this@UsageMonitorService).takeIf { it.isNotBlank() }?.let { setRequestProperty("Authorization", "Bearer $it") }
+                }
+                try {
+                    proactive.outputStream.use { output -> output.write(payload) }
+                    if (proactive.responseCode in 200..299) {
+                        val result = proactive.inputStream.bufferedReader().use { it.readText() }
+                        val responseJson = JSONObject(result)
+                        assistantDeviceActionsFromJson(responseJson.optJSONArray("deviceActions"))
+                            .forEach { action -> AlarmScheduler.apply(this@UsageMonitorService, action) }
+                        responseJson.optString("reply").trim().takeIf { it.isNotBlank() }?.let { UsageMonitorNotification.send(this@UsageMonitorService, "向前", it) }
+                    }
+                } finally { proactive.disconnect() }
+            }
+        } finally { connection.disconnect() }
+    }
+
+    private suspend fun evaluateAiProactive(targetSnapshots: List<UsageAppSnapshot>, snapshot: UsageMonitorSnapshot) {
+        targetSnapshots.filter { it.isInForeground && it.currentSessionMinutes >= 10 && UsageMonitorStore.shouldSendAiProactive(this, it.sessionStartedAt, it.packageName) }
+            .forEach { target ->
+                UsageMonitorStore.markAiProactiveSent(this, target.sessionStartedAt, target.packageName)
+                val configuredUrl = BuildConfig.AI_GATEWAY_URL.trim()
+                if (configuredUrl.isBlank()) return@forEach
+                val endpoint = if (configuredUrl.endsWith("/api/assistant/respond")) configuredUrl.removeSuffix("/api/assistant/respond") + "/api/assistant/proactive" else configuredUrl.trimEnd('/') + "/api/assistant/proactive"
+                val payload = JSONObject().apply {
+                    put("event", "手机检测到 ${target.appName} 已连续使用约 ${target.currentSessionMinutes} 分钟。")
+                    put("app_usage", JSONArray().put(JSONObject().apply {
+                        put("enabled", snapshot.enabled); put("app", target.appName); put("package_name", target.packageName)
+                        put("today_minutes", target.dailyMinutes); put("current_session_minutes", target.currentSessionMinutes)
+                        put("daily_limit_minutes", target.dailyLimitMinutes); put("session_limit_minutes", target.sessionLimitMinutes)
+                        put("in_foreground", true); put("updated_at", snapshot.updatedAt); put("date", LocalDate.now().toString()); put("source", "android-usage-monitor")
+                    }) )
+                }.toString().toByteArray(Charsets.UTF_8)
+                runCatching {
+                    val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                        requestMethod = "POST"; connectTimeout = 8_000; readTimeout = 60_000; doOutput = true; useCaches = false
+                        setFixedLengthStreamingMode(payload.size); setRequestProperty("Content-Type", "application/json; charset=utf-8"); setRequestProperty("Connection", "close")
+                        if (BuildConfig.AI_GATEWAY_TOKEN.isNotBlank()) setRequestProperty("x-forward-token", BuildConfig.AI_GATEWAY_TOKEN)
+                        AssistantSessionStore.token(this@UsageMonitorService).takeIf { it.isNotBlank() }?.let { setRequestProperty("Authorization", "Bearer $it") }
+                    }
+                    try {
+                        connection.outputStream.use { output -> output.write(payload) }
+                        val body = (if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream)?.bufferedReader()?.use { it.readText() }.orEmpty()
+                        if (connection.responseCode !in 200..299) error(JSONObject(body).optString("error", "主动判断请求失败"))
+                        val responseJson = JSONObject(body)
+                        assistantDeviceActionsFromJson(responseJson.optJSONArray("deviceActions"))
+                            .forEach { action ->
+                                val outcome = AlarmScheduler.apply(this, action)
+                                if (!outcome.ok) UsageMonitorStore.saveEvent(this, "主动闹钟操作失败：${outcome.message}")
+                            }
+                        val reply = responseJson.optString("reply").trim()
+                        if (reply.isNotBlank()) UsageMonitorNotification.send(this, "向前", reply)
+                    } finally { connection.disconnect() }
+                }.onFailure { UsageMonitorStore.saveEvent(this, "主动判断请求失败：${it.message.orEmpty()}") }
+            }
     }
 
     private fun calculateTargetUsage(

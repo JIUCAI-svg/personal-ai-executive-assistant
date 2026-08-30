@@ -23,6 +23,11 @@ export const ASSISTANT_TOOLS = Object.freeze([
     parameters: { time: 'HH:mm', date: '可选 YYYY-MM-DD', label: '闹钟标签', repeat: '可选 none 或 daily', reason: '设置原因' }
   },
   {
+    name: 'schedule_followup',
+    description: '安排一次未来的主动唤醒；到时间后系统会再次让 AI 判断是否需要发消息或调整计划。',
+    parameters: { after_minutes: '多少分钟后唤醒', instruction: '到时间时需要重新判断的事项', reason: '安排原因' }
+  },
+  {
     name: 'cancel_alarm',
     description: '取消手机上的一个闹钟。优先使用 alarm_id；也可以用标签和时间匹配。',
     parameters: { alarm_id: '可选闹钟 ID', time: '可选 HH:mm', date: '可选 YYYY-MM-DD', label: '可选闹钟标签', reason: '取消原因' }
@@ -107,12 +112,13 @@ export const ASSISTANT_TOOLS = Object.freeze([
 
 export const ASSISTANT_TOOL_NAMES = new Set(ASSISTANT_TOOLS.map((tool) => tool.name));
 
-const NUMBER_PARAMETERS = new Set(['estimated_minutes', 'daily_minutes', 'priority', 'target_minutes', 'minutes']);
+const NUMBER_PARAMETERS = new Set(['estimated_minutes', 'daily_minutes', 'priority', 'target_minutes', 'minutes', 'after_minutes']);
 const REQUIRED_PARAMETERS = {
   set_sleep_time: ['time'],
   set_wake_time: ['time'],
   set_buffer_minutes: ['minutes'],
   set_alarm: ['time'],
+  schedule_followup: ['after_minutes', 'instruction'],
   cancel_task: ['task'],
   defer_task: ['task'],
   create_task: ['title'],

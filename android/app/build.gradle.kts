@@ -14,8 +14,8 @@ android {
         applicationId = "com.forward.assistant"
         minSdk = 26
         targetSdk = 35
-        versionCode = 14
-        versionName = "0.6.5"
+        versionCode = 15
+        versionName = "0.6.6"
     }
 
     buildTypes {
