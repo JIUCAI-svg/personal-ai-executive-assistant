@@ -29,13 +29,15 @@ test('AI-created child tasks keep their parent relationship', async () => {
   await store.mutate((draft) => { draft.settings.show_sleep_plan = true; });
   const parent = state.tasks[0];
   const result = await store.executeActions([{
-    type: 'create_task',
+    type: 'create_subtask',
     title: '完成第一组错题',
     estimated_minutes: 25,
     parent_task_id: parent.id
   }]);
+  assert.equal(result.results[0].ok, true);
   const child = result.results[0].task;
   assert.equal(child.parent_task_id, parent.id);
+  assert.equal(child.project_id, parent.project_id);
   assert.equal((await store.listTasks()).find((item) => item.id === child.id).parent_task_id, parent.id);
   const plan = (await store.bootstrap()).plan;
   const displayed = [...plan.scheduled, ...plan.sleeping_tasks];
@@ -47,9 +49,16 @@ test('subtasks cannot create another nested task', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'forward-task-depth-'));
   const store = new AssistantStateStore(root);
   const parent = (await store.bootstrap()).tasks[0];
-  const childResult = await store.executeActions([{ type: 'create_task', title: '一级子任务', parent_task_id: parent.id }]);
+  const wrongAction = await store.executeActions([{ type: 'create_task', title: '伪装的子任务', parent_task_id: parent.id }]);
+  assert.equal(wrongAction.results[0].ok, false);
+  assert.match(wrongAction.results[0].reason, /新建子任务/);
+  const missingParent = await store.executeActions([{ type: 'create_subtask', title: '没有父任务的子任务', parent_task_id: 'missing-parent' }]);
+  assert.equal(missingParent.results[0].ok, false);
+  assert.match(missingParent.results[0].reason, /没有找到要归属的父任务/);
+  const childResult = await store.executeActions([{ type: 'create_subtask', title: '一级子任务', parent_task_id: parent.id }]);
+  assert.equal(childResult.results[0].ok, true);
   const child = childResult.results[0].task;
-  const nestedResult = await store.executeActions([{ type: 'create_task', title: '不应创建的子子任务', parent_task_id: child.id }]);
+  const nestedResult = await store.executeActions([{ type: 'create_subtask', title: '不应创建的子子任务', parent_task_id: child.id }]);
   assert.equal(nestedResult.results[0].ok, false);
   assert.match(nestedResult.results[0].reason, /子任务不能继续创建子任务/);
   assert.equal((await store.listTasks()).some((task) => task.title === '不应创建的子子任务'), false);

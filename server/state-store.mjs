@@ -1404,7 +1404,7 @@ export class AssistantStateStore {
             master.updated_at = timestamp;
             result = { type, ok: true, long_task: master, reason: '长期任务已更新。' };
           } else result = { type, ok: false, reason: '没有找到匹配的长期任务。' };
-        } else if (type === 'create_task') {
+        } else if (type === 'create_task' || type === 'create_subtask') {
           const title = normalizeText(action.title, 120);
           if (title) {
             const projectName = normalizeText(action.project, 80);
@@ -1415,22 +1415,26 @@ export class AssistantStateStore {
             const parent = requestedParent
               ? state.tasks.find((item) => item.id === requestedParent) || state.tasks.find((item) => taskMatches(item, requestedParent))
               : null;
-            if (parent?.parent_task_id) {
+            if (type === 'create_subtask' && !parent) {
+              result = { type, ok: false, reason: '没有找到要归属的父任务，子任务未创建。' };
+            } else if (type === 'create_task' && requestedParent) {
+              result = { type, ok: false, reason: '请使用新建子任务操作来绑定父任务。' };
+            } else if (parent?.parent_task_id) {
               result = { type, ok: false, reason: '子任务不能继续创建子任务，请将新事项添加到一级任务下。' };
             } else {
-              let project = state.projects.find((item) => item.name === projectName);
-              if (!project && projectName) {
+              let project = parent ? state.projects.find((item) => item.id === parent.project_id) : state.projects.find((item) => item.name === projectName);
+              if (!parent && !project && projectName) {
                 project = { id: id(), name: projectName, description: '', kind: 'project', status: 'active', priority: 3, due_at: null, created_at: timestamp, updated_at: timestamp };
                 state.projects.push(project);
               }
               const task = {
-                id: id(), project_id: project?.id || context.project_id || null, parent_task_id: parent?.id || null, title,
+                id: id(), project_id: project?.id || (parent ? parent.project_id || null : context.project_id || null), parent_task_id: parent?.id || null, title,
                 notes: normalizeText(action.reason, 500), status: 'open', priority: taskPriority(action.priority),
                 estimated_minutes: Math.max(5, Math.min(720, Number(action.estimated_minutes) || 45)),
                 actual_minutes: 0, sort_order: (state.tasks.length + 1) * 10, due_at: action.due_at || null, created_at: timestamp, updated_at: timestamp
               };
               state.tasks.push(task);
-              result = { type, ok: true, task, reason: '任务已加入真实任务库。' };
+              result = { type, ok: true, task, reason: parent ? '子任务已加入父任务。' : '任务已加入真实任务库。' };
             }
           }
         } else if (['start_task_timer', 'pause_task_timer', 'stop_task_timer', 'complete_task', 'reopen_task', 'update_task', 'reorder_tasks'].includes(type)) {

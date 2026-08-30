@@ -59,10 +59,17 @@ export const ASSISTANT_TOOLS = Object.freeze([
   },
   {
     name: 'create_task',
-    description: '创建任务并加入真实任务库，再由计划器安排时间。',
+    description: '创建顶层任务并加入真实任务库，再由计划器安排时间。顶层任务不能绑定父任务。',
     parameters: {
       title: '任务名称', estimated_minutes: '预计分钟数', priority: '1-5',
-      project: '可选项目名', parent_task_id: '可选父任务 ID；用于创建可独立计时的子任务', due_at: '可选 ISO 时间', date: '可选 YYYY-MM-DD', reason: '创建原因'
+      project: '可选项目名', due_at: '可选 ISO 时间', date: '可选 YYYY-MM-DD', reason: '创建原因'
+    }
+  },
+  {
+    name: 'create_subtask',
+    description: '在指定一级任务下创建一条可独立计时、完成的子任务；自动继承父任务所属项目，不能继续嵌套。',
+    parameters: {
+      title: '子任务名称', parent_task_id: '父任务真实 ID，必填', estimated_minutes: '预计分钟数', priority: '1-5', reason: '创建原因'
     }
   },
   {
@@ -127,6 +134,7 @@ const REQUIRED_PARAMETERS = {
   cancel_task: ['task'],
   defer_task: ['task'],
   create_task: ['title'],
+  create_subtask: ['title', 'parent_task_id'],
   create_long_task: ['title'],
   create_project: ['name'],
   update_project: ['project'],
@@ -143,12 +151,12 @@ export const ASSISTANT_SKILLS = Object.freeze([
   {
     name: 'task_management',
     description: '创建、编辑、排序、计时、完成、取消和顺延任务。',
-    tools: ['create_task', 'create_long_task', 'update_task', 'update_long_task', 'reorder_tasks', 'start_task_timer', 'pause_task_timer', 'stop_task_timer', 'complete_task', 'reopen_task', 'complete_current_task', 'cancel_task', 'cancel_all_tasks', 'defer_task']
+    tools: ['create_task', 'create_subtask', 'create_long_task', 'update_task', 'update_long_task', 'reorder_tasks', 'start_task_timer', 'pause_task_timer', 'stop_task_timer', 'complete_task', 'reopen_task', 'complete_current_task', 'cancel_task', 'cancel_all_tasks', 'defer_task']
   },
   {
     name: 'project_management',
     description: '创建、查看和调整人生主线、支线与项目。',
-    tools: ['create_project', 'update_project', 'create_task', 'update_task']
+    tools: ['create_project', 'update_project', 'create_task', 'create_subtask', 'update_task']
   },
   {
     name: 'dynamic_planning',

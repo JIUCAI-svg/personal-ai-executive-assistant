@@ -1022,15 +1022,19 @@ private fun ForwardApp(activity: MainActivity) {
         fun createTask(title: String, minutes: Int, priority: Int, projectId: String? = null, parentTaskId: String? = null, taskType: String = "one_off", dueAt: String? = null) {
             scope.launch { runCatching {
                 gatewayExecuteAction(activity, remoteThreadId, JSONObject()
-                    .put("type", if (taskType == "long") "create_long_task" else "create_task")
+                    .put("type", when {
+                        parentTaskId?.isNotBlank() == true -> "create_subtask"
+                        taskType == "long" -> "create_long_task"
+                        else -> "create_task"
+                    })
                     .put("title", title)
                     .put("estimated_minutes", minutes)
                     .put("daily_minutes", minutes)
                     .put("priority", priority)
-                    .apply { dueAt?.takeIf(String::isNotBlank)?.let { put("due_at", it) } }
-                    .apply { remoteProjects.firstOrNull { it.id == projectId }?.name?.let { put("project", it) } }
+                    .apply { if (parentTaskId.isNullOrBlank()) dueAt?.takeIf(String::isNotBlank)?.let { put("due_at", it) } }
+                    .apply { if (parentTaskId.isNullOrBlank()) remoteProjects.firstOrNull { it.id == projectId }?.name?.let { put("project", it) } }
                     .apply { parentTaskId?.takeIf(String::isNotBlank)?.let { put("parent_task_id", it) } }
-                    .put("reason", "用户在移动端手动新建任务"))
+                    .put("reason", if (parentTaskId.isNullOrBlank()) "用户在移动端手动新建任务" else "用户在移动端手动新建子任务"))
             }.onSuccess { state -> remotePlan = state.plan; remoteProjects = state.projects; remoteTasks = state.tasks }
                 .onFailure { snackbar.showSnackbar(it.message ?: "新建任务失败") } }
         }
@@ -1673,9 +1677,9 @@ private fun TodayScreen(
         item { Composer(input, onInput, sendMessage, aiBusy) }
     }
     creatingSubtask?.let { parent ->
-        CreateProjectTaskDialog(
-            projectId = null,
-            parentTask = RemoteTask(id = parent.id, title = parent.title, notes = parent.notes, status = parent.status, priority = parent.priority, minutes = parent.minutes, actualMinutes = parent.actualMinutes, dueAt = parent.dueAt),
+        CreateSubtaskDialog(
+            parentTitle = parent.title,
+            parentPriority = parent.priority,
             onDismiss = { creatingSubtask = null },
             onCreate = { title, minutes, priority ->
                 creatingSubtask = null
@@ -2119,7 +2123,7 @@ private fun ProjectScreen(
     val projectName = project?.name.orEmpty()
     val projectTasks = tasks.filter { it.projectId == project?.id }
     val completedCount = projectTasks.count { it.status == "done" }
-    var showTaskDialog by remember { mutableStateOf(false) }
+    var showProjectTaskDialog by remember { mutableStateOf(false) }
     var subtaskParent by remember { mutableStateOf<RemoteTask?>(null) }
     Column(modifier.fillMaxSize().padding(padding)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -2139,7 +2143,7 @@ private fun ProjectScreen(
         }
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("项目任务", color = Green, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            TextButton(onClick = { subtaskParent = null; showTaskDialog = true }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) { Icon(Icons.Default.Add, null, tint = Green, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(4.dp)); Text("新建任务", color = Green, fontSize = 11.sp) }
+            TextButton(onClick = { showProjectTaskDialog = true }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) { Icon(Icons.Default.Add, null, tint = Green, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(4.dp)); Text("新建任务", color = Green, fontSize = 11.sp) }
         }
         if (projectTasks.isEmpty()) {
             Text("还没有这个项目的任务，可以先新建一项。", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
@@ -2159,7 +2163,7 @@ private fun ProjectScreen(
                         if (task.status == "open" || task.status == "in_progress") {
                             val running = plan?.activeTimer?.taskId == task.id
                             TextButton(onClick = { if (running) onPauseTaskTimer(task) else onStartTaskTimer(task) }, contentPadding = PaddingValues(horizontal = 5.dp)) { Text(if (running) "暂停" else "计时", color = Green, fontSize = 10.sp) }
-                            TextButton(onClick = { subtaskParent = task; showTaskDialog = true }, contentPadding = PaddingValues(horizontal = 5.dp)) { Text("子任务", color = Muted, fontSize = 10.sp) }
+                            if (task.parentTaskId == null) TextButton(onClick = { subtaskParent = task }, contentPadding = PaddingValues(horizontal = 5.dp)) { Text("子任务", color = Muted, fontSize = 10.sp) }
                         }
                     }
                 }
@@ -2172,12 +2176,22 @@ private fun ProjectScreen(
             modifier = Modifier.weight(1f)
         )
     }
-    if (showTaskDialog) {
+    if (showProjectTaskDialog) {
         CreateProjectTaskDialog(
             projectId = project?.id,
-            parentTask = subtaskParent,
-            onDismiss = { showTaskDialog = false },
-            onCreate = { title, minutes, priority -> showTaskDialog = false; onCreateTask(title, minutes, priority, project?.id, subtaskParent?.id); subtaskParent = null }
+            onDismiss = { showProjectTaskDialog = false },
+            onCreate = { title, minutes, priority -> showProjectTaskDialog = false; onCreateTask(title, minutes, priority, project?.id, null) }
+        )
+    }
+    subtaskParent?.let { parent ->
+        CreateSubtaskDialog(
+            parentTitle = parent.title,
+            parentPriority = parent.priority,
+            onDismiss = { subtaskParent = null },
+            onCreate = { title, minutes, priority ->
+                onCreateTask(title, minutes, priority, null, parent.id)
+                subtaskParent = null
+            }
         )
     }
 }
@@ -2185,7 +2199,6 @@ private fun ProjectScreen(
 @Composable
 private fun CreateProjectTaskDialog(
     projectId: String?,
-    parentTask: RemoteTask? = null,
     onDismiss: () -> Unit,
     onCreate: (String, Int, Int) -> Unit
 ) {
@@ -2194,7 +2207,7 @@ private fun CreateProjectTaskDialog(
     var priority by remember { mutableStateOf(3) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (parentTask == null) "新建项目任务" else "新建子任务", color = Green, fontWeight = FontWeight.Bold) },
+        title = { Text("新建项目任务", color = Green, fontWeight = FontWeight.Bold) },
         text = {
             Column {
                 OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("任务内容") }, singleLine = true)
@@ -2204,6 +2217,37 @@ private fun CreateProjectTaskDialog(
             }
         },
         confirmButton = { TextButton(onClick = { if (title.isNotBlank()) onCreate(title.trim(), minutes.toIntOrNull()?.coerceIn(5, 720) ?: 45, priority) }) { Text("创建", color = Green) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消", color = Muted) } }
+    )
+}
+
+@Composable
+private fun CreateSubtaskDialog(
+    parentTitle: String,
+    parentPriority: Int,
+    onDismiss: () -> Unit,
+    onCreate: (String, Int, Int) -> Unit
+) {
+    var title by remember { mutableStateOf("") }
+    var minutes by remember { mutableStateOf("30") }
+    var priority by remember { mutableStateOf(when { parentPriority >= 4 -> 5; parentPriority <= 1 -> 1; else -> 3 }) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        shape = RoundedCornerShape(18.dp),
+        containerColor = Color(0xFFFFFEFA),
+        title = { Text("新建子任务", color = Green, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("归入父任务", color = Muted, fontSize = 10.sp)
+                Text(parentTitle, color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text("子任务会继承所属项目，可独立计时和完成。", color = Muted, fontSize = 10.sp, lineHeight = 15.sp)
+                OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("子任务内容") }, singleLine = true)
+                OutlinedTextField(value = minutes, onValueChange = { minutes = it.filter(Char::isDigit) }, label = { Text("预计分钟") }, singleLine = true)
+                Text("优先级", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
+                Row { listOf(1 to "低", 3 to "中", 5 to "高").forEach { (value, label) -> TextButton(onClick = { priority = value }) { Text(if (priority == value) "✓ $label" else label, color = if (priority == value) Green else Muted) } } }
+            }
+        },
+        confirmButton = { TextButton(onClick = { if (title.isNotBlank()) onCreate(title.trim(), minutes.toIntOrNull()?.coerceIn(5, 720) ?: 30, priority) }) { Text("创建子任务", color = Green) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消", color = Muted) } }
     )
 }
