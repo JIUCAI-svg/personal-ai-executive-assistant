@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -55,18 +55,20 @@ function parseClaudeOutput(stdout) {
   const raw = text(stdout);
   try {
     const parsed = JSON.parse(raw);
-    return text(parsed.result || parsed.message || parsed.output || parsed.content || raw);
+    return { content: text(parsed.result || parsed.message || parsed.output || parsed.content || raw), sessionId: text(parsed.session_id || parsed.sessionId) || null };
   } catch {
-    return raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).pop() || raw;
+    return { content: raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).pop() || raw, sessionId: null };
   }
 }
 
 function parseCodexOutput(stdout) {
   const lines = text(stdout).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   let result = '';
+  let sessionId = null;
   for (const line of lines) {
     try {
       const event = JSON.parse(line);
+      if (event.type === 'thread.started') sessionId = text(event.thread_id || event.threadId) || sessionId;
       if (event.type === 'item.completed' && event.item?.type === 'agent_message') result = text(event.item.text || event.item.message || result);
       if (event.type === 'turn.completed' && event.last_message) result = text(event.last_message);
       if (event.type === 'message' && event.role === 'assistant') result = text(event.content || result);
@@ -74,7 +76,7 @@ function parseCodexOutput(stdout) {
       // Codex can emit human-readable diagnostics alongside JSON events.
     }
   }
-  return result || lines[lines.length - 1] || '';
+  return { content: result || lines[lines.length - 1] || '', sessionId };
 }
 
 function codexConfig(provider, mcpUrl, token) {
@@ -101,39 +103,40 @@ export function agentEngineCatalog() {
   ];
 }
 
-export async function runAgentEngine({ engine, prompt, provider, appRoot, mcpUrl, mcpToken, accessToken = '' }) {
+export async function runAgentEngine({ engine, prompt, provider, appRoot, mcpUrl, mcpToken, accessToken = '', nativeSessionId = '', sessionHome = '' }) {
   const selected = String(engine || '').toLowerCase();
   if (!['claude_code', 'codex'].includes(selected)) throw new Error('未选择可用的 Agent 引擎。');
   if (!provider?.base_url || !provider?.api_key || !provider?.model) throw new Error('Agent 缺少中转站、密钥或模型配置。');
+  const home = sessionHome || await mkdtemp(path.join(os.tmpdir(), 'forward-agent-'));
+  await mkdir(home, { recursive: true });
+  await writeFile(path.join(home, 'config.toml'), codexConfig(provider, mcpUrl, mcpToken), 'utf8');
   if (selected === 'claude_code') {
-    const output = await run('claude', [
+    const args = [
       '--print', '--output-format', 'json', '--model', provider.model,
       '--permission-mode', 'bypassPermissions', '--strict-mcp-config',
-      '--mcp-config', mcpConfig(mcpUrl, mcpToken, accessToken), prompt
-    ], {
+      '--mcp-config', mcpConfig(mcpUrl, mcpToken, accessToken)
+    ];
+    if (nativeSessionId) args.push('--resume', nativeSessionId);
+    args.push(prompt);
+    const output = await run('claude', args, {
       cwd: appRoot,
-      env: { ANTHROPIC_API_KEY: provider.api_key, ANTHROPIC_BASE_URL: provider.base_url },
+      env: { ANTHROPIC_API_KEY: provider.api_key, ANTHROPIC_BASE_URL: provider.base_url, CLAUDE_CONFIG_DIR: home },
       timeoutMs: 150000
     });
-    return { engine: selected, content: parseClaudeOutput(output.stdout) };
+    const parsed = parseClaudeOutput(output.stdout);
+    return { engine: selected, content: parsed.content, sessionId: parsed.sessionId || nativeSessionId || null };
   }
-
-  const tempHome = await mkdtemp(path.join(os.tmpdir(), 'forward-codex-'));
-  try {
-    await writeFile(path.join(tempHome, 'config.toml'), codexConfig(provider, mcpUrl, mcpToken), 'utf8');
-    const output = await run('codex', [
-      'exec', '--json', '--ephemeral', '--dangerously-bypass-approvals-and-sandbox',
-      '--skip-git-repo-check', '-C', appRoot, prompt
-    ], {
+  const args = nativeSessionId
+    ? ['exec', 'resume', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-C', appRoot, nativeSessionId, prompt]
+    : ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-C', appRoot, prompt];
+  const output = await run('codex', args, {
       cwd: appRoot,
       env: {
-        CODEX_HOME: tempHome, OPENAI_API_KEY: provider.api_key,
+        CODEX_HOME: home, OPENAI_API_KEY: provider.api_key,
         FORWARD_MCP_TOKEN: accessToken || mcpToken || '', FORWARD_MCP_ACCESS_TOKEN: accessToken || ''
       },
       timeoutMs: 150000
     });
-    return { engine: selected, content: parseCodexOutput(output.stdout) };
-  } finally {
-    await rm(tempHome, { recursive: true, force: true }).catch(() => undefined);
-  }
+  const parsed = parseCodexOutput(output.stdout);
+  return { engine: selected, content: parsed.content, sessionId: parsed.sessionId || nativeSessionId || null, sessionHome: home };
 }

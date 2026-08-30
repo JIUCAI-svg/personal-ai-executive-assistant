@@ -257,6 +257,8 @@ export function repairAssistantState(source) {
     unavailable_blocks: Array.isArray(state.unavailable_blocks) ? state.unavailable_blocks : [],
     threads: (Array.isArray(state.threads) ? state.threads : []).map((thread) => ({
       ...thread,
+      agent_session_id: normalizeNullableId(thread.agent_session_id),
+      agent_session_home: normalizeNullableId(thread.agent_session_home, 500),
       locked: thread.locked === true
     })),
     messages: (Array.isArray(state.messages) ? state.messages : []).map((message) => ({
@@ -675,6 +677,8 @@ export class AssistantStateStore {
         memory_scope: Boolean(options.memory_scope),
         save_full_conversation: options.save_full_conversation !== false,
         allow_memory_distillation: options.allow_memory_distillation !== false,
+        agent_session_id: normalizeNullableId(options.agent_session_id),
+        agent_session_home: normalizeNullableId(options.agent_session_home, 500),
         created_at: isoAt(current.date, current.time),
         updated_at: isoAt(current.date, current.time),
         locked: false
@@ -858,6 +862,16 @@ export class AssistantStateStore {
       if (content !== undefined) memory.content = normalizeText(content, 220);
       memory.updated_at = isoAt(nowParts().date, nowParts().time);
       return memory;
+    });
+  }
+
+  async updateThreadAgentSession(threadId, agentSessionId) {
+    return this.mutate((state) => {
+      const thread = state.threads.find((item) => item.id === threadId);
+      if (!thread) return null;
+      thread.agent_session_id = normalizeNullableId(agentSessionId);
+      thread.updated_at = isoAt(nowParts().date, nowParts().time);
+      return thread;
     });
   }
 

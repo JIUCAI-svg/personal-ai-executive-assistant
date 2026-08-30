@@ -1578,6 +1578,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       try {
         const accessToken = accessTokenFromRequest(request);
         const mcpUrl = `http://127.0.0.1:${port}/api/mcp?thread_id=${encodeURIComponent(hydratedThread.id)}${hydratedThread.project_id ? `&project_id=${encodeURIComponent(hydratedThread.project_id)}` : ''}`;
+        const agentSessionHome = path.join(appRoot, '.forward-assistant', 'agent-sessions', hydratedThread.id);
         const agentPrompt = [
           `你是个人 AI 执行助手“向前”，当前引擎为 ${selectedAgent}。`,
           `当前对话线程 ID：${hydratedThread.id}。项目 ID：${hydratedThread.project_id || '无'}。`,
@@ -1590,8 +1591,13 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         ].join('\n\n');
         const agentResult = await runAgentEngine({
           engine: selectedAgent, prompt: agentPrompt, provider, appRoot, mcpUrl,
-          mcpToken: aiGatewayToken, accessToken
+          mcpToken: aiGatewayToken, accessToken,
+          nativeSessionId: hydratedThread.agent_session_id || '',
+          sessionHome: agentSessionHome
         });
+        if (agentResult.sessionId && agentResult.sessionId !== hydratedThread.agent_session_id) {
+          await store.updateThreadAgentSession(hydratedThread.id, agentResult.sessionId);
+        }
         return finishAssistantResponse({ reply: agentResult.content || '我已经处理好了。', actions: [], memoryCandidates: [] });
       } catch (error) {
         console.error(`Agent ${selectedAgent} failed; falling back to standard AI`, error?.message || 'unknown');
