@@ -146,7 +146,7 @@ private fun remoteProject(item: JSONObject): RemoteProject = RemoteProject(
 private fun remoteTask(item: JSONObject): RemoteTask = RemoteTask(
     id = item.optString("id"),
     projectId = item.optString("project_id").ifBlank { null },
-    parentTaskId = item.optString("parent_task_id").ifBlank { null },
+    parentTaskId = item.optString("parent_task_id").takeUnless { it.isBlank() || it == "null" || it == "undefined" },
     title = item.optString("title"),
     notes = item.optString("notes"),
     status = item.optString("status", "open"),

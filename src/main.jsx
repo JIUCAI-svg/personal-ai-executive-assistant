@@ -80,34 +80,42 @@ function isoToday() {
 
 function dynamicPlanToUi(dynamicPlan) {
   if (!dynamicPlan) return [];
-  const scheduled = (dynamicPlan.scheduled || []).map((item, index) => ({
+  const normalizeParentId = (value) => {
+    const normalized = typeof value === 'string' ? value.trim() : '';
+    return normalized && normalized.toLowerCase() !== 'null' && normalized.toLowerCase() !== 'undefined' ? normalized : null;
+  };
+  const scheduled = (dynamicPlan.scheduled || []).map((item, index) => {
+    const parentTaskId = normalizeParentId(item.parent_task_id);
+    return {
     id: item.id,
     start: item.start,
     end: item.end,
     title: item.title,
     project: item.project,
-    parentTaskId: item.parent_task_id || null,
-    parentTitle: item.parent_title || '',
-    isSubtask: Boolean(item.parent_task_id),
+    parentTaskId,
+    parentTitle: parentTaskId ? (item.parent_title || '') : '',
+    isSubtask: Boolean(parentTaskId),
     tone: item.priority >= 5 ? 'urgent' : item.priority >= 3 ? 'work' : 'creative',
     state: item.id === dynamicPlan.current_task?.id ? 'current' : index === 1 ? 'next' : 'planned',
     note: [item.long_task_id ? '长期' : '', item.due_at ? `截止 ${item.due_at.slice(5, 10)}` : '', item.notes || '按当前节奏推进'].filter(Boolean).join(' · '),
     duration: item.estimated_minutes
-  }));
-  const deferred = (dynamicPlan.deferred || []).map((item) => ({
+  }; });
+  const deferred = (dynamicPlan.deferred || []).map((item) => {
+    const parentTaskId = normalizeParentId(item.parent_task_id);
+    return {
     id: item.id,
     start: '之后',
     end: '',
     title: item.title,
     project: item.project || '未归类',
-    parentTaskId: item.parent_task_id || null,
-    parentTitle: item.parent_title || '',
-    isSubtask: Boolean(item.parent_task_id),
+    parentTaskId,
+    parentTitle: parentTaskId ? (item.parent_title || '') : '',
+    isSubtask: Boolean(parentTaskId),
     tone: 'creative',
     state: 'deferred',
     note: item.reason || '等待重新安排',
     duration: item.estimated_minutes || 45
-  }));
+  }; });
   return [...scheduled, ...deferred];
 }
 

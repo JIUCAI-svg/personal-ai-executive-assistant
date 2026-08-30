@@ -67,6 +67,15 @@ function normalizeText(value, limit = 240) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
 }
 
+// JSON clients often serialize an absent parent as the literal string
+// "null". Treat all such sentinel values as an actual missing relationship.
+function normalizeNullableId(value, limit = 120) {
+  const normalized = normalizeText(value, limit);
+  return normalized && normalized.toLowerCase() !== 'null' && normalized.toLowerCase() !== 'undefined'
+    ? normalized
+    : null;
+}
+
 function daysBetween(startDate, endDate) {
   return Math.round((Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`)) / 86400000);
 }
@@ -227,7 +236,7 @@ export function repairAssistantState(source) {
     })),
     tasks: (Array.isArray(state.tasks) ? state.tasks : base.tasks).map((task, index) => ({
       ...task,
-      parent_task_id: typeof task.parent_task_id === 'string' && task.parent_task_id.trim() ? task.parent_task_id.trim() : null,
+      parent_task_id: normalizeNullableId(task.parent_task_id),
       priority: taskPriority(task.priority),
       status: ['open', 'in_progress', 'done', 'cancelled', 'deferred', 'missed'].includes(task.status) ? task.status : 'open',
       actual_minutes: Math.max(0, Number(task.actual_minutes) || 0),
@@ -393,14 +402,6 @@ function buildPlan(state, current = nowParts()) {
   const activeStatuses = new Set(['open', 'in_progress']);
   const parentIds = new Set(state.tasks.filter((task) => activeStatuses.has(task.status)).map((task) => task.parent_task_id).filter(Boolean));
   const taskById = new Map(state.tasks.map((task) => [task.id, task]));
-  const baseTaskItems = state.tasks
-    // Container tasks organize sub-plans; only leaf tasks consume calendar time.
-    .filter((task) => ['open', 'in_progress'].includes(task.status) && !parentIds.has(task.id))
-    .filter((task) => !task.long_task_id || task.occurrence_date === window.planning_date)
-    .filter(() => !window.is_sleeping)
-    .sort((left, right) => (right.priority - left.priority) || (dueWeight(left) - dueWeight(right)) || ((Number(left.sort_order) || 0) - (Number(right.sort_order) || 0)) || left.created_at.localeCompare(right.created_at));
-  // Keep each parent's leaf tasks together while retaining the original
-  // priority/deadline ordering between groups.
   const rootParentId = (task) => {
     let currentTask = task;
     const seen = new Set();
@@ -412,6 +413,20 @@ function buildPlan(state, current = nowParts()) {
     }
     return currentTask?.id === task.id ? '' : (currentTask?.id || task.parent_task_id || '');
   };
+  const planningParent = (task) => taskById.get(rootParentId(task)) || task;
+  const baseTaskItems = state.tasks
+    // Container tasks organize sub-plans; only leaf tasks consume calendar time.
+    .filter((task) => ['open', 'in_progress'].includes(task.status) && !parentIds.has(task.id))
+    .filter((task) => !task.long_task_id || task.occurrence_date === window.planning_date)
+    .filter(() => !window.is_sleeping)
+    // A child follows its parent project's priority/deadline, so adding a
+    // subtask to an urgent parent does not strand it behind unrelated work.
+    .sort((left, right) => (planningParent(right).priority - planningParent(left).priority)
+      || (dueWeight(planningParent(left)) - dueWeight(planningParent(right)))
+      || ((Number(left.sort_order) || 0) - (Number(right.sort_order) || 0))
+      || left.created_at.localeCompare(right.created_at));
+  // Keep each parent's leaf tasks together while retaining the original
+  // priority/deadline ordering between groups.
   const groups = new Map();
   baseTaskItems.forEach((task, index) => {
     const key = rootParentId(task) || `task:${task.id}`;
@@ -1356,7 +1371,7 @@ export class AssistantStateStore {
             // Accept the canonical parent ID from the model, but also resolve a
             // parent title when a compatible provider returns the human label.
             // This keeps child tasks nested and prevents dangling relationships.
-            const requestedParent = normalizeText(action.parent_task_id, 120);
+            const requestedParent = normalizeNullableId(action.parent_task_id);
             const parent = requestedParent
               ? state.tasks.find((item) => item.id === requestedParent) || state.tasks.find((item) => taskMatches(item, requestedParent))
               : null;
