@@ -1667,7 +1667,8 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         }
         return finishAssistantResponse({ reply: agentResult.content || '我已经处理好了。', actions: [], memoryCandidates: [] });
       } catch (error) {
-        console.error(`Agent ${selectedAgent} failed; falling back to standard AI`, error?.message || 'unknown');
+        console.error(`Agent ${selectedAgent} failed`, error?.message || 'unknown');
+        throw requestError(`${selectedAgent === 'codex' ? 'Codex' : 'Claude Code'} 执行失败：${error?.message || '未知错误'}`, 502, 'AGENT_ENGINE_FAILED');
       }
     }
 

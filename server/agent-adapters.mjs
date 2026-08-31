@@ -127,7 +127,10 @@ export async function runAgentEngine({ engine, prompt, provider, appRoot, mcpUrl
     return { engine: selected, content: parsed.content, sessionId: parsed.sessionId || nativeSessionId || null };
   }
   const args = nativeSessionId
-    ? ['exec', 'resume', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-C', appRoot, nativeSessionId, prompt]
+    // `-C/--cd` belongs to `codex exec`, not the `exec resume` subcommand.
+    // The child process already runs with `cwd: appRoot`, so resume does not
+    // need a directory argument.
+    ? ['exec', 'resume', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', nativeSessionId, prompt]
     : ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-C', appRoot, prompt];
   const output = await run('codex', args, {
       cwd: appRoot,
