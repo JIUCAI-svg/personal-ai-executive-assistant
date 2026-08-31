@@ -1211,6 +1211,7 @@ private fun ForwardApp(activity: MainActivity) {
             agentActivity = "正在连接 Agent"
             val requestId = UUID.randomUUID().toString()
             scope.launch {
+                var resolved = true
                 val monitorJob = launch {
                     val labels = mapOf("started" to "已建立运行记录", "accepted" to "已接收消息", "agent_started" to "Agent 正在运行", "finalizing" to "正在保存工具结果", "completed" to "已完成")
                     repeat(120) {
@@ -1248,7 +1249,28 @@ private fun ForwardApp(activity: MainActivity) {
                         }
                         if (state == "failed") break
                     }
-                    recovered ?: AssistantResult("本次请求仍在后台处理中，重新打开对话后会显示最终结果。", emptyList()).also { scope.launch { snackbar.showSnackbar(error.message ?: "请求仍在后台处理") } }
+                    if (recovered == null) {
+                        resolved = false
+                        agentActivity = "后台运行中，完成后会自动显示"
+                        scope.launch {
+                            repeat(120) {
+                                delay(3000)
+                                val status = runCatching { gatewayRunStatus(activity, requestId) }.getOrNull() ?: return@repeat
+                                if (status.optString("status") == "completed") {
+                                    val recoveredThreadId = status.optString("thread_id").ifBlank { remoteThreadId.orEmpty() }
+                                    val detail = recoveredThreadId.takeIf { it.isNotBlank() }?.let { runCatching { gatewayLoadThread(activity, it) }.getOrNull() }
+                                    val reply = detail?.messages?.lastOrNull { it.fromAssistant }?.text.orEmpty().ifBlank { status.optString("reply") }
+                                    if (reply.isNotBlank()) messages = messages + ChatMessage(true, reply)
+                                    if (recoveredThreadId.isNotBlank()) { remoteThreadId = recoveredThreadId; AssistantSessionStore.saveCurrentThread(activity, recoveredThreadId) }
+                                    agentActivity = ""
+                                    return@launch
+                                }
+                                if (status.optString("status") == "failed") return@launch
+                            }
+                            agentActivity = ""
+                        }
+                    }
+                    recovered ?: AssistantResult("", emptyList()).also { scope.launch { snackbar.showSnackbar(error.message ?: "请求仍在后台处理") } }
                 }
                 monitorJob.cancel()
                 if (result.plan == null) applyActions(result.actions)
@@ -1268,9 +1290,9 @@ private fun ForwardApp(activity: MainActivity) {
                 } else if (deviceResults.isNotEmpty()) {
                     result.reply + "\n\n" + deviceResults.joinToString("\n") { it.message }
                 } else result.reply
-                messages = messages + ChatMessage(true, displayReply)
+                if (resolved) messages = messages + ChatMessage(true, displayReply)
                 aiBusy = false
-                agentActivity = ""
+                if (resolved) agentActivity = ""
                 val queued = queuedMessages.firstOrNull()
                 if (queued != null) {
                     queuedMessages = queuedMessages.drop(1)
