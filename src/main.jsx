@@ -738,6 +738,18 @@ function App() {
     }
   }
 
+  function openSubtaskDraft(taskId) {
+    const parent = (assistantState?.tasks || []).find((task) => task.id === taskId);
+    if (!parent || parent.parent_task_id || ['done', 'cancelled'].includes(parent.status)) return;
+    setSubtaskDraft({
+      parent,
+      title: '',
+      estimated_minutes: '30',
+      priority: String(parent.priority >= 4 ? 5 : parent.priority <= 1 ? 1 : 3),
+      notes: ''
+    });
+  }
+
   async function createProjectManually(event) {
     event.preventDefault();
     const name = projectDraft.name.trim();
@@ -1133,7 +1145,7 @@ function App() {
               <div className="schedule-list">
                 {plan.filter((item) => item.state !== 'deferred').map((item) => (
                   <div className={`schedule-item ${item.state} ${item.tone} ${item.isSubtask ? 'subtask' : ''}`} key={item.id}>
-                    <time>{item.start}</time><div className="schedule-line"><span /></div><div className="schedule-body"><strong className={item.isSubtask ? 'subtask-title' : ''}>{item.isSubtask && <span className="subtask-mark" aria-hidden="true">↳</span>}{item.title}</strong><small>{item.note}</small></div>{item.state === 'current' && <button className="done-button" onClick={markCurrentDone} aria-label={`完成${item.title}`}><Check size={16} /></button>}{item.state === 'done' && <Check size={16} className="done-check" />}
+                    <time>{item.start}</time><div className="schedule-line"><span /></div><div className="schedule-body"><strong className={item.isSubtask ? 'subtask-title' : ''}>{item.isSubtask && <span className="subtask-mark" aria-hidden="true">↳</span>}{item.title}</strong><small>{item.note}</small></div>{item.displayOnly && <button className="subtask-schedule-button" type="button" onClick={() => openSubtaskDraft(item.id)}><Plus size={13} /> 子任务</button>}{item.state === 'current' && <button className="done-button" onClick={markCurrentDone} aria-label={`完成${item.title}`}><Check size={16} /></button>}{item.state === 'done' && <Check size={16} className="done-check" />}
                   </div>
                 ))}
               </div>
