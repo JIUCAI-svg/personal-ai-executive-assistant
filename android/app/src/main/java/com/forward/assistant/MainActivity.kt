@@ -202,7 +202,9 @@ data class PlanItem(
     val actualMinutes: Int = 0,
     val actualSeconds: Long = 0,
     val isSubtask: Boolean = false,
-    val parentTitle: String = ""
+    val parentTitle: String = "",
+    val displayOnly: Boolean = false,
+    val childCount: Int = 0
 )
 
 data class ScheduledPlanItem(
@@ -396,7 +398,8 @@ private fun remoteTone(priority: Int): Color = when {
 }
 
 private fun remoteScheduledItem(item: RemotePlanItem, deferred: Boolean): ScheduledPlanItem {
-    val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), flexible = deferred, deferred = deferred, id = item.id, priority = item.priority, actualMinutes = item.actualMinutes, actualSeconds = item.actualSeconds, isSubtask = item.parentTaskId != null, parentTitle = item.parentTitle)
+    val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), flexible = deferred, deferred = deferred, id = item.id, priority = item.priority, actualMinutes = item.actualMinutes, actualSeconds = item.actualSeconds, isSubtask = item.parentTaskId != null, parentTitle = item.parentTitle, displayOnly = item.displayOnly, childCount = item.childCount)
+    if (item.displayOnly) return ScheduledPlanItem(planItem)
     if (deferred || item.start.isBlank() || item.end.isBlank()) return ScheduledPlanItem(planItem, deferredByCapacity = true)
     val date = runCatching { LocalDate.parse(item.date) }.getOrDefault(LocalDate.now())
     val start = parseClock(item.start) ?: return ScheduledPlanItem(planItem, deferredByCapacity = true)
@@ -405,13 +408,14 @@ private fun remoteScheduledItem(item: RemotePlanItem, deferred: Boolean): Schedu
 }
 
 private fun normalizeRemotePlanItems(remote: RemotePlan, now: LocalDateTime): List<ScheduledPlanItem> {
-    val source = remote.scheduled + remote.sleeping + remote.deferred
+    val displaySource = remote.scheduledDisplay
+    val source = if (displaySource.isNotEmpty()) displaySource else remote.scheduled + remote.sleeping + remote.deferred
     val hasMissingTimes = remote.scheduled.any { it.start.isBlank() || it.end.isBlank() } ||
         (remote.scheduled.isEmpty() && remote.deferred.isNotEmpty())
     // If the gateway gives task totals but no actual slots, the slots are stale
     // regardless of the cached capacity number. Rebuild them for the live view.
     if (!hasMissingTimes) {
-        return remote.scheduled.map { remoteScheduledItem(it, false) } + remote.sleeping.map { remoteScheduledItem(it, true) } + remote.deferred.map { remoteScheduledItem(it, true) }
+        return source.map { remoteScheduledItem(it, it.start.isBlank() || it.displayOnly) }
     }
     // A stale snapshot can contain the right totals but blank schedule fields.
     // Keep the server order and rebuild only the visual time slots locally.
@@ -420,7 +424,7 @@ private fun normalizeRemotePlanItems(remote: RemotePlan, now: LocalDateTime): Li
         val start = cursor
         val end = cursor.plusMinutes(item.minutes.toLong())
         cursor = end
-        val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), id = item.id, priority = item.priority, actualMinutes = item.actualMinutes, actualSeconds = item.actualSeconds, isSubtask = item.parentTaskId != null, parentTitle = item.parentTitle)
+        val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), id = item.id, priority = item.priority, actualMinutes = item.actualMinutes, actualSeconds = item.actualSeconds, isSubtask = item.parentTaskId != null, parentTitle = item.parentTitle, displayOnly = item.displayOnly, childCount = item.childCount)
         ScheduledPlanItem(planItem, start, end)
     }
 }
@@ -1585,7 +1589,7 @@ private fun TodayScreen(
         val dragged = draggingTaskId
         draggingTaskId = null
         dragOffset = 0f
-        if (dragged != null) reorderTasks(displayPlan.map { it.item.id })
+        if (dragged != null) reorderTasks(displayPlan.filterNot { it.item.displayOnly }.map { it.item.id })
     }
     val scheduledPlan = displayPlan
     val availableMinutes = remotePlan?.availableMinutes?.toLong() ?: minutesUntilSleep(now, sleepTime)
@@ -1639,7 +1643,7 @@ private fun TodayScreen(
                 },
                 isDragging = draggingTaskId == item.item.id,
                 dragOffset = if (draggingTaskId == item.item.id) dragOffset else 0f,
-                onDragStart = { if (item.item.id.isNotBlank() && !item.item.done) { draggingTaskId = item.item.id; dragOffset = 0f; lastDragMoveAt = 0L } },
+                onDragStart = { if (item.item.id.isNotBlank() && !item.item.done && !item.item.displayOnly) { draggingTaskId = item.item.id; dragOffset = 0f; lastDragMoveAt = 0L } },
                 onDrag = { delta ->
                     if (draggingTaskId == item.item.id) {
                         dragOffset += delta
@@ -1648,7 +1652,9 @@ private fun TodayScreen(
                             val center = draggedInfo.offset + dragOffset + draggedInfo.size / 2
                             val sourceIndex = displayPlan.indexOfFirst { it.item.id == item.item.id }
                             val direction = if (dragOffset > 0f) 1 else -1
-                            val targetItem = displayPlan.getOrNull(sourceIndex + direction)
+                            val targetItem = generateSequence(sourceIndex + direction) { it + direction }
+                                .mapNotNull { displayPlan.getOrNull(it) }
+                                .firstOrNull { !it.item.displayOnly }
                             val target = targetItem?.let { targetValue ->
                                 listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == targetValue.item.id }
                             }
@@ -1902,16 +1908,18 @@ private fun PlanRow(
 ) {
     val item = scheduled.item
     val time = when {
+        item.displayOnly -> "父任务"
         item.done -> "完成"
         scheduled.deferredByCapacity -> "明日"
         else -> formatClock(scheduled.start!!.toLocalTime())
     }
     val note = when {
+        item.displayOnly -> "${item.childCount} 项子任务 · ${item.note}"
         item.done -> "已完成"
         scheduled.deferredByCapacity -> if (item.deferred) "因今天安排变化而顺延" else "超过今晚可用时间，顺延"
         else -> "${item.note} · 至 ${formatClock(scheduled.end!!.toLocalTime())} · ${item.minutes} 分钟"
     }
-    val dragModifier = if (item.id.isNotBlank() && !item.done) Modifier.pointerInput(item.id) {
+    val dragModifier = if (item.id.isNotBlank() && !item.done && !item.displayOnly) Modifier.pointerInput(item.id) {
         detectDragGesturesAfterLongPress(
             onDragStart = { onDragStart() },
             onDragCancel = { onDragEnd() },
@@ -1919,7 +1927,7 @@ private fun PlanRow(
             onDrag = { _, amount -> onDrag(amount.y) }
         )
     } else Modifier
-    Row(dragModifier.graphicsLayer { translationY = if (isDragging) dragOffset else 0f; alpha = if (isDragging) 0.86f else 1f }.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalAlignment = Alignment.Top) { Text(time, color = Muted, fontSize = 10.sp, modifier = Modifier.width(39.dp)); Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(18.dp)) { Box(Modifier.size(9.dp).border(2.dp, item.tone, CircleShape).clip(CircleShape).background(Rail)); Box(Modifier.width(1.dp).height(39.dp).background(Color(0xFFD2DAD1))) }; Spacer(Modifier.width(7.dp)); Column(Modifier.weight(1f).padding(start = if (item.isSubtask) 20.dp else 0.dp).combinedClickable(onClick = { if (item.id.isNotBlank()) editTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes, parentTaskId = null)) }, onDoubleClick = { if (!item.done && item.id.isNotBlank()) completeTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes, parentTaskId = null)) })) { Text(if (item.isSubtask) "↳ ${item.title}" else item.title, color = if (item.done || scheduled.deferredByCapacity) Muted else if (item.isSubtask) Color(0xFF56756D) else Ink, fontSize = if (item.isSubtask) 11.sp else 12.sp, fontWeight = if (item.isSubtask) FontWeight.Medium else FontWeight.SemiBold, textDecoration = if (item.done) androidx.compose.ui.text.style.TextDecoration.LineThrough else null, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(note, color = Muted, fontSize = 10.sp) }; if (!item.done && !item.isSubtask && item.id.isNotBlank()) TextButton(onClick = { createSubtask(scheduled) }, contentPadding = PaddingValues(horizontal = 4.dp)) { Text("子任务", color = Muted, fontSize = 10.sp) }; if (item.done) Icon(Icons.Default.TaskAlt, null, tint = Color(0xFF4A897D), modifier = Modifier.size(17.dp)) }
+    Row(dragModifier.graphicsLayer { translationY = if (isDragging) dragOffset else 0f; alpha = if (isDragging) 0.86f else 1f }.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalAlignment = Alignment.Top) { Text(time, color = Muted, fontSize = 10.sp, modifier = Modifier.width(39.dp)); Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(18.dp)) { Box(Modifier.size(9.dp).border(2.dp, item.tone, CircleShape).clip(CircleShape).background(Rail)); Box(Modifier.width(1.dp).height(39.dp).background(Color(0xFFD2DAD1))) }; Spacer(Modifier.width(7.dp)); Column(Modifier.weight(1f).padding(start = if (item.isSubtask) 20.dp else 0.dp).combinedClickable(onClick = { if (item.id.isNotBlank() && !item.displayOnly) editTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes, parentTaskId = null)) }, onDoubleClick = { if (!item.done && item.id.isNotBlank() && !item.displayOnly) completeTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes, parentTaskId = null)) })) { Text(if (item.displayOnly) item.title else if (item.isSubtask) "↳ ${item.title}" else item.title, color = if (item.done || scheduled.deferredByCapacity) Muted else if (item.displayOnly) Green else if (item.isSubtask) Color(0xFF56756D) else Ink, fontSize = if (item.displayOnly) 13.sp else if (item.isSubtask) 11.sp else 12.sp, fontWeight = if (item.displayOnly) FontWeight.Bold else if (item.isSubtask) FontWeight.Medium else FontWeight.SemiBold, textDecoration = if (item.done) androidx.compose.ui.text.style.TextDecoration.LineThrough else null, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(note, color = Muted, fontSize = 10.sp) }; if (!item.done && !item.isSubtask && !item.displayOnly && item.id.isNotBlank()) TextButton(onClick = { createSubtask(scheduled) }, contentPadding = PaddingValues(horizontal = 4.dp)) { Text("子任务", color = Muted, fontSize = 10.sp) }; if (item.done) Icon(Icons.Default.TaskAlt, null, tint = Color(0xFF4A897D), modifier = Modifier.size(17.dp)) }
 }
 
 @Composable

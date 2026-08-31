@@ -543,6 +543,37 @@ function buildPlan(state, current = nowParts()) {
     cursor = end;
   }
 
+  // Keep container parents in the timeline for context without making them
+  // consume calendar time. Leaf tasks remain the only executable schedule
+  // entries and continue to drive totals/current-task selection.
+  const scheduledDisplay = [];
+  const displayedParents = new Set();
+  for (const item of scheduled) {
+    if (item.parent_task_id && !displayedParents.has(item.parent_task_id)) {
+      const parent = taskById.get(item.parent_task_id);
+      if (parent) {
+        const childCount = state.tasks.filter((task) => task.parent_task_id === parent.id && ['open', 'in_progress', 'deferred', 'done'].includes(task.status)).length;
+        scheduledDisplay.push({
+          id: parent.id,
+          title: parent.title,
+          project: taskProject(parent, state.projects)?.name || '未归类',
+          priority: parent.priority,
+          estimated_minutes: 0,
+          start: '', end: '', date: item.date,
+          status: parent.status,
+          due_at: parent.due_at,
+          notes: parent.notes || '',
+          parent_task_id: null,
+          parent_title: null,
+          child_count: childCount,
+          display_only: true
+        });
+        displayedParents.add(parent.id);
+      }
+    }
+    scheduledDisplay.push(item);
+  }
+
   return {
     now: `${current.date} ${current.time}`,
     sleep_time: state.settings.sleep_time,
@@ -563,6 +594,7 @@ function buildPlan(state, current = nowParts()) {
     next_task: scheduled[1] || null,
     active_timer: activeTimer,
     scheduled,
+    scheduled_display: scheduledDisplay,
     sleeping_tasks: sleepingTasks,
     completed: state.tasks.filter((task) => task.status === 'done' && (!task.long_task_id || task.occurrence_date === window.planning_date) && (!state.settings.clear_completed_at_sleep || completedSinceSleep(task, current, state.settings.sleep_time))).slice().sort((a, b) => String(b.completed_at || '').localeCompare(String(a.completed_at || ''))).map((task) => ({
       id: task.id, title: task.title, project: taskProject(task, state.projects)?.name || '未归类', priority: task.priority,

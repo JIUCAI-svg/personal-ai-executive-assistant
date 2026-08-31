@@ -84,7 +84,8 @@ function dynamicPlanToUi(dynamicPlan) {
     const normalized = typeof value === 'string' ? value.trim() : '';
     return normalized && normalized.toLowerCase() !== 'null' && normalized.toLowerCase() !== 'undefined' ? normalized : null;
   };
-  const scheduled = (dynamicPlan.scheduled || []).map((item, index) => {
+  const executionIndex = new Map((dynamicPlan.scheduled || []).map((item, index) => [item.id, index]));
+  const scheduled = (dynamicPlan.scheduled_display || dynamicPlan.scheduled || []).map((item) => {
     const parentTaskId = normalizeParentId(item.parent_task_id);
     return {
     id: item.id,
@@ -96,8 +97,11 @@ function dynamicPlanToUi(dynamicPlan) {
     parentTitle: parentTaskId ? (item.parent_title || '') : '',
     isSubtask: Boolean(parentTaskId),
     tone: item.priority >= 5 ? 'urgent' : item.priority >= 3 ? 'work' : 'creative',
-    state: item.id === dynamicPlan.current_task?.id ? 'current' : index === 1 ? 'next' : 'planned',
-    note: [item.long_task_id ? '长期' : '', item.due_at ? `截止 ${item.due_at.slice(5, 10)}` : '', item.notes || '按当前节奏推进'].filter(Boolean).join(' · '),
+    displayOnly: item.display_only === true,
+    state: item.display_only ? 'group' : item.id === dynamicPlan.current_task?.id ? 'current' : executionIndex.get(item.id) === 1 ? 'next' : 'planned',
+    note: item.display_only
+      ? `${item.child_count || 0} 项子任务 · ${item.notes || '父任务总览'}`
+      : [item.long_task_id ? '长期' : '', item.due_at ? `截止 ${item.due_at.slice(5, 10)}` : '', item.notes || '按当前节奏推进'].filter(Boolean).join(' · '),
     duration: item.estimated_minutes
   }; });
   const deferred = (dynamicPlan.deferred || []).map((item) => {

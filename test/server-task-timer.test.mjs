@@ -40,8 +40,9 @@ test('AI-created child tasks keep their parent relationship', async () => {
   assert.equal(child.project_id, parent.project_id);
   assert.equal((await store.listTasks()).find((item) => item.id === child.id).parent_task_id, parent.id);
   const plan = (await store.bootstrap()).plan;
-  const displayed = [...plan.scheduled, ...plan.sleeping_tasks];
-  assert.equal(displayed.some((item) => item.id === parent.id), false);
+  const displayed = [...(plan.scheduled_display || plan.scheduled), ...plan.sleeping_tasks];
+  assert.equal(plan.scheduled.some((item) => item.id === parent.id), false);
+  assert.equal(displayed.some((item) => item.id === parent.id && item.display_only === true), true);
   assert.equal(displayed.some((item) => item.id === child.id), true);
 });
 

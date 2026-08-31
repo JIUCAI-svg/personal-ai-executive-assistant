@@ -24,7 +24,9 @@ data class RemotePlanItem(
     val longTaskId: String? = null,
     val occurrenceDate: String? = null,
     val parentTaskId: String? = null,
-    val parentTitle: String = ""
+    val parentTitle: String = "",
+    val displayOnly: Boolean = false,
+    val childCount: Int = 0
 )
 
 data class RemoteActiveTimer(val taskId: String, val mode: String, val targetMinutes: Int, val elapsedSeconds: Long)
@@ -43,6 +45,7 @@ data class RemotePlan(
     val freeMinutes: Int,
     val adjustmentReason: String,
     val scheduled: List<RemotePlanItem>,
+    val scheduledDisplay: List<RemotePlanItem> = emptyList(),
     val deferred: List<RemotePlanItem>,
     val sleeping: List<RemotePlanItem> = emptyList(),
     val completed: List<RemotePlanItem> = emptyList(),
@@ -141,7 +144,8 @@ private fun remotePlanItem(item: JSONObject): RemotePlanItem = RemotePlanItem(
     id = item.optString("id"), title = item.optString("title"), project = item.optString("project"), notes = item.optString("notes"),
     priority = item.optInt("priority", 3), minutes = item.optInt("estimated_minutes", 45), start = item.optString("start"), end = item.optString("end"),
     date = item.optString("date"), status = item.optString("status", "open"), dueAt = item.optString("due_at").takeUnless { it.isBlank() || it == "null" }, reason = item.optString("reason"), actualMinutes = item.optInt("actual_minutes", 0), actualSeconds = item.optLong("actual_seconds", item.optInt("actual_minutes", 0) * 60L), longTaskId = item.optString("long_task_id").ifBlank { null }, occurrenceDate = item.optString("occurrence_date").ifBlank { null }
-    , parentTaskId = item.optString("parent_task_id").takeUnless { it.isBlank() || it == "null" }, parentTitle = item.optString("parent_title").takeUnless { it.isBlank() || it == "null" }.orEmpty()
+    , parentTaskId = item.optString("parent_task_id").takeUnless { it.isBlank() || it == "null" }, parentTitle = item.optString("parent_title").takeUnless { it.isBlank() || it == "null" }.orEmpty(),
+    displayOnly = item.optBoolean("display_only", false), childCount = item.optInt("child_count", 0)
 )
 
 private fun remoteProject(item: JSONObject): RemoteProject = RemoteProject(
@@ -181,7 +185,7 @@ fun parseRemotePlan(json: JSONObject?): RemotePlan? {
         now = json.optString("now"), sleepTime = json.optString("sleep_time", "01:00"), wakeTime = json.optString("wake_time", "08:00"), sleepDurationMinutes = json.optInt("sleep_duration_minutes", 480), isSleeping = json.optBoolean("is_sleeping", false), showSleepPlan = json.optBoolean("show_sleep_plan", false),
         availableMinutes = json.optInt("available_minutes"), scheduledMinutes = json.optInt("scheduled_minutes"),
         bufferMinutes = json.optInt("buffer_minutes"), configuredBufferMinutes = json.optInt("configured_buffer_minutes", json.optInt("buffer_minutes")), freeMinutes = json.optInt("free_minutes"),
-        adjustmentReason = json.optString("adjustment_reason"), scheduled = items("scheduled"), deferred = items("deferred"), sleeping = items("sleeping_tasks"),
+        adjustmentReason = json.optString("adjustment_reason"), scheduled = items("scheduled"), scheduledDisplay = items("scheduled_display"), deferred = items("deferred"), sleeping = items("sleeping_tasks"),
         currentTaskId = json.optJSONObject("current_task")?.optString("id")?.ifBlank { null }, completed = items("completed"), activeTimer = active
     )
 }
