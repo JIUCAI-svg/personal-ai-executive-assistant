@@ -22,6 +22,33 @@ test('task timer lifecycle keeps completed tasks and supports reopen', async () 
   assert.equal(result.results[0].task.status, 'open');
 });
 
+test('selecting a current task persists selection and switches the running timer', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'forward-current-task-'));
+  const store = new AssistantStateStore(root);
+  const state = await store.bootstrap();
+  const [first, second] = state.tasks;
+  let result = await store.executeActions([{ type: 'set_current_task', task_id: second.id, start_timer: true }]);
+  assert.equal(result.results[0].ok, true);
+  assert.equal(result.plan.current_task.id, second.id);
+  assert.equal(result.plan.active_timer.task_id, second.id);
+  result = await store.executeActions([{ type: 'set_current_task', task_id: first.id, start_timer: true }]);
+  assert.equal(result.plan.current_task.id, first.id);
+  const persisted = await store.bootstrap();
+  assert.equal(persisted.plan.current_task.id, first.id);
+  assert.equal(persisted.plan.active_timer.task_id, first.id);
+  assert.equal((await store.read()).time_sessions.find((session) => session.task_id === second.id).status, 'paused');
+});
+
+test('parent containers cannot be selected as the current task', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'forward-current-parent-'));
+  const store = new AssistantStateStore(root);
+  const parent = (await store.bootstrap()).tasks[0];
+  await store.executeActions([{ type: 'create_subtask', title: '执行子任务', parent_task_id: parent.id }]);
+  const result = await store.executeActions([{ type: 'set_current_task', task_id: parent.id }]);
+  assert.equal(result.results[0].ok, false);
+  assert.match(result.results[0].reason, /父任务/);
+});
+
 test('AI-created child tasks keep their parent relationship', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'forward-task-subtask-'));
   const store = new AssistantStateStore(root);

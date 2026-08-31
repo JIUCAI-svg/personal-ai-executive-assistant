@@ -609,6 +609,7 @@ function normalizeActions(actions) {
       ...(Number.isFinite(Number(action.target_minutes)) ? { target_minutes: Math.max(1, Math.min(720, Number(action.target_minutes))) } : {}),
       ...(Number.isFinite(Number(action.minutes)) ? { minutes: Math.max(0, Math.min(1440, Number(action.minutes))) } : {}),
       ...(typeof action.visible === 'boolean' ? { visible: action.visible } : {}),
+      ...(typeof action.start_timer === 'boolean' ? { start_timer: action.start_timer } : {}),
       ...(stringValue(action.project, 80) ? { project: stringValue(action.project, 80) } : {}),
       ...(stringValue(action.due_at, 40) ? { due_at: stringValue(action.due_at, 40) } : {}),
       ...(stringValue(action.date, 10) ? { date: stringValue(action.date, 10) } : {}),
@@ -745,6 +746,7 @@ ${assistantToolPrompt()}
 - 只在用户明确表达或对计划有直接影响时返回 actions；普通聊天可返回空数组。
 - 时间必须 24 小时制 HH:mm。用户说“今晚一点睡”就设为 01:00；说“明天八点起”就设为 08:00。
 - 只有用户明确说“当前任务完成/做完”时才可使用 complete_current_task。
+- 用户说“做这个、现在开始这个、把这个设为当前”时，使用 set_current_task 并传入对应任务的真实 task_id；默认立即开始 stopwatch 计时。父任务容器不可选择，必须选择具体可执行任务或子任务。
 - 用户说“取消、删除、移除”某项任务时，使用 cancel_task，该任务从今天的计划中移除；不要声称只是顺延。
 - 用户说“取消所有任务、全部清空计划”时，使用 cancel_all_tasks，清空今天和已顺延的安排。
 - 用户说“今天不做、跳过、顺延、明天再做”时，使用 defer_task，该任务保留但移到之后；取消和顺延不能混用。

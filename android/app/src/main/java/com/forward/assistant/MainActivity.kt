@@ -65,6 +65,7 @@ import androidx.compose.material.icons.filled.ListAlt
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.NotificationsNone
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
@@ -204,7 +205,8 @@ data class PlanItem(
     val isSubtask: Boolean = false,
     val parentTitle: String = "",
     val displayOnly: Boolean = false,
-    val childCount: Int = 0
+    val childCount: Int = 0,
+    val parentTaskId: String? = null
 )
 
 data class ScheduledPlanItem(
@@ -398,7 +400,7 @@ private fun remoteTone(priority: Int): Color = when {
 }
 
 private fun remoteScheduledItem(item: RemotePlanItem, deferred: Boolean): ScheduledPlanItem {
-    val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), flexible = deferred, deferred = deferred, id = item.id, priority = item.priority, actualMinutes = item.actualMinutes, actualSeconds = item.actualSeconds, isSubtask = item.parentTaskId != null, parentTitle = item.parentTitle, displayOnly = item.displayOnly, childCount = item.childCount)
+    val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), flexible = deferred, deferred = deferred, id = item.id, priority = item.priority, actualMinutes = item.actualMinutes, actualSeconds = item.actualSeconds, isSubtask = item.parentTaskId != null, parentTitle = item.parentTitle, displayOnly = item.displayOnly, childCount = item.childCount, parentTaskId = item.parentTaskId)
     if (item.displayOnly) return ScheduledPlanItem(planItem)
     if (deferred || item.start.isBlank() || item.end.isBlank()) return ScheduledPlanItem(planItem, deferredByCapacity = true)
     val date = runCatching { LocalDate.parse(item.date) }.getOrDefault(LocalDate.now())
@@ -1043,6 +1045,15 @@ private fun ForwardApp(activity: MainActivity) {
                 .onFailure { snackbar.showSnackbar(it.message ?: "新建任务失败") } }
         }
 
+        fun setCurrentAndStart(item: RemotePlanItem) {
+            if (item.id.isBlank() || item.displayOnly) return
+            scope.launch {
+                runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_current_task").put("task_id", item.id).put("start_timer", true).put("mode", "stopwatch").put("reason", "用户在移动端选择当前任务并开始计时")) }
+                    .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks }
+                    .onFailure { snackbar.showSnackbar(it.message ?: "切换当前任务失败") }
+            }
+        }
+
         fun reorderTasks(taskIds: List<String>) {
             val ids = taskIds.filter(String::isNotBlank)
             if (ids.size < 2) return
@@ -1267,7 +1278,7 @@ private fun ForwardApp(activity: MainActivity) {
             }
         ) { padding ->
             when (tab) {
-                0 -> TodayScreen(padding, now, sleepTime, currentDone, unavailablePeriod, breakTimer, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), remotePlan, remoteProjects, { showProjects = true }, ::completeTask, ::startCurrentTimer, ::pauseCurrentTimer, { breakTimer = breakTimer?.copy(running = !breakTimer!!.running) }, { breakTimer = null; currentDone = false }, ::reopenTask, ::editTask, ::removeTask, ::createTask, { parent, title, minutes, priority ->
+                0 -> TodayScreen(padding, now, sleepTime, currentDone, unavailablePeriod, breakTimer, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), remotePlan, remoteProjects, { showProjects = true }, ::completeTask, ::startCurrentTimer, ::pauseCurrentTimer, ::setCurrentAndStart, { breakTimer = breakTimer?.copy(running = !breakTimer!!.running) }, { breakTimer = null; currentDone = false }, ::reopenTask, ::editTask, ::removeTask, ::createTask, { parent, title, minutes, priority ->
                     val projectId = remoteProjects.firstOrNull { it.name == parent.project }?.id
                     createTask(title, minutes, priority, projectId, parent.id)
                 }, ::completeSpecificTask, ::reorderTasks, ::sendMessage, input, { value -> input = value }, aiBusy, initialStateLoading)
@@ -1525,6 +1536,7 @@ private fun TodayScreen(
     completeTask: () -> Unit,
     startTimer: () -> Unit,
     pauseTimer: () -> Unit,
+    setCurrentAndStart: (RemotePlanItem) -> Unit,
     toggleBreak: () -> Unit,
     skipBreak: () -> Unit,
     reopenTask: (String) -> Unit,
@@ -1636,6 +1648,7 @@ private fun TodayScreen(
                 editTask = { task -> editingTask = task; editTitle = task.title; editMinutes = task.minutes.toString(); editPriority = task.priority.toString() },
                 removeTask = removeTask,
                 completeTask = completeSpecificTask,
+                setCurrentAndStart = setCurrentAndStart,
                 createSubtask = { item ->
                     val source = remotePlan?.scheduled.orEmpty().firstOrNull { it.id == item.item.id }
                         ?: remotePlan?.deferred.orEmpty().firstOrNull { it.id == item.item.id }
@@ -1899,6 +1912,7 @@ private fun PlanRow(
     editTask: (RemotePlanItem) -> Unit,
     removeTask: (RemotePlanItem) -> Unit = {},
     completeTask: (RemotePlanItem) -> Unit = {},
+    setCurrentAndStart: (RemotePlanItem) -> Unit = {},
     createSubtask: (ScheduledPlanItem) -> Unit = {},
     isDragging: Boolean = false,
     dragOffset: Float = 0f,
@@ -1927,7 +1941,7 @@ private fun PlanRow(
             onDrag = { _, amount -> onDrag(amount.y) }
         )
     } else Modifier
-    Row(dragModifier.graphicsLayer { translationY = if (isDragging) dragOffset else 0f; alpha = if (isDragging) 0.86f else 1f }.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalAlignment = Alignment.Top) { Text(time, color = Muted, fontSize = 10.sp, modifier = Modifier.width(39.dp)); Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(18.dp)) { Box(Modifier.size(9.dp).border(2.dp, item.tone, CircleShape).clip(CircleShape).background(Rail)); Box(Modifier.width(1.dp).height(39.dp).background(Color(0xFFD2DAD1))) }; Spacer(Modifier.width(7.dp)); Column(Modifier.weight(1f).padding(start = if (item.isSubtask) 20.dp else 0.dp).combinedClickable(onClick = { if (item.id.isNotBlank() && !item.displayOnly) editTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes, parentTaskId = null)) }, onDoubleClick = { if (!item.done && item.id.isNotBlank() && !item.displayOnly) completeTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes, parentTaskId = null)) })) { Text(if (item.displayOnly) item.title else if (item.isSubtask) "↳ ${item.title}" else item.title, color = if (item.done || scheduled.deferredByCapacity) Muted else if (item.displayOnly) Green else if (item.isSubtask) Color(0xFF56756D) else Ink, fontSize = if (item.displayOnly) 13.sp else if (item.isSubtask) 11.sp else 12.sp, fontWeight = if (item.displayOnly) FontWeight.Bold else if (item.isSubtask) FontWeight.Medium else FontWeight.SemiBold, textDecoration = if (item.done) androidx.compose.ui.text.style.TextDecoration.LineThrough else null, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(note, color = Muted, fontSize = 10.sp) }; if (!item.done && !item.isSubtask && item.id.isNotBlank()) TextButton(onClick = { createSubtask(scheduled) }, contentPadding = PaddingValues(horizontal = 4.dp)) { Text("子任务", color = Muted, fontSize = 10.sp) }; if (item.done) Icon(Icons.Default.TaskAlt, null, tint = Color(0xFF4A897D), modifier = Modifier.size(17.dp)) }
+    Row(dragModifier.graphicsLayer { translationY = if (isDragging) dragOffset else 0f; alpha = if (isDragging) 0.86f else 1f }.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalAlignment = Alignment.Top) { Text(time, color = Muted, fontSize = 10.sp, modifier = Modifier.width(39.dp)); Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(18.dp)) { Box(Modifier.size(9.dp).border(2.dp, item.tone, CircleShape).clip(CircleShape).background(Rail)); Box(Modifier.width(1.dp).height(39.dp).background(Color(0xFFD2DAD1))) }; Spacer(Modifier.width(7.dp)); Column(Modifier.weight(1f).padding(start = if (item.isSubtask) 20.dp else 0.dp).combinedClickable(onClick = { if (item.id.isNotBlank() && !item.displayOnly) editTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes, parentTaskId = null)) }, onDoubleClick = { if (!item.done && item.id.isNotBlank() && !item.displayOnly) completeTask(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes, parentTaskId = null)) })) { Text(if (item.displayOnly) item.title else if (item.isSubtask) "↳ ${item.title}" else item.title, color = if (item.done || scheduled.deferredByCapacity) Muted else if (item.displayOnly) Green else if (item.isSubtask) Color(0xFF56756D) else Ink, fontSize = if (item.displayOnly) 13.sp else if (item.isSubtask) 11.sp else 12.sp, fontWeight = if (item.displayOnly) FontWeight.Bold else if (item.isSubtask) FontWeight.Medium else FontWeight.SemiBold, textDecoration = if (item.done) androidx.compose.ui.text.style.TextDecoration.LineThrough else null, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(note, color = Muted, fontSize = 10.sp) }; if (!item.done && !item.isSubtask && item.id.isNotBlank()) TextButton(onClick = { createSubtask(scheduled) }, contentPadding = PaddingValues(horizontal = 4.dp)) { Text("子任务", color = Muted, fontSize = 10.sp) }; if (!item.done && !item.displayOnly && !scheduled.deferredByCapacity && item.id.isNotBlank()) IconButton(onClick = { setCurrentAndStart(RemotePlanItem(item.id, item.title, "", item.note, item.priority, item.minutes, "", "", "", "open", actualMinutes = item.actualMinutes, parentTaskId = item.parentTaskId)) }, modifier = Modifier.size(30.dp)) { Icon(Icons.Default.PlayArrow, "开始", tint = Green, modifier = Modifier.size(17.dp)) }; if (item.done) Icon(Icons.Default.TaskAlt, null, tint = Color(0xFF4A897D), modifier = Modifier.size(17.dp)) }
 }
 
 @Composable

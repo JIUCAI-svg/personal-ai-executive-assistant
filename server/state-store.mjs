@@ -159,6 +159,7 @@ export function createDefaultAssistantState() {
   return {
     version: 1,
     updated_at: createdAt,
+    current_task_id: null,
     settings: { ...DEFAULT_SETTINGS },
     projects: [
       { id: examProject, name: '9 月 5 日补考', description: '两门补考，当前最高优先级。', kind: 'goal', status: 'active', priority: 5, due_at: '2026-09-05T23:59:00+08:00', created_at: createdAt },
@@ -227,6 +228,7 @@ export function repairAssistantState(source) {
   return {
     ...base,
     ...state,
+    current_task_id: normalizeNullableId(state.current_task_id),
     settings,
     projects: (Array.isArray(state.projects) ? state.projects : base.projects).map((project, index) => ({
       ...project,
@@ -615,8 +617,19 @@ function buildPlan(state, current = nowParts()) {
     configured_buffer_minutes: configuredBufferMinutes,
     free_minutes: Math.max(0, usableMinutes - bufferMinutes - scheduled.reduce((total, item) => total + item.estimated_minutes, 0)),
     unavailable_minutes: totalUnavailable,
-    current_task: scheduled[0] || null,
-    next_task: scheduled[1] || null,
+    current_task: (() => {
+      const selectedIndex = state.current_task_id
+        ? scheduled.findIndex((item) => item.id === state.current_task_id)
+        : -1;
+      return scheduled[selectedIndex >= 0 ? selectedIndex : 0] || null;
+    })(),
+    next_task: (() => {
+      const selectedIndex = state.current_task_id
+        ? scheduled.findIndex((item) => item.id === state.current_task_id)
+        : -1;
+      const index = selectedIndex >= 0 ? selectedIndex + 1 : 1;
+      return scheduled[index] || null;
+    })(),
     active_timer: activeTimer,
     scheduled,
     scheduled_display: scheduledDisplay,
@@ -1494,6 +1507,37 @@ export class AssistantStateStore {
               result = { type, ok: true, task, reason: parent ? '子任务已加入父任务。' : '任务已加入真实任务库。' };
             }
           }
+        } else if (type === 'set_current_task') {
+          const task = action.task_id
+            ? state.tasks.find((item) => item.id === action.task_id)
+            : findTask(action.task || action.title);
+          const hasChildren = task && state.tasks.some((item) => item.parent_task_id === task.id && !['cancelled', 'missed'].includes(item.status));
+          if (!task) result = { type, ok: false, reason: '没有找到匹配的任务。' };
+          else if (!['open', 'in_progress'].includes(task.status)) result = { type, ok: false, reason: '只能选择未完成且当前可执行的任务。' };
+          else if (hasChildren) result = { type, ok: false, reason: '父任务只用于组织子任务，请选择具体的子任务开始。' };
+          else {
+            state.current_task_id = task.id;
+            if (action.start_timer !== false) {
+              state.time_sessions ||= [];
+              const timestampNow = timestamp;
+              const active = state.time_sessions.find((session) => session.status === 'running');
+              const closeSession = (session) => {
+                if (!session) return;
+                const elapsed = Math.max(0, Math.floor((Date.parse(timestampNow) - Date.parse(session.started_at)) / 1000));
+                session.elapsed_seconds = (session.elapsed_seconds || 0) + elapsed;
+                session.ended_at = timestampNow;
+                session.status = 'paused';
+              };
+              if (active && active.task_id !== task.id) closeSession(active);
+              const existing = state.time_sessions
+                .filter((session) => session.task_id === task.id && session.status === 'paused')
+                .sort((left, right) => Date.parse(String(right.ended_at || '')) - Date.parse(String(left.ended_at || '')))[0];
+              if (existing) { existing.status = 'running'; existing.started_at = timestampNow; existing.ended_at = null; }
+              else state.time_sessions.push({ id: id(), task_id: task.id, mode: action.mode === 'countdown' ? 'countdown' : 'stopwatch', target_minutes: Math.max(1, Number(action.target_minutes) || Number(task.estimated_minutes) || 45), started_at: timestampNow, ended_at: null, elapsed_seconds: 0, status: 'running', created_at: timestampNow });
+              task.status = 'in_progress';
+            }
+            result = { type, ok: true, task, reason: action.start_timer === false ? '已切换当前任务。' : '已切换当前任务并开始计时。' };
+          }
         } else if (['start_task_timer', 'pause_task_timer', 'stop_task_timer', 'complete_task', 'reopen_task', 'update_task', 'reorder_tasks'].includes(type)) {
           if (type === 'reorder_tasks') {
             const ids = Array.isArray(action.task_ids) ? action.task_ids : [];
@@ -1527,6 +1571,7 @@ export class AssistantStateStore {
                   if (target) target.actual_minutes = Math.round(state.time_sessions.filter((s) => s.task_id === target.id).reduce((sum, s) => sum + (s.elapsed_seconds || 0), 0) / 60);
                 };
                 if (type === 'start_task_timer') {
+                  state.current_task_id = task.id;
                   if (active && active.task_id !== task.id) closeSession(active);
                   const existing = state.time_sessions
                     .filter((session) => session.task_id === task.id && session.status === 'paused')
@@ -1537,7 +1582,7 @@ export class AssistantStateStore {
                 } else {
                   const session = state.time_sessions.find((entry) => entry.task_id === task.id && entry.status === 'running');
                   if (session) closeSession(session, type === 'stop_task_timer' || type === 'complete_task' ? 'completed' : 'paused');
-                  if (type === 'complete_task') { task.status = 'done'; task.completed_at = timestamp; }
+                  if (type === 'complete_task') { task.status = 'done'; task.completed_at = timestamp; if (state.current_task_id === task.id) state.current_task_id = null; }
                   else if (type === 'stop_task_timer' && task.status === 'in_progress') task.status = 'open';
                   task.updated_at = timestamp; result = { type, ok: true, task, sessions: state.time_sessions.filter((entry) => entry.task_id === task.id), reason: type === 'pause_task_timer' ? '已暂停计时。' : type === 'complete_task' ? '任务已完成并保留在历史中。' : '计时已停止。' };
                 }
@@ -1556,6 +1601,7 @@ export class AssistantStateStore {
               task.actual_minutes = Math.round((state.time_sessions || []).filter((entry) => entry.task_id === task.id).reduce((sum, entry) => sum + (entry.elapsed_seconds || 0), 0) / 60);
             }
             task.status = 'done'; task.completed_at = timestamp; task.updated_at = timestamp;
+            if (state.current_task_id === task.id) state.current_task_id = null;
             result = { type, ok: true, task_id: task.id, title: task.title, reason: '任务已完成。' };
           }
         } else if (type === 'cancel_task' || type === 'defer_task') {
@@ -1564,11 +1610,13 @@ export class AssistantStateStore {
             : findTask(action.task);
           if (task) {
             task.status = type === 'cancel_task' ? 'cancelled' : 'deferred'; task.updated_at = timestamp;
+            if (state.current_task_id === task.id) state.current_task_id = null;
             result = { type, ok: true, task_id: task.id, title: task.title, reason: type === 'cancel_task' ? '任务已取消。' : '任务已顺延。' };
           }
         } else if (type === 'cancel_all_tasks') {
           const changed = state.tasks.filter((task) => ['open', 'in_progress', 'deferred'].includes(task.status));
           changed.forEach((task) => { task.status = 'cancelled'; task.updated_at = timestamp; });
+          if (state.current_task_id && changed.some((task) => task.id === state.current_task_id)) state.current_task_id = null;
           result = { type, ok: true, count: changed.length, reason: '未完成任务已全部取消。' };
         } else if (type === 'set_unavailable_period') {
           const start = clock(action.start); const end = clock(action.end);

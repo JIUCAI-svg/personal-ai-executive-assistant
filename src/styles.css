@@ -163,6 +163,8 @@ button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2p
 .schedule-item.group .schedule-body small { color: #6f847c; }
 .subtask-schedule-button { align-self: start; min-height: 26px; display: inline-flex; align-items: center; gap: 3px; margin-top: 1px; padding: 3px 6px; color: #4f8177; background: #e4f0e9; border: 1px solid #cfe2d8; border-radius: 5px; font-size: 10px; cursor: pointer; }
 .subtask-schedule-button:hover { color: #245f55; background: #d8ebe2; }
+.current-select-button { width: 24px; height: 24px; display: grid; place-items: center; align-self: start; color: #2d7769; background: #e5eee8; border: 0; border-radius: 50%; cursor: pointer; }
+.current-select-button:hover { color: #fff; background: #397d72; }
 .subtask-mark { display: inline-block; margin-right: 5px; color: #9aaa9f; font-size: 13px; }
 .subtask-inline-button { margin-left: auto; border: 0; background: transparent; color: #5d857b; font: inherit; font-size: 11px; cursor: pointer; }
 .subtask-parent { margin: -2px 0 8px; color: #6b817a; font-size: 12px; line-height: 1.55; }

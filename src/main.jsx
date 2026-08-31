@@ -5,7 +5,7 @@ import {
   Bell, Bot, Brain, CalendarDays, Check, ChevronDown, ChevronRight, Circle,
   Clock3, Cloud, CloudOff, Command, FileText, Flame, FolderKanban, HeartPulse, ListChecks, LogIn, LogOut, Menu,
   MessageCircle, Image, Camera, MoreHorizontal, MoveRight, PenLine, Plus, RefreshCw, Send, Settings2,
-  Sparkles, SunMedium, Target, X, Zap
+  Sparkles, SunMedium, Target, X, Zap, Play
 } from 'lucide-react';
 import './styles.css';
 
@@ -663,6 +663,29 @@ function App() {
     }
   }
 
+  async function setCurrentAndStart(item) {
+    if (!item?.id || item.displayOnly || item.state === 'deferred' || item.state === 'sleeping' || aiBusy) return;
+    setAiBusy(true);
+    try {
+      const response = await apiFetch('/api/assistant/actions', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          thread_id: threadId,
+          conversation_mode: conversationMode,
+          actions: [{ type: 'set_current_task', task_id: item.id, start_timer: true, mode: 'stopwatch', reason: '用户在今日计划中选择当前任务并开始计时' }]
+        })
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '切换当前任务失败');
+      applyAssistantData(payload);
+      loadThreads();
+    } catch (error) {
+      setNotice(error.message || '切换当前任务失败');
+    } finally {
+      setAiBusy(false);
+    }
+  }
+
   async function createTaskManually(event) {
     event.preventDefault();
     const title = newTask.title.trim();
@@ -1145,7 +1168,7 @@ function App() {
               <div className="schedule-list">
                 {plan.filter((item) => item.state !== 'deferred').map((item) => (
                   <div className={`schedule-item ${item.state} ${item.tone} ${item.isSubtask ? 'subtask' : ''}`} key={item.id}>
-                    <time>{item.start}</time><div className="schedule-line"><span /></div><div className="schedule-body"><strong className={item.isSubtask ? 'subtask-title' : ''}>{item.isSubtask && <span className="subtask-mark" aria-hidden="true">↳</span>}{item.title}</strong><small>{item.note}</small></div>{item.displayOnly && <button className="subtask-schedule-button" type="button" onClick={() => openSubtaskDraft(item.id)}><Plus size={13} /> 子任务</button>}{item.state === 'current' && <button className="done-button" onClick={markCurrentDone} aria-label={`完成${item.title}`}><Check size={16} /></button>}{item.state === 'done' && <Check size={16} className="done-check" />}
+                    <time>{item.start}</time><div className="schedule-line"><span /></div><div className="schedule-body"><strong className={item.isSubtask ? 'subtask-title' : ''}>{item.isSubtask && <span className="subtask-mark" aria-hidden="true">↳</span>}{item.title}</strong><small>{item.note}</small></div>{item.displayOnly && <button className="subtask-schedule-button" type="button" onClick={() => openSubtaskDraft(item.id)}><Plus size={13} /> 子任务</button>}{!item.displayOnly && !item.done && item.state !== 'deferred' && item.state !== 'sleeping' && item.state !== 'current' && <button className="current-select-button" type="button" onClick={() => setCurrentAndStart(item)} aria-label={`开始${item.title}`}><Play size={15} /></button>}{item.state === 'current' && <button className="done-button" onClick={markCurrentDone} aria-label={`完成${item.title}`}><Check size={16} /></button>}{item.state === 'done' && <Check size={16} className="done-check" />}
                   </div>
                 ))}
               </div>

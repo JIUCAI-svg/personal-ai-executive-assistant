@@ -68,6 +68,11 @@ export const ASSISTANT_TOOLS = Object.freeze([
     parameters: { reason: '完成说明' }
   },
   {
+    name: 'set_current_task',
+    description: '把指定的可执行任务设为顶部当前任务，并默认立即开始计时；父任务容器不可选择。',
+    parameters: { task: '任务名称', task_id: '可选任务 ID', start_timer: '是否立即开始计时，默认 true', mode: '可选 stopwatch 或 countdown', target_minutes: '倒计时分钟数', reason: '选择原因' }
+  },
+  {
     name: 'cancel_task',
     description: '取消一项任务，使它从计划中移除。',
     parameters: { task: '任务名称', reason: '取消原因' }
@@ -170,6 +175,7 @@ export const ASSISTANT_TOOLS = Object.freeze([
 export const ASSISTANT_TOOL_NAMES = new Set(ASSISTANT_TOOLS.map((tool) => tool.name));
 
 const NUMBER_PARAMETERS = new Set(['estimated_minutes', 'daily_minutes', 'priority', 'target_minutes', 'minutes', 'after_minutes', 'limit']);
+const BOOLEAN_PARAMETERS = new Set(['visible', 'start_timer']);
 const REQUIRED_PARAMETERS = {
   get_now: [], get_today_plan: [], list_tasks: [], list_projects: [], get_app_usage: [],
   set_sleep_time: ['time'],
@@ -186,6 +192,7 @@ const REQUIRED_PARAMETERS = {
   update_project: ['project'],
   set_unavailable_period: ['start', 'end'],
   capture_memory: ['title'],
+  set_current_task: [],
   search_memory: ['query'],
   get_memory: ['memory_id'],
   search_vault: ['query'],
@@ -201,7 +208,7 @@ export const ASSISTANT_SKILLS = Object.freeze([
   {
     name: 'task_management',
     description: '创建、编辑、排序、计时、完成、取消和顺延任务。',
-    tools: ['create_task', 'create_subtask', 'create_long_task', 'update_task', 'update_long_task', 'reorder_tasks', 'start_task_timer', 'pause_task_timer', 'stop_task_timer', 'complete_task', 'reopen_task', 'complete_current_task', 'cancel_task', 'cancel_all_tasks', 'defer_task']
+    tools: ['create_task', 'create_subtask', 'create_long_task', 'update_task', 'update_long_task', 'reorder_tasks', 'set_current_task', 'start_task_timer', 'pause_task_timer', 'stop_task_timer', 'complete_task', 'reopen_task', 'complete_current_task', 'cancel_task', 'cancel_all_tasks', 'defer_task']
   },
   {
     name: 'project_management',
@@ -244,7 +251,7 @@ export function assistantToolCatalog() {
 
 function parameterSchema(name, description) {
   return {
-    type: NUMBER_PARAMETERS.has(name) ? 'number' : 'string',
+    type: NUMBER_PARAMETERS.has(name) ? 'number' : BOOLEAN_PARAMETERS.has(name) ? 'boolean' : 'string',
     description
   };
 }
