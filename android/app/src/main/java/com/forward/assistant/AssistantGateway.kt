@@ -419,6 +419,12 @@ suspend fun gatewayInitializeCloud(context: Context): RemoteState = kotlinx.coro
     } finally { connection.disconnect() }
 }
 
+suspend fun gatewayRunStatus(context: Context, requestId: String): JSONObject = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val connection = gatewayConnection(context, "/api/assistant/runs/${java.net.URLEncoder.encode(requestId, "UTF-8")}", "GET")
+    try { connection.readJsonOrThrow("读取运行状态失败").optJSONObject("run") ?: error("服务没有返回运行状态") }
+    finally { connection.disconnect() }
+}
+
 suspend fun gatewayDeleteThread(context: Context, threadId: String): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
     val connection = gatewayConnection(context, "/api/assistant/threads/${threadId.trim()}", "DELETE")
     try { connection.readJsonOrThrow("删除对话失败"); true } finally { connection.disconnect() }

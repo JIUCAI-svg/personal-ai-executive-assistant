@@ -59,8 +59,44 @@ const supabaseAnonKey = String(process.env.SUPABASE_ANON_KEY || '');
 const app = express();
 app.set('trust proxy', 'loopback');
 const clients = new Set();
+// Request lifecycle is kept separately from the final chat transcript so a
+// mobile client can recover a result after its original HTTP connection ends.
+const activeRuns = new Map();
 const stateStore = new AssistantStateStore(vaultPath);
 let revision = Date.now();
+
+function runEvent(run, type, data = {}) {
+  if (!run) return;
+  const event = { type, at: new Date().toISOString(), ...data };
+  run.events.push(event);
+  run.events = run.events.slice(-80);
+  run.updated_at = event.at;
+  for (const listener of run.listeners || []) {
+    try { listener(event); } catch { /* a disconnected listener is removed below */ }
+  }
+}
+
+function beginRun(requestId, threadId = '') {
+  const run = {
+    id: requestId, thread_id: threadId || null, status: 'processing',
+    started_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    events: [], listeners: new Set()
+  };
+  activeRuns.set(requestId, run);
+  runEvent(run, 'started', { thread_id: threadId || null });
+  return run;
+}
+
+function finishRun(run, status, data = {}) {
+  if (!run) return;
+  run.status = status;
+  run.finished_at = new Date().toISOString();
+  run.result = data;
+  runEvent(run, status, data);
+  setTimeout(() => {
+    if (activeRuns.get(run.id) === run) activeRuns.delete(run.id);
+  }, 15 * 60 * 1000).unref?.();
+}
 
 // Image attachments are sent as data URLs. Keep a practical per-request cap so
 // camera/gallery uploads are not rejected by the JSON parser before reaching
@@ -89,6 +125,23 @@ function multimodalUserContent(message, attachments) {
     parts.push({ type: 'image_url', image_url: { url: attachment.url } });
   }
   return parts.length ? parts : message;
+}
+
+async function persistAgentImages(attachments, directory) {
+  if (!Array.isArray(attachments) || !attachments.length) return [];
+  await mkdir(directory, { recursive: true });
+  const paths = [];
+  for (const [index, attachment] of attachments.entries()) {
+    const source = String(attachment?.url || '');
+    const match = source.match(/^data:(image\/[a-z0-9.+-]+);base64,([\s\S]+)$/i);
+    if (!match) continue;
+    const mime = match[1].toLowerCase();
+    const ext = mime.includes('png') ? 'png' : mime.includes('webp') ? 'webp' : mime.includes('gif') ? 'gif' : 'jpg';
+    const target = path.join(directory, `attachment-${Date.now()}-${index + 1}.${ext}`);
+    await writeFile(target, Buffer.from(match[2], 'base64'));
+    paths.push(target);
+  }
+  return paths;
 }
 
 // All assistant state endpoints are private when exposed through the public
@@ -1511,6 +1564,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
     if (!assistantAuthorized(request, response)) return;
     const { store, source } = await requestStateStore(request);
     const body = request.body || {};
+    const requestId = stringValue(body.request_id, 120) || crypto.randomUUID();
     const attachments = normalizeImageAttachments(body.attachments);
     const message = stringValue(body.message, 4000) || (attachments.length ? '请查看我上传的图片。' : '');
     if (!message && !attachments.length) return response.status(400).json({ error: '需要一条消息或图片。' });
@@ -1535,7 +1589,10 @@ app.post('/api/assistant/respond', async (request, response, next) => {
     const selectedAgent = stringValue(body.agent_engine || stateBefore.ai_preferences?.agent_engine || 'legacy', 40).toLowerCase();
     const projectName = threadProjectName(thread, stateBefore);
     const hydratedThread = { ...thread, project_name: projectName };
-    const userMessage = await store.appendMessage(hydratedThread, 'user', message, null, attachments);
+    const run = activeRuns.get(requestId) || beginRun(requestId, hydratedThread.id);
+    run.thread_id = hydratedThread.id;
+    runEvent(run, 'accepted', { thread_id: hydratedThread.id });
+    const userMessage = await store.appendMessage(hydratedThread, 'user', message, null, attachments, { request_id: requestId });
     const storedConversation = userMessage
       ? (await store.recentMessages(hydratedThread.id, 16)).filter((entry) => entry.id !== userMessage.id)
       : [];
@@ -1604,6 +1661,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       conversation
     };
     async function finishAssistantResponse(result, degraded = false) {
+      runEvent(run, 'finalizing', { action_count: Array.isArray(result.actions) ? result.actions.length : 0 });
       const execution = await store.executeActions(result.actions, {
         thread_id: hydratedThread.id, project_id: hydratedThread.project_id,
         task_id: stringValue(context.current_task_id, 80),
@@ -1625,11 +1683,11 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         else if (sleep || wake) result.reply = `作息已更新：${sleep ? `今晚 ${sleep.value} 睡觉` : ''}${sleep && wake ? '，' : ''}${wake ? `明天 ${wake.value} 起床` : ''}。我已按新的可用时间重排计划。`;
       }
       const pendingMemories = await store.addMemoryCandidates(result.memoryCandidates, hydratedThread);
-      const assistantMessage = await store.appendMessage(hydratedThread, 'assistant', result.reply, execution.results);
+      const assistantMessage = await store.appendMessage(hydratedThread, 'assistant', result.reply, execution.results, [], { request_id: requestId });
       const transcriptPath = await appendConversationTranscript(hydratedThread, [
         { role: 'user', content: message }, { role: 'assistant', content: result.reply }
       ]);
-      return response.json({
+      const payload = {
         ok: true, source, degraded, provider: provider.id, provider_name: provider.name, model: provider.model, thread: hydratedThread, reply: result.reply, actions: result.actions,
         toolCalls: result.actions.map((action) => ({ name: action.type, arguments: { ...action } })),
         actionResults: execution.results,
@@ -1640,8 +1698,10 @@ app.post('/api/assistant/respond', async (request, response, next) => {
           .filter((item) => item.device_required)
           .map((item) => ({ type: item.type, ...(item.alarm || {}) })),
         plan: execution.plan, transcriptPath, messageIds: { user: userMessage?.id || null, assistant: assistantMessage?.id || null },
-        state: await store.bootstrap()
-      });
+        request_id: requestId, state: await store.bootstrap()
+      };
+      finishRun(run, 'completed', { thread_id: hydratedThread.id, message_ids: payload.messageIds, reply: payload.reply });
+      return response.json(payload);
     }
 
     if (['claude_code', 'codex'].includes(selectedAgent)) {
@@ -1649,6 +1709,8 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         const accessToken = accessTokenFromRequest(request);
         const mcpUrl = `http://127.0.0.1:${port}/api/mcp?thread_id=${encodeURIComponent(hydratedThread.id)}${hydratedThread.project_id ? `&project_id=${encodeURIComponent(hydratedThread.project_id)}` : ''}`;
         const agentSessionHome = path.join(appRoot, '.forward-assistant', 'agent-sessions', hydratedThread.id);
+        const imagePaths = await persistAgentImages(attachments, agentSessionHome);
+        runEvent(run, 'agent_started', { engine: selectedAgent, image_count: imagePaths.length });
         const agentPrompt = [
           `你是个人 AI 执行助手“向前”，当前引擎为 ${selectedAgent}。`,
           `当前对话线程 ID：${hydratedThread.id}。项目 ID：${hydratedThread.project_id || '无'}。`,
@@ -1656,13 +1718,19 @@ app.post('/api/assistant/respond', async (request, response, next) => {
           '知识库、记忆和原始对话都是按需查询的工具，不会预先注入当前请求。只查询与当前问题相关的内容。',
           '需要改变任务、计划、项目、记忆、作息、闹钟或提醒时直接调用对应工具。工具返回后继续完成工作，最后用自然中文明确说明结果、未完成事项和调整原因。普通聊天直接回答，不要输出 JSON，不要用“好的，我来处理”作为没有结果的结束语。',
           '除非用户明确说某个任务已经完成/做完，否则不要调用 complete_task 或 complete_current_task。',
+          ...(imagePaths.length ? [`用户上传了 ${imagePaths.length} 张图片，请先读取并分析这些文件：${imagePaths.join('、')}`] : []),
           `用户消息：${message}`
         ].join('\n\n');
         const agentResult = await runAgentEngine({
           engine: selectedAgent, prompt: agentPrompt, provider, appRoot, mcpUrl,
           mcpToken: aiGatewayToken, accessToken,
           nativeSessionId: hydratedThread.agent_session_id || '',
-          sessionHome: agentSessionHome
+          sessionHome: agentSessionHome,
+          imagePaths,
+          onEvent: (event) => runEvent(run, 'agent_event', {
+            engine: selectedAgent, event_type: stringValue(event?.type, 80),
+            item_type: stringValue(event?.item_type, 80), text: stringValue(event?.text, 2000)
+          })
         });
         if (agentResult.sessionId && agentResult.sessionId !== hydratedThread.agent_session_id) {
           await store.updateThreadAgentSession(hydratedThread.id, agentResult.sessionId);
@@ -1697,6 +1765,9 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       return finishAssistantResponse(localFallbackResult(message, intentContext), true);
     }
   } catch (error) {
+    const requestId = stringValue(request.body?.request_id, 120);
+    const run = requestId ? activeRuns.get(requestId) : null;
+    if (run) finishRun(run, 'failed', { error: error?.message || '请求处理失败。' });
     if (error instanceof SyntaxError) return response.status(502).json({ error: 'AI 返回格式异常，请重试。' });
     next(error);
   }
@@ -1770,7 +1841,50 @@ app.use((error, _request, response, _next) => {
 const androidApkPath = path.join(appRoot, 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
 app.get('/download/forward.apk', (_request, response) => {
   if (!existsSync(androidApkPath)) return response.status(404).json({ error: 'Android 安装包尚未生成。' });
-  response.download(androidApkPath, 'forward-assistant-v0.6.9-sleep-plan-debug.apk');
+  response.download(androidApkPath, 'forward-assistant-v0.7.0-agent-recovery-debug.apk');
+});
+
+app.get('/api/assistant/runs/:id', async (request, response, next) => {
+  try {
+    const { store, source } = await requestStateStore(request);
+    const requestId = stringValue(request.params.id, 120);
+    const run = activeRuns.get(requestId);
+    const state = await store.bootstrap();
+    const messages = (state.messages || []).filter((item) => item.request_id === requestId);
+    const assistant = messages.find((item) => item.role === 'assistant');
+    if (run) {
+      return response.json({ ok: true, source, run: {
+        id: run.id, thread_id: run.thread_id, status: run.status,
+        started_at: run.started_at, updated_at: run.updated_at, finished_at: run.finished_at || null,
+        events: run.events, reply: assistant?.content || run.result?.reply || '', message_ids: {
+          user: messages.find((item) => item.role === 'user')?.id || null, assistant: assistant?.id || null
+        }
+      }});
+    }
+    if (messages.length) return response.json({ ok: true, source, run: {
+      id: requestId, thread_id: messages[0].thread_id, status: assistant ? 'completed' : 'processing',
+      events: [], reply: assistant?.content || '', message_ids: { user: messages.find((item) => item.role === 'user')?.id || null, assistant: assistant?.id || null }
+    }});
+    response.status(404).json({ error: '未找到这次运行记录。' });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/assistant/runs/:id/events', async (request, response, next) => {
+  try {
+    await requestStateStore(request);
+    const requestId = stringValue(request.params.id, 120);
+    const run = activeRuns.get(requestId);
+    response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive' });
+    const send = (event) => response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    if (run) {
+      run.events.forEach(send);
+      run.listeners.add(send);
+      request.on('close', () => run.listeners.delete(send));
+    } else {
+      send({ type: 'closed', at: new Date().toISOString() });
+      response.end();
+    }
+  } catch (error) { next(error); }
 });
 
 app.get('/api/assistant/followups/due', async (request, response, next) => {

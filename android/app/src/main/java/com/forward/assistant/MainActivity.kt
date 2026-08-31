@@ -15,6 +15,7 @@ import android.util.Log
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Base64
+import java.util.UUID
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -456,12 +457,14 @@ private suspend fun requestAssistant(
     model: String,
     agentEngine: String,
     threadId: String?,
+    requestId: String,
     conversationOptions: ConversationOptions,
     attachments: List<String> = emptyList()
 ): AssistantResult = withContext(Dispatchers.IO) {
     check(aiGatewayUrl.isNotBlank()) { "AI 网关地址尚未配置" }
     val payload = JSONObject().apply {
         put("message", message)
+        put("request_id", requestId)
         if (attachments.isNotEmpty()) put("attachments", JSONArray(attachments))
         if (!threadId.isNullOrBlank()) put("thread_id", threadId)
         put("conversation_mode", conversationOptions.mode)
@@ -548,7 +551,10 @@ private suspend fun requestAssistant(
     val connection = (URL(aiGatewayUrl).openConnection() as HttpURLConnection).apply {
         requestMethod = "POST"
         connectTimeout = 8_000
-        readTimeout = 60_000
+        // Codex/Claude can legitimately run for a few minutes while using
+        // tools. Result recovery handles disconnects, but avoid ending the
+        // normal request before the Agent has a chance to finish.
+        readTimeout = 180_000
         doOutput = true
         useCaches = false
         setFixedLengthStreamingMode(payloadBytes.size)
@@ -770,6 +776,7 @@ private fun ForwardApp(activity: MainActivity) {
         var cancelledTasks by remember { mutableStateOf(activity.plannerSet("cancelled_tasks")) }
         var cancelAllTasks by remember { mutableStateOf(activity.plannerFlag("cancel_all_tasks")) }
         var aiBusy by remember { mutableStateOf(false) }
+        var agentActivity by remember { mutableStateOf("") }
         var input by remember { mutableStateOf(TextFieldValue()) }
         var sleepTime by remember { mutableStateOf(activity.plannerTime("sleep_time", DEFAULT_SLEEP_MINUTES)) }
         var wakeTime by remember { mutableStateOf(activity.plannerTime("wake_time", DEFAULT_WAKE_MINUTES)) }
@@ -793,6 +800,7 @@ private fun ForwardApp(activity: MainActivity) {
         var now by remember { mutableStateOf(LocalDateTime.now()) }
         var messages by remember { mutableStateOf(emptyList<ChatMessage>()) }
         var pendingImageData by remember { mutableStateOf<List<String>>(emptyList()) }
+        var queuedMessages by remember { mutableStateOf(emptyList<Pair<String, List<String>>>()) }
         var showProjects by remember { mutableStateOf(false) }
         var showCreateProject by remember { mutableStateOf(false) }
         var drawerOpen by remember { mutableStateOf(false) }
@@ -953,8 +961,9 @@ private fun ForwardApp(activity: MainActivity) {
         }
         val galleryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris: List<Uri> ->
             val additions = uris.take((4 - pendingImageData.size).coerceAtLeast(0)).mapNotNull { uri ->
+                val mime = activity.contentResolver.getType(uri)?.takeIf { it.startsWith("image/") } ?: "image/jpeg"
                 runCatching { activity.contentResolver.openInputStream(uri)?.use { Base64.encodeToString(it.readBytes(), Base64.NO_WRAP) } }
-                    .getOrNull()?.let { "data:image/*;base64,$it" }
+                    .getOrNull()?.let { "data:$mime;base64,$it" }
             }
             pendingImageData = (pendingImageData + additions).take(4)
         }
@@ -1186,17 +1195,62 @@ private fun ForwardApp(activity: MainActivity) {
 
         fun sendMessage() {
             val text = input.text.trim()
-            if ((text.isEmpty() && pendingImageData.isEmpty()) || aiBusy) return
+            if (text.isEmpty() && pendingImageData.isEmpty()) return
+            if (aiBusy) {
+                queuedMessages = queuedMessages + (text to pendingImageData)
+                pendingImageData = emptyList()
+                input = TextFieldValue()
+                return
+            }
             val priorConversation = messages
             val images = pendingImageData
             pendingImageData = emptyList()
             messages = messages + ChatMessage(false, text, images)
             input = TextFieldValue()
             aiBusy = true
+            agentActivity = "正在连接 Agent"
+            val requestId = UUID.randomUUID().toString()
             scope.launch {
-                val result = runCatching {
-                    requestAssistant(activity, text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel, agentEngine, remoteThreadId, conversationOptions, images)
-                }.getOrElse { error -> AssistantResult("这次没有连上服务，内容没有写入任务、计划或记忆。请稍后重试。", emptyList()).also { scope.launch { snackbar.showSnackbar(error.message ?: "AI 服务连接失败") } } }
+                val monitorJob = launch {
+                    val labels = mapOf("started" to "已建立运行记录", "accepted" to "已接收消息", "agent_started" to "Agent 正在运行", "finalizing" to "正在保存工具结果", "completed" to "已完成")
+                    repeat(120) {
+                        delay(1500)
+                        val status = runCatching { gatewayRunStatus(activity, requestId) }.getOrNull()
+                        val events = status?.optJSONArray("events")
+                        val latest = events?.optJSONObject((events.length() - 1).coerceAtLeast(0))
+                        if (latest != null) {
+                            agentActivity = if (latest.optString("type") == "agent_event") {
+                                when (latest.optString("item_type")) {
+                                    "command_execution" -> "正在执行工具"
+                                    "agent_message" -> "正在生成回复"
+                                    else -> "Agent 正在处理"
+                                }
+                            } else labels[latest.optString("type")] ?: "Agent 正在处理"
+                        }
+                        if (status?.optString("status") == "completed" || status?.optString("status") == "failed") return@launch
+                    }
+                }
+                val result = try {
+                    requestAssistant(activity, text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel, agentEngine, remoteThreadId, requestId, conversationOptions, images)
+                } catch (error: Exception) {
+                    // The server may finish after the original socket timed out.
+                    // Reconcile by request id before presenting a failure state.
+                    var recovered: AssistantResult? = null
+                    for (attempt in 0 until 12) {
+                        delay(2500)
+                        val status = runCatching { gatewayRunStatus(activity, requestId) }.getOrNull() ?: continue
+                        val state = status.optString("status")
+                        if (state == "completed") {
+                            val recoveredThreadId = status.optString("thread_id").ifBlank { remoteThreadId.orEmpty() }
+                            val detail = recoveredThreadId.takeIf { it.isNotBlank() }?.let { runCatching { gatewayLoadThread(activity, it) }.getOrNull() }
+                            val reply = detail?.messages?.lastOrNull { it.fromAssistant }?.text.orEmpty().ifBlank { status.optString("reply") }
+                            if (reply.isNotBlank()) recovered = AssistantResult(reply, emptyList(), threadId = recoveredThreadId); break
+                        }
+                        if (state == "failed") break
+                    }
+                    recovered ?: AssistantResult("本次请求仍在后台处理中，重新打开对话后会显示最终结果。", emptyList()).also { scope.launch { snackbar.showSnackbar(error.message ?: "请求仍在后台处理") } }
+                }
+                monitorJob.cancel()
                 if (result.plan == null) applyActions(result.actions)
                 val deviceResults = applyDeviceActions(result.deviceActions.ifEmpty { result.actions })
                 result.plan?.let { remotePlan = it }
@@ -1216,6 +1270,14 @@ private fun ForwardApp(activity: MainActivity) {
                 } else result.reply
                 messages = messages + ChatMessage(true, displayReply)
                 aiBusy = false
+                agentActivity = ""
+                val queued = queuedMessages.firstOrNull()
+                if (queued != null) {
+                    queuedMessages = queuedMessages.drop(1)
+                    input = TextFieldValue(queued.first)
+                    pendingImageData = queued.second
+                    sendMessage()
+                }
             }
         }
 
@@ -1300,7 +1362,7 @@ private fun ForwardApp(activity: MainActivity) {
                     onSetThreadLocked = ::setThreadLocked,
                     onDeleteThreads = ::deleteThreads
                     ,onGallery = { galleryLauncher.launch("image/*") },
-                    onCamera = { cameraLauncher.launch(null) }, imageData = pendingImageData, onRemoveImage = { index -> pendingImageData = pendingImageData.filterIndexed { position, _ -> position != index } }, onClearImage = { pendingImageData = emptyList() }
+                    onCamera = { cameraLauncher.launch(null) }, imageData = pendingImageData, onRemoveImage = { index -> pendingImageData = pendingImageData.filterIndexed { position, _ -> position != index } }, onClearImage = { pendingImageData = emptyList() }, agentActivity = agentActivity
                 )
                 2 -> MemoryScreen(
                     padding = padding,
@@ -1981,6 +2043,7 @@ private fun ChatScreen(
     imageData: List<String> = emptyList(),
     onRemoveImage: (Int) -> Unit = {},
     onClearImage: () -> Unit = {},
+    agentActivity: String = "",
     modifier: Modifier = Modifier
 ) {
     val listState = rememberLazyListState()
@@ -2074,6 +2137,14 @@ private fun ChatScreen(
                     }
                 }
             }
+            if (agentActivity.isNotBlank()) {
+                item {
+                    Row(Modifier.padding(start = 16.dp, top = 2.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.AutoAwesome, null, tint = Green, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(7.dp)); Text(agentActivity, color = Muted, fontSize = 11.sp)
+                    }
+                }
+            }
         }
         if (imageData.isNotEmpty()) Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             imageData.forEachIndexed { index, image ->
@@ -2085,7 +2156,9 @@ private fun ChatScreen(
             Spacer(Modifier.width(4.dp)); Text("已选择 ${imageData.size} 张", color = Green, fontSize = 10.sp); Spacer(Modifier.weight(1f)); TextButton(onClick = onClearImage) { Text("清空", color = Coral, fontSize = 10.sp) }
         }
 
-        Composer(input, onInput, onSend, aiBusy || threadLoading, onGallery, onCamera, imageData.isNotEmpty())
+        // Keep the editor available while an Agent runs; a message sent during
+        // that window is queued and dispatched in conversation order.
+        Composer(input, onInput, onSend, threadLoading, onGallery, onCamera, imageData.isNotEmpty())
     }
 
     if (showHistory) {

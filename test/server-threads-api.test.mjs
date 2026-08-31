@@ -65,6 +65,7 @@ test('thread APIs preserve a selected conversation and keep temporary chat out o
     const reply = await (await fetch(`${baseUrl}/api/assistant/respond`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        request_id: 'run-test-001',
         message: '项目今天已经推进了一步。',
         attachments: [{ name: 'progress.png', type: 'image/png', data_url: 'data:image/png;base64,aGVsbG8=' }],
         thread_id: created.thread.id,
@@ -72,6 +73,11 @@ test('thread APIs preserve a selected conversation and keep temporary chat out o
       })
     })).json();
     assert.equal(reply.thread.id, created.thread.id);
+    assert.equal(reply.request_id, 'run-test-001');
+
+    const run = await (await fetch(`${baseUrl}/api/assistant/runs/run-test-001`)).json();
+    assert.equal(run.run.status, 'completed');
+    assert.equal(run.run.thread_id, created.thread.id);
 
     const list = await (await fetch(`${baseUrl}/api/assistant/threads`)).json();
     assert.equal(list.threads.length, 1);

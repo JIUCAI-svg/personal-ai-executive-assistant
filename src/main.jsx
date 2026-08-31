@@ -149,6 +149,7 @@ function App() {
   const [assistantState, setAssistantState] = useState(null);
   const [threadId, setThreadId] = useState(() => window.localStorage.getItem('forward.current.thread') || null);
   const [messages, setMessages] = useState([]);
+  const [agentActivity, setAgentActivity] = useState('');
   const [conversationMode, setConversationMode] = useState('daily_planning');
   const [projectId, setProjectId] = useState('');
   const [threads, setThreads] = useState([]);
@@ -843,12 +844,35 @@ function App() {
   }
 
   async function handleUserMessage(text, attachments = []) {
+    const requestId = crypto.randomUUID();
     setAiBusy(true);
+    setAgentActivity('正在连接 Agent');
+    const activityLabels = {
+      started: '已建立运行记录', accepted: '已接收消息', agent_started: 'Agent 正在运行',
+      finalizing: '正在保存工具结果', completed: '已完成', failed: '运行出现错误'
+    };
+    const monitor = async () => {
+      try {
+        const statusResponse = await apiFetch(`/api/assistant/runs/${encodeURIComponent(requestId)}`);
+        if (!statusResponse.ok) return;
+        const statusPayload = await statusResponse.json();
+        const latest = statusPayload.run?.events?.at(-1);
+        if (latest?.type === 'agent_event') {
+          const label = latest.item_type === 'command_execution' ? '正在执行工具'
+            : latest.item_type === 'agent_message' ? '正在生成回复'
+              : latest.event_type === 'thread.started' ? 'Agent 会话已连接' : 'Agent 正在处理';
+          setAgentActivity(label);
+        } else if (latest?.type) setAgentActivity(activityLabels[latest.type] || 'Agent 正在处理');
+      } catch { /* the request itself remains the source of truth */ }
+    };
+    const monitorTimer = window.setInterval(monitor, 1200);
+    monitor();
     try {
       const response = await apiFetch('/api/assistant/respond', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: text,
+          request_id: requestId,
           attachments,
           thread_id: threadId,
           conversation_mode: conversationMode,
@@ -872,9 +896,26 @@ function App() {
       const applied = (payload.actionResults || []).filter((item) => item.ok);
       setNotice(applied.length ? applied.map((item) => item.reason).join(' ') : (payload.plan?.adjustment_reason || '已保存本轮对话。'));
     } catch (error) {
-      setNotice(error.message || 'AI 连接暂时不可用');
-      addAssistant('这次没有成功写入计划。我保留了你的消息，稍后重试时会继续处理。');
+      setAgentActivity('正在确认后台运行结果');
+      let recovered = false;
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+        try {
+          const statusResponse = await apiFetch(`/api/assistant/runs/${encodeURIComponent(requestId)}`);
+          if (!statusResponse.ok) continue;
+          const statusPayload = await statusResponse.json();
+          if (statusPayload.run?.status === 'completed' && statusPayload.run?.thread_id) {
+            await openThread(statusPayload.run.thread_id);
+            recovered = true;
+            break;
+          }
+          if (statusPayload.run?.status === 'failed') break;
+        } catch { /* keep reconciling while the network recovers */ }
+      }
+      if (!recovered) setNotice(error.message || '本次请求仍在后台处理中');
     } finally {
+      window.clearInterval(monitorTimer);
+      setAgentActivity('');
       setAiBusy(false);
     }
   }
@@ -1150,6 +1191,7 @@ function App() {
                   <div><div className="message-meta">{message.role === 'assistant' ? '向前' : '你'} <time>{message.time}</time></div>{message.text && (message.role === 'assistant' ? <div className="message-markdown">{renderAssistantMarkdown(message.text)}</div> : <p>{message.text}</p>)}{message.attachments?.map((image) => <img className="message-image" key={image.data_url} src={image.data_url} alt={image.name || '上传图片'} />)}</div>
                 </article>
               ))}
+              {agentActivity && <div className="agent-live-status"><Sparkles size={14} /><span>{agentActivity}</span><span className="agent-live-dots" aria-hidden="true">···</span></div>}
               {notice && <div className="change-note"><Sparkles size={15} /><span>{notice}</span></div>}
               <div ref={endRef} />
             </div>

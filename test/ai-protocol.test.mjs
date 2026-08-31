@@ -52,3 +52,14 @@ test('natural text providers remain usable without JSON envelope', () => {
   const provider = { api_mode: 'chat_completions' };
   assert.equal(extractAssistantText(provider, { choices: [{ message: { content: '你好，今天继续推进。' } }] }), '你好，今天继续推进。');
 });
+
+test('multimodal messages preserve image input for both API envelopes', () => {
+  const message = { role: 'user', content: [
+    { type: 'text', text: '请看图' },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,aGVsbG8=' } }
+  ] };
+  const chat = buildAssistantModelRequest({ api_mode: 'chat_completions' }, { model: 'vision-model', messages: [message] });
+  assert.deepEqual(chat.messages[0].content[1], { type: 'image_url', image_url: { url: 'data:image/png;base64,aGVsbG8=' } });
+  const responses = buildAssistantModelRequest({ api_mode: 'responses' }, { model: 'vision-model', messages: [message] });
+  assert.deepEqual(responses.input[0].content[1], { type: 'input_image', image_url: 'data:image/png;base64,aGVsbG8=' });
+});

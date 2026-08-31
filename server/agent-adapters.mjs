@@ -7,7 +7,7 @@ function text(value, limit = 20000) {
   return String(value || '').trim().slice(0, limit);
 }
 
-function run(command, args, { env = {}, cwd = process.cwd(), timeoutMs = 120000 } = {}) {
+function run(command, args, { env = {}, cwd = process.cwd(), timeoutMs = 120000, onStdout = null } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
@@ -21,7 +21,7 @@ function run(command, args, { env = {}, cwd = process.cwd(), timeoutMs = 120000 
       child.kill('SIGTERM');
       reject(new Error(`${command} 执行超时。`));
     }, timeoutMs);
-    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stdout.on('data', (chunk) => { stdout += chunk; onStdout?.(String(chunk)); });
     child.stderr.on('data', (chunk) => { stderr += chunk; });
     child.on('error', (error) => { clearTimeout(timer); reject(error); });
     child.on('close', (code) => {
@@ -103,7 +103,7 @@ export function agentEngineCatalog() {
   ];
 }
 
-export async function runAgentEngine({ engine, prompt, provider, appRoot, mcpUrl, mcpToken, accessToken = '', nativeSessionId = '', sessionHome = '' }) {
+export async function runAgentEngine({ engine, prompt, provider, appRoot, mcpUrl, mcpToken, accessToken = '', nativeSessionId = '', sessionHome = '', imagePaths = [], onEvent = null }) {
   const selected = String(engine || '').toLowerCase();
   if (!['claude_code', 'codex'].includes(selected)) throw new Error('未选择可用的 Agent 引擎。');
   if (!provider?.base_url || !provider?.api_key || !provider?.model) throw new Error('Agent 缺少中转站、密钥或模型配置。');
@@ -114,14 +114,19 @@ export async function runAgentEngine({ engine, prompt, provider, appRoot, mcpUrl
     const args = [
       '--print', '--output-format', 'json', '--model', provider.model,
       '--permission-mode', 'bypassPermissions', '--strict-mcp-config',
-      '--mcp-config', mcpConfig(mcpUrl, mcpToken, accessToken)
+      '--mcp-config', mcpConfig(mcpUrl, mcpToken, accessToken),
+      ...(imagePaths.length ? ['--add-dir', home] : [])
     ];
     if (nativeSessionId) args.push('--resume', nativeSessionId);
+    // Claude Code can read local image files through its native file tools.
+    // The absolute paths are also included in the prompt for deterministic
+    // discovery across CLI versions.
     args.push(prompt);
     const output = await run('claude', args, {
       cwd: appRoot,
       env: { ANTHROPIC_API_KEY: provider.api_key, ANTHROPIC_BASE_URL: provider.base_url, CLAUDE_CONFIG_DIR: home },
-      timeoutMs: 150000
+      timeoutMs: 150000,
+      onStdout: (chunk) => onEvent?.({ type: 'agent_output', text: chunk.slice(-4000) })
     });
     const parsed = parseClaudeOutput(output.stdout);
     return { engine: selected, content: parsed.content, sessionId: parsed.sessionId || nativeSessionId || null };
@@ -130,15 +135,27 @@ export async function runAgentEngine({ engine, prompt, provider, appRoot, mcpUrl
     // `-C/--cd` belongs to `codex exec`, not the `exec resume` subcommand.
     // The child process already runs with `cwd: appRoot`, so resume does not
     // need a directory argument.
-    ? ['exec', 'resume', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', nativeSessionId, prompt]
-    : ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-C', appRoot, prompt];
+    ? ['exec', 'resume', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', ...imagePaths.flatMap((file) => ['-i', file]), nativeSessionId, prompt]
+    : ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', ...imagePaths.flatMap((file) => ['-i', file]), '-C', appRoot, prompt];
   const output = await run('codex', args, {
       cwd: appRoot,
       env: {
         CODEX_HOME: home, OPENAI_API_KEY: provider.api_key,
         FORWARD_MCP_TOKEN: accessToken || mcpToken || '', FORWARD_MCP_ACCESS_TOKEN: accessToken || ''
       },
-      timeoutMs: 150000
+      timeoutMs: 150000,
+      onStdout: (chunk) => {
+        for (const line of String(chunk).split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+          try {
+            const event = JSON.parse(line);
+            onEvent?.({
+              type: event.type || 'agent_event',
+              text: event.item?.text || event.item?.message || event.last_message || '',
+              item_type: event.item?.type || ''
+            });
+          } catch { /* diagnostics are intentionally omitted from the event stream */ }
+        }
+      }
     });
   const parsed = parseCodexOutput(output.stdout);
   return { engine: selected, content: parsed.content, sessionId: parsed.sessionId || nativeSessionId || null, sessionHome: home };

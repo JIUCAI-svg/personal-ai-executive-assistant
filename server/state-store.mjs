@@ -780,7 +780,7 @@ export class AssistantStateStore {
     });
   }
 
-  async appendMessage(thread, role, content, actionResult = null, attachments = []) {
+  async appendMessage(thread, role, content, actionResult = null, attachments = [], metadata = {}) {
     if (!thread?.id || !thread.save_full_conversation) return null;
     return this.mutate((state) => {
       const current = nowParts();
@@ -791,6 +791,7 @@ export class AssistantStateStore {
         content: normalizeText(content, 12000),
         action_result: actionResult,
         attachments: normalizeMessageAttachments(attachments),
+        request_id: normalizeNullableId(metadata?.request_id, 120),
         created_at: isoAt(current.date, current.time)
       };
       state.messages.push(message);
