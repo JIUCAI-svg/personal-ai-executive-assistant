@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { AssistantStateStore } from '../server/state-store.mjs';
+import { AssistantStateStore, buildDynamicPlan } from '../server/state-store.mjs';
 
 test('task timer lifecycle keeps completed tasks and supports reopen', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'forward-task-timer-'));
@@ -44,6 +44,28 @@ test('AI-created child tasks keep their parent relationship', async () => {
   assert.equal(plan.scheduled.some((item) => item.id === parent.id), false);
   assert.equal(displayed.some((item) => item.id === parent.id && item.display_only === true), true);
   assert.equal(displayed.some((item) => item.id === child.id), true);
+});
+
+test('parent display row remains when every child is deferred or sleeping', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'forward-task-parent-display-'));
+  const store = new AssistantStateStore(root);
+  const state = await store.bootstrap();
+  const parent = state.tasks[0];
+  await store.executeActions([{
+    type: 'create_subtask',
+    title: '需要顺延的子任务',
+    estimated_minutes: 120,
+    parent_task_id: parent.id
+  }]);
+  let persisted = await store.read();
+  const deferredPlan = buildDynamicPlan(persisted, { date: '2026-08-31', time: '00:30' });
+  assert.equal(deferredPlan.scheduled.length, 0);
+  assert.equal(deferredPlan.scheduled_display.some((item) => item.id === parent.id && item.display_only), true);
+
+  persisted.settings.show_sleep_plan = true;
+  const sleepingPlan = buildDynamicPlan(persisted, { date: '2026-08-31', time: '02:00' });
+  assert.equal(sleepingPlan.is_sleeping, true);
+  assert.equal(sleepingPlan.sleeping_tasks.some((item) => item.id === parent.id && item.display_only), true);
 });
 
 test('subtasks cannot create another nested task', async () => {

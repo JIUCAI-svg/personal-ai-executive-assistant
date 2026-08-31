@@ -479,23 +479,52 @@ function buildPlan(state, current = nowParts()) {
     if (runningSession?.task_id === taskId && activeTimer) return Math.max(stored, activeTimer.elapsed_seconds);
     return stored;
   };
+  const parentDisplayRow = (parent, date, childCount, extra = {}) => ({
+    id: parent.id,
+    title: parent.title,
+    project: taskProject(parent, state.projects)?.name || '未归类',
+    priority: parent.priority,
+    estimated_minutes: 0,
+    start: '', end: '', date: date || current.date,
+    status: parent.status,
+    due_at: parent.due_at,
+    notes: parent.notes || '',
+    parent_task_id: null,
+    parent_title: null,
+    child_count: childCount,
+    display_only: true,
+    ...extra
+  });
   const sleepingTasks = window.is_sleeping && state.settings.show_sleep_plan
-    ? candidateTaskItems.map((task) => ({
-      id: task.id,
-      title: task.title,
-      project: taskProject(task, state.projects)?.name || '未归类',
-      priority: task.priority,
-      estimated_minutes: Math.max(5, Math.min(720, Number(task.estimated_minutes) || 45)),
-      start: '', end: '', date: window.planning_date, status: task.status,
-      due_at: task.due_at, notes: task.notes || '',
-      parent_task_id: task.parent_task_id || null,
-      parent_title: parentTitle(task) || null,
-      long_task_id: task.long_task_id || null,
-      occurrence_date: task.occurrence_date || null,
-      actual_minutes: task.actual_minutes || 0,
-      actual_seconds: elapsedSecondsForTask(task.id),
-      sleeping: true
-    }))
+    ? (() => {
+      const rows = [];
+      const displayedParents = new Set();
+      for (const task of candidateTaskItems) {
+        const parent = task.parent_task_id ? taskById.get(task.parent_task_id) : null;
+        if (parent && !displayedParents.has(parent.id)) {
+          const childCount = state.tasks.filter((entry) => entry.parent_task_id === parent.id && ['open', 'in_progress', 'deferred', 'done'].includes(entry.status)).length;
+          rows.push(parentDisplayRow(parent, window.planning_date, childCount, { sleeping: true }));
+          displayedParents.add(parent.id);
+        }
+        rows.push({
+          id: task.id,
+          title: task.title,
+          project: taskProject(task, state.projects)?.name || '未归类',
+          priority: task.priority,
+          estimated_minutes: Math.max(5, Math.min(720, Number(task.estimated_minutes) || 45)),
+          start: '', end: '', date: window.planning_date, status: task.status,
+          due_at: task.due_at, notes: task.notes || '',
+          parent_task_id: task.parent_task_id || null,
+          parent_title: parentTitle(task) || null,
+          long_task_id: task.long_task_id || null,
+          occurrence_date: task.occurrence_date || null,
+          actual_minutes: task.actual_minutes || 0,
+          actual_seconds: elapsedSecondsForTask(task.id),
+          sleeping: true
+        });
+      }
+      return rows;
+    })()
     : [];
   const deferred = state.tasks
     .filter((task) => task.status === 'deferred' && (!task.long_task_id || task.occurrence_date === window.planning_date))
@@ -553,25 +582,21 @@ function buildPlan(state, current = nowParts()) {
       const parent = taskById.get(item.parent_task_id);
       if (parent) {
         const childCount = state.tasks.filter((task) => task.parent_task_id === parent.id && ['open', 'in_progress', 'deferred', 'done'].includes(task.status)).length;
-        scheduledDisplay.push({
-          id: parent.id,
-          title: parent.title,
-          project: taskProject(parent, state.projects)?.name || '未归类',
-          priority: parent.priority,
-          estimated_minutes: 0,
-          start: '', end: '', date: item.date,
-          status: parent.status,
-          due_at: parent.due_at,
-          notes: parent.notes || '',
-          parent_task_id: null,
-          parent_title: null,
-          child_count: childCount,
-          display_only: true
-        });
+        scheduledDisplay.push(parentDisplayRow(parent, item.date, childCount));
         displayedParents.add(parent.id);
       }
     }
     scheduledDisplay.push(item);
+  }
+
+  // A child may be deferred because the remaining window is too short. Keep
+  // its parent visible as context even when no child made it into `scheduled`.
+  for (const item of deferred) {
+    const parent = item.parent_task_id ? taskById.get(item.parent_task_id) : null;
+    if (!parent || displayedParents.has(parent.id)) continue;
+    const childCount = state.tasks.filter((task) => task.parent_task_id === parent.id && ['open', 'in_progress', 'deferred', 'done'].includes(task.status)).length;
+    scheduledDisplay.push(parentDisplayRow(parent, item.date, childCount));
+    displayedParents.add(parent.id);
   }
 
   return {

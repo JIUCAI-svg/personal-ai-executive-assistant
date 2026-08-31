@@ -132,8 +132,11 @@ function dynamicPlanToUi(dynamicPlan) {
       parentTitle: parentTaskId ? (item.parent_title || '') : '',
       isSubtask: Boolean(parentTaskId),
       tone: 'sleeping',
-      state: 'sleeping',
-      note: '睡眠时段不安排，起床后再继续',
+      displayOnly: item.display_only === true,
+      state: item.display_only ? 'group' : 'sleeping',
+      note: item.display_only
+        ? `${item.child_count || 0} 项子任务 · ${item.notes || '父任务总览'}`
+        : '睡眠时段不安排，起床后再继续',
       duration: item.estimated_minutes || 45
     };
   });
