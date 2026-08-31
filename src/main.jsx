@@ -1126,7 +1126,7 @@ function App() {
               <div className="schedule-list">
                 {plan.filter((item) => item.state !== 'deferred').map((item) => (
                   <div className={`schedule-item ${item.state} ${item.tone} ${item.isSubtask ? 'subtask' : ''}`} key={item.id}>
-                    <time>{item.start}</time><div className="schedule-line"><span /></div><div className="schedule-body">{item.isSubtask && item.parentTitle ? <><strong className="parent-task-title">{item.parentTitle}</strong><strong className="subtask-title"><span className="subtask-mark" aria-hidden="true">↳</span>{item.title}</strong></> : <strong>{item.title}</strong>}<small>{item.note}</small></div>{item.state === 'current' && <button className="done-button" onClick={markCurrentDone} aria-label={`完成${item.title}`}><Check size={16} /></button>}{item.state === 'done' && <Check size={16} className="done-check" />}
+                    <time>{item.start}</time><div className="schedule-line"><span /></div><div className="schedule-body"><strong className={item.isSubtask ? 'subtask-title' : ''}>{item.isSubtask && <span className="subtask-mark" aria-hidden="true">↳</span>}{item.title}</strong><small>{item.note}</small></div>{item.state === 'current' && <button className="done-button" onClick={markCurrentDone} aria-label={`完成${item.title}`}><Check size={16} /></button>}{item.state === 'done' && <Check size={16} className="done-check" />}
                   </div>
                 ))}
               </div>
