@@ -128,6 +128,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -904,14 +905,16 @@ private fun ForwardApp(activity: MainActivity) {
         var remoteProjects by remember { mutableStateOf(emptyList<RemoteProject>()) }
         var remoteTasks by remember { mutableStateOf(emptyList<RemoteTask>()) }
         var remoteLongTasks by remember { mutableStateOf(emptyList<RemoteLongTask>()) }
-        var remoteThreadId by remember { mutableStateOf<String?>(null) }
+        var remoteThreadId by remember {
+            mutableStateOf(AssistantSessionStore.currentThread(activity).takeIf(String::isNotBlank))
+        }
         var showSleepPlan by remember { mutableStateOf(false) }
         var initialStateLoading by remember { mutableStateOf(true) }
         var conversationOptions by remember { mutableStateOf(defaultConversationOptions("assistant")) }
         var threads by remember { mutableStateOf(emptyList<ConversationThread>()) }
         var threadLoading by remember { mutableStateOf(false) }
         var now by remember { mutableStateOf(LocalDateTime.now()) }
-        var messages by remember { mutableStateOf(emptyList<ChatMessage>()) }
+        var messages by remember { mutableStateOf(AssistantSessionStore.currentMessages(activity)) }
         var pendingImageData by remember { mutableStateOf<List<String>>(emptyList()) }
         var queuedMessages by remember { mutableStateOf(emptyList<Pair<String, List<String>>>()) }
         var showProjects by remember { mutableStateOf(false) }
@@ -934,6 +937,13 @@ private fun ForwardApp(activity: MainActivity) {
             showSleepPlan = state.plan?.showSleepPlan ?: showSleepPlan
             parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
             parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
+        }
+
+        LaunchedEffect(messages) {
+            // SharedPreferences is only a startup accelerator. The durable
+            // transcript is still loaded from the gateway and remains the
+            // source of truth.
+            AssistantSessionStore.saveCurrentMessages(activity, remoteThreadId, messages)
         }
 
         fun runStateOperation(keys: Set<String>, label: String, operation: suspend () -> RemoteState, onSuccess: () -> Unit = {}) {
@@ -1016,31 +1026,59 @@ private fun ForwardApp(activity: MainActivity) {
         }
         LaunchedEffect(Unit) {
             val initialSession = AssistantSessionStore.token(activity)
-            runCatching { gatewayFetchState(activity) }.onSuccess { state ->
-                    if (initialSession == AssistantSessionStore.token(activity)) applyRemoteState(state)
-                    runCatching { gatewayMemoryStatus(activity) }.onSuccess { memoryStatus = it }
-                }.also { initialStateLoading = false }
-            runCatching { gatewayListThreads(activity) }.onSuccess { loadedThreads ->
-                threads = loadedThreads
-                val pendingDeepLink = activity.pendingReplyThreadId()
-                val savedThreadId = AssistantSessionStore.currentThread(activity)
-                val resume = if (pendingDeepLink.isNullOrBlank()) {
-                    loadedThreads.firstOrNull { it.id == savedThreadId }
-                        ?: loadedThreads.firstOrNull { it.mode != "temporary" }
-                        ?: loadedThreads.firstOrNull()
-                } else null
-                if (resume != null) {
-                    threadLoading = true
-                    runCatching { gatewayLoadThread(activity, resume.id) }.onSuccess { detail ->
-                        remoteThreadId = detail.thread.id
-                        AssistantSessionStore.saveCurrentThread(activity, detail.thread.id)
-                        conversationOptions = detail.thread.toConversationOptions()
-                        messages = detail.messages
-                    }
-                    threadLoading = false
-                }
+            val pendingDeepLink = activity.pendingReplyThreadId()
+            val savedThreadId = AssistantSessionStore.currentThread(activity).takeIf { pendingDeepLink.isNullOrBlank() && it.isNotBlank() }
+            if (savedThreadId != null) threadLoading = true
+
+            // These reads are independent. In particular, the current thread
+            // no longer waits for the full state snapshot or history list.
+            val stateDeferred = async { runCatching { gatewayFetchState(activity) } }
+            val memoryDeferred = async { runCatching { gatewayMemoryStatus(activity) } }
+            val threadsDeferred = async { runCatching { gatewayListThreads(activity) } }
+            val currentThreadDeferred = async {
+                savedThreadId?.let { id -> runCatching { gatewayLoadThread(activity, id) } }
             }
-            runCatching { requestAiProviders(activity) }.onSuccess { providers ->
+            val providersDeferred = async { runCatching { requestAiProviders(activity) } }
+
+            // Render the known conversation as soon as its own request
+            // finishes. A slow state snapshot or memory status must not keep
+            // the chat screen blank.
+            val currentDetail = currentThreadDeferred.await()?.getOrNull()
+            if (currentDetail != null) {
+                remoteThreadId = currentDetail.thread.id
+                AssistantSessionStore.saveCurrentThread(activity, currentDetail.thread.id)
+                conversationOptions = currentDetail.thread.toConversationOptions()
+                messages = currentDetail.messages
+            }
+            threadLoading = false
+            stateDeferred.await().onSuccess { state ->
+                if (initialSession == AssistantSessionStore.token(activity)) applyRemoteState(state)
+            }
+            memoryDeferred.await().onSuccess { memoryStatus = it }
+                .also { initialStateLoading = false }
+
+            val loadedThreadsResult = threadsDeferred.await()
+            loadedThreadsResult.onSuccess { loadedThreads ->
+                threads = loadedThreads
+                if (currentDetail == null && pendingDeepLink.isNullOrBlank()) {
+                    val resume = loadedThreads.firstOrNull { it.id == savedThreadId }
+                        ?: loadedThreads.firstOrNull { it.mode != "temporary" } ?: loadedThreads.firstOrNull()
+                    if (resume != null) {
+                        threadLoading = true
+                        runCatching { gatewayLoadThread(activity, resume.id) }.onSuccess { detail ->
+                            remoteThreadId = detail.thread.id
+                            AssistantSessionStore.saveCurrentThread(activity, detail.thread.id)
+                            conversationOptions = detail.thread.toConversationOptions()
+                            messages = detail.messages
+                        }
+                    }
+                }
+                threadLoading = false
+            }.onFailure {
+                // Keep the local transcript visible while the next poll retries.
+                threadLoading = false
+            }
+            providersDeferred.await().onSuccess { providers ->
                 aiProviders = providers
                 val provider = providers.firstOrNull { it.id == selectedProviderId } ?: providers.firstOrNull { it.active } ?: providers.firstOrNull()
                 if (provider != null) {

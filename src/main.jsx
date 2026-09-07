@@ -51,6 +51,21 @@ function threadMessagesToUi(messages = []) {
   }));
 }
 
+function threadCacheKey(threadId) {
+  return threadId ? `forward.thread.messages.${threadId}` : '';
+}
+
+function readCachedThreadMessages(threadId) {
+  const key = threadCacheKey(threadId);
+  if (!key) return [];
+  try {
+    const value = JSON.parse(window.localStorage.getItem(key) || '[]');
+    return Array.isArray(value) ? value : [];
+  } catch {
+    return [];
+  }
+}
+
 function renderInlineMarkdown(value, keyPrefix) {
   const source = String(value || '');
   const tokens = /(`[^`\n]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__)/g;
@@ -160,7 +175,7 @@ function App() {
   const [planner, setPlanner] = useState(null);
   const [assistantState, setAssistantState] = useState(null);
   const [threadId, setThreadId] = useState(() => window.localStorage.getItem('forward.current.thread') || null);
-  const [messages, setMessages] = useState([]);
+  const [messages, setMessages] = useState(() => readCachedThreadMessages(window.localStorage.getItem('forward.current.thread')));
   const [agentActivity, setAgentActivity] = useState('');
   const [conversationMode, setConversationMode] = useState('daily_planning');
   const [projectId, setProjectId] = useState('');
@@ -231,6 +246,25 @@ function App() {
   const [pendingInteractions, setPendingInteractions] = useState({});
   const [chatHydrated, setChatHydrated] = useState(true);
 
+  // Keep a small local copy so a slow cloud request never makes an existing
+  // conversation appear empty on startup. The cloud transcript remains the
+  // source of truth and replaces this cache when it arrives.
+  useEffect(() => {
+    const key = threadCacheKey(threadId);
+    if (!key || !messages.length) return undefined;
+    const timer = window.setTimeout(() => {
+      try {
+        // Keep startup cache text-only. Image data URLs can be several MB and
+        // would either exceed localStorage or make the first paint expensive.
+        const cache = messages.slice(-200).map(({ id, role, time, text }) => ({ id, role, time, text }));
+        window.localStorage.setItem(key, JSON.stringify(cache));
+      } catch {
+        // Storage quota is best-effort; the durable server transcript is intact.
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [threadId, messages]);
+
   const mode = modes.find((item) => item.id === conversationMode) || modes[0];
   const projects = assistantState?.projects || [];
   const longTasks = assistantState?.long_tasks || [];
@@ -299,17 +333,24 @@ function App() {
 
   async function loadThreads(forceAuthentication = false, restoreLatest = false) {
     try {
+      const savedThreadId = window.localStorage.getItem('forward.current.thread');
+      // Start restoring the known conversation at the same time as the list
+      // request. The list is only needed to populate the history drawer; it
+      // should not gate the conversation that is already open.
+      const savedRestore = restoreLatest && savedThreadId
+        ? openThread(savedThreadId, forceAuthentication, true)
+        : null;
       const response = await apiFetch('/api/assistant/threads', {}, forceAuthentication);
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '读取对话历史失败');
       const nextThreads = payload.threads || [];
       setThreads(nextThreads);
       if (restoreLatest) {
-        const savedThreadId = window.localStorage.getItem('forward.current.thread');
-        const resumeId = savedThreadId && nextThreads.some((item) => item.id === savedThreadId)
-          ? savedThreadId
-          : (!threadId ? nextThreads[0]?.id : null);
-        if (resumeId) await openThread(resumeId, forceAuthentication);
+        if (savedThreadId && nextThreads.some((item) => item.id === savedThreadId)) {
+          await savedRestore;
+        } else if (nextThreads[0]?.id) {
+          await openThread(nextThreads[0].id, forceAuthentication);
+        }
       }
     } catch (error) {
       setNotice(error.message || '读取对话历史失败');
@@ -1064,9 +1105,9 @@ function App() {
     }
   }
 
-  async function openThread(id, forceAuthentication = false) {
+  async function openThread(id, forceAuthentication = false, preserveExisting = false) {
     try {
-      setChatHydrated(false);
+      if (!preserveExisting) setChatHydrated(false);
       const response = await apiFetch(`/api/assistant/threads/${id}`, {}, forceAuthentication);
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '读取对话失败');

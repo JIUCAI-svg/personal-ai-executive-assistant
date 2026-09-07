@@ -128,11 +128,45 @@ object AssistantSessionStore {
     private const val ACCESS_TOKEN = "supabase_access_token"
     private const val EMAIL = "supabase_email"
     private const val CURRENT_THREAD = "current_thread_id"
+    private const val CURRENT_MESSAGES = "current_thread_messages"
+    private const val CURRENT_MESSAGES_THREAD = "current_thread_messages_id"
     fun token(context: Context): String = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(ACCESS_TOKEN, "").orEmpty()
     fun email(context: Context): String = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(EMAIL, "").orEmpty()
     fun currentThread(context: Context): String = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(CURRENT_THREAD, "").orEmpty()
     fun saveCurrentThread(context: Context, threadId: String?) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(CURRENT_THREAD, threadId.orEmpty()).apply()
+        val editor = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(CURRENT_THREAD, threadId.orEmpty())
+        if (threadId.isNullOrBlank()) editor.remove(CURRENT_MESSAGES_THREAD).remove(CURRENT_MESSAGES)
+        editor.apply()
+    }
+    fun currentMessages(context: Context): List<ChatMessage> = runCatching {
+        val preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (preferences.getString(CURRENT_MESSAGES_THREAD, "").orEmpty() != currentThread(context)) return@runCatching emptyList()
+        val raw = preferences.getString(CURRENT_MESSAGES, "[]").orEmpty()
+        val array = JSONArray(raw)
+        (0 until array.length()).mapNotNull { index ->
+            array.optJSONObject(index)?.let { item ->
+                val text = item.optString("text")
+                if (text.isBlank()) null else ChatMessage(item.optBoolean("from_assistant"), text)
+            }
+        }
+    }.getOrDefault(emptyList())
+    fun saveCurrentMessages(context: Context, threadId: String?, messages: List<ChatMessage>) {
+        if (threadId.isNullOrBlank()) return
+        val array = JSONArray()
+        messages.takeLast(200).forEach { message ->
+            if (message.text.isNotBlank()) {
+                array.put(JSONObject()
+                    .put("from_assistant", message.fromAssistant)
+                    .put("text", message.text.take(12_000)))
+            }
+        }
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(CURRENT_MESSAGES_THREAD, threadId)
+            .putString(CURRENT_MESSAGES, array.toString()).apply()
+    }
+    fun clearCurrentMessages(context: Context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .remove(CURRENT_MESSAGES_THREAD).remove(CURRENT_MESSAGES).apply()
     }
     fun save(context: Context, accessToken: String, email: String) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(ACCESS_TOKEN, accessToken).putString(EMAIL, email).apply()
