@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createClient } from '@supabase/supabase-js';
 import {
@@ -8,6 +8,8 @@ import {
   Sparkles, SunMedium, Target, X, Zap, Play
 } from 'lucide-react';
 import './styles.css';
+import { createInteractionStateGuard } from './interaction-state.mjs';
+import { shouldAnimateChatScroll } from './chat-scroll.mjs';
 
 const appBasePath = String(import.meta.env.BASE_URL || '/').replace(/\/$/, '');
 function appPath(path) {
@@ -37,6 +39,16 @@ function messageTime(value) {
   if (!value) return timeNow();
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? timeNow() : parsed.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+function threadMessagesToUi(messages = []) {
+  return messages.map((message) => ({
+    id: message.id,
+    role: message.role,
+    time: messageTime(message.created_at),
+    text: message.content,
+    attachments: Array.isArray(message.attachments) ? message.attachments : []
+  }));
 }
 
 function renderInlineMarkdown(value, keyPrefix) {
@@ -213,7 +225,11 @@ function App() {
   const [providerDraft, setProviderDraft] = useState({ name: '', base_url: '', api_key: '', api_mode: 'chat_completions', models: '', selected_model: '', reasoning_efforts: 'low, medium, high' });
   const [showAiSettings, setShowAiSettings] = useState(false);
   const endRef = useRef(null);
+  const previousMessagesRef = useRef([]);
   const autoMemoryRunDateRef = useRef('');
+  const interactionGuard = useRef(createInteractionStateGuard());
+  const [pendingInteractions, setPendingInteractions] = useState({});
+  const [chatHydrated, setChatHydrated] = useState(true);
 
   const mode = modes.find((item) => item.id === conversationMode) || modes[0];
   const projects = assistantState?.projects || [];
@@ -250,6 +266,7 @@ function App() {
 
   async function apiFetch(path, options = {}, authentication = null) {
     const headers = new Headers(options.headers || {});
+    if (path.startsWith('/api/assistant/')) headers.set('X-Assistant-View', 'ui');
     const includeAuthentication = authentication === true || (authentication !== false && syncStatus.mode === 'cloud');
     if (session?.access_token && includeAuthentication) {
       headers.set('Authorization', `Bearer ${session.access_token}`);
@@ -262,7 +279,7 @@ function App() {
       const response = await apiFetch('/api/assistant/state', {}, forceAuthentication);
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '读取计划失败');
-      applyAssistantData(payload);
+      if (!applyAssistantData(payload)) return;
       const preferences = payload.state?.ai_preferences;
       if (preferences?.provider_id) setSelectedProviderId(preferences.provider_id);
       if (preferences?.model) setSelectedModel(preferences.model);
@@ -344,7 +361,7 @@ function App() {
     });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || '保存失败');
-    if (payload.state) setAssistantState(payload.state);
+    applyAssistantData(payload);
     if (typeof payload.state?.settings?.show_sleep_plan === 'boolean') setShowSleepPlan(payload.state.settings.show_sleep_plan);
     if (close) setShowAiSettings(false);
     return payload;
@@ -384,7 +401,7 @@ function App() {
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '每日整理失败');
-      if (payload.state) setAssistantState(payload.state);
+      applyAssistantData(payload);
       setMemoryStatus((current) => ({ ...(current || {}), latest_run: payload.run, summary: payload.summary || current?.summary || null }));
       if (!silent) {
         setNotice(payload.empty ? '今天还没有可整理的已保存对话。' : `已完成今日整理：新增 ${payload.created?.length || 0} 条待确认记忆。`);
@@ -493,6 +510,7 @@ function App() {
   }, []);
 
   function applyAssistantData(payload) {
+    if (!interactionGuard.current.accepts(payload.state)) return false;
     const dynamicPlan = payload.plan || payload.state?.plan;
     if (dynamicPlan) {
       setPlanner(dynamicPlan);
@@ -504,6 +522,24 @@ function App() {
     }
     if (payload.state) setAssistantState(payload.state);
     if (Array.isArray(payload.memoryRead)) setMemoryRead(payload.memoryRead);
+    return true;
+  }
+
+  function beginInteraction(keys, label) {
+    if (!interactionGuard.current.begin(keys)) return false;
+    setPendingInteractions((current) => ({ ...current, ...Object.fromEntries(keys.map((key) => [key, label])) }));
+    return true;
+  }
+
+  function finishInteraction(keys) {
+    interactionGuard.current.finish(keys);
+    setPendingInteractions((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !keys.includes(key))));
+  }
+
+  async function reconcileInteraction(error) {
+    setNotice(`${error.message || '请求未完成'}；正在核对最新状态，请勿重复提交。`);
+    await loadAssistantState(syncStatus.mode === 'cloud');
+    setNotice(`${error.message || '请求未完成'}；请核对最新状态后重试。`);
   }
 
   useEffect(() => {
@@ -559,9 +595,46 @@ function App() {
     return () => { active = false; };
   }, [assistantState?.updated_at, memoryAutoDaily, memoryDailyTime, memoryRunBusy]);
 
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  useLayoutEffect(() => {
+    if (messages.length > 0) {
+      const behavior = shouldAnimateChatScroll(previousMessagesRef.current, messages) ? 'smooth' : 'auto';
+      endRef.current?.scrollIntoView({ behavior, block: 'end' });
+    }
+    previousMessagesRef.current = messages;
+    if (!chatHydrated) setChatHydrated(true);
   }, [messages]);
+
+  // Proactive replies are written by the Android monitor or another browser,
+  // so the open conversation cannot rely on the initial history request alone.
+  // Reconcile the persisted thread while idle; this also replaces optimistic
+  // local messages with their durable IDs and prevents duplicate bubbles.
+  useEffect(() => {
+    if (!threadId || !chatHydrated || aiBusy) return undefined;
+    let active = true;
+    let inFlight = false;
+    const syncThread = async () => {
+      if (!active || inFlight) return;
+      inFlight = true;
+      try {
+        const response = await apiFetch(`/api/assistant/threads/${encodeURIComponent(threadId)}?limit=500`);
+        const payload = await response.json();
+        if (!response.ok || !active || payload.thread?.id !== threadId) return;
+        const nextMessages = threadMessagesToUi(payload.thread.messages || []);
+        setMessages((current) => {
+          const same = current.length === nextMessages.length && current.every((item, index) => {
+            const next = nextMessages[index];
+            return item.id === next.id && item.role === next.role && item.text === next.text
+              && JSON.stringify(item.attachments || []) === JSON.stringify(next.attachments || []);
+          });
+          return same ? current : nextMessages;
+        });
+      } catch { /* background reconciliation stays silent */ }
+      finally { inFlight = false; }
+    };
+    syncThread();
+    const interval = window.setInterval(syncThread, 5000);
+    return () => { active = false; window.clearInterval(interval); };
+  }, [threadId, chatHydrated, aiBusy, syncStatus.mode, session?.access_token]);
 
   useEffect(() => {
     if ('serviceWorker' in navigator) navigator.serviceWorker.register(appPath('/sw.js'), { scope: `${appBasePath || ''}/` }).catch(() => {});
@@ -612,6 +685,8 @@ function App() {
   }
 
   async function updateMemory(memory, status, content = memory.content) {
+    const keys = [`memory:${memory.id}`];
+    if (!beginInteraction(keys, status === 'active' ? '正在确认记忆' : '正在更新记忆')) return;
     try {
       const response = await apiFetch(`/api/assistant/memories/${memory.id}`, {
         method: 'PATCH',
@@ -626,10 +701,12 @@ function App() {
       applyAssistantData(payload);
       setEditingMemoryId(null);
       setMemoryDraft('');
-      setNotice(status === 'active' ? `已确认并写入知识库：${payload.relativePath}` : '这条记忆已忽略');
+      setNotice(status === 'active' ? `已确认并写入知识库：${payload.relativePath}` : status === 'archived' ? '这条记忆已忽略' : '记忆已更新');
       await loadVault(showVault);
     } catch (error) {
-      setNotice(error.message || '更新记忆失败');
+      await reconcileInteraction(error);
+    } finally {
+      finishInteraction(keys);
     }
   }
 
@@ -639,6 +716,8 @@ function App() {
 
   async function markCurrentDone() {
     if (!current || aiBusy) return;
+    const keys = ['timer', `task:${current.id}`];
+    if (!beginInteraction(keys, '正在完成任务')) return;
     setAiBusy(true);
     try {
       const response = await apiFetch('/api/assistant/actions', {
@@ -647,25 +726,30 @@ function App() {
           thread_id: threadId,
           task_id: current.id,
           conversation_mode: conversationMode,
-          actions: [{ type: 'complete_current_task', reason: '用户点击完成当前任务' }]
+          actions: [{ type: 'complete_task', task_id: current.id, reason: '用户点击完成当前任务' }]
         })
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '任务完成操作失败');
+      const rejected = payload.results?.find((item) => !item.ok);
+      if (rejected) throw new Error(rejected.reason || '任务完成操作失败');
       applyAssistantData(payload);
       loadThreads();
       const result = payload.results?.find((item) => item.ok);
       setNotice(result?.reason || '任务已完成，计划已重新安排');
       addAssistant(result?.title ? `已记下「${result.title}」完成，我已按今天的剩余时间更新后续安排。` : '任务已完成，我已更新今天后续安排。');
     } catch (error) {
-      setNotice(error.message || '任务操作失败');
+      await reconcileInteraction(error);
     } finally {
+      finishInteraction(keys);
       setAiBusy(false);
     }
   }
 
   async function setCurrentAndStart(item) {
     if (!item?.id || item.displayOnly || item.state === 'deferred' || item.state === 'sleeping' || aiBusy) return;
+    const keys = ['timer', `task:${item.id}`];
+    if (!beginInteraction(keys, '正在开始计时')) return;
     setAiBusy(true);
     try {
       const response = await apiFetch('/api/assistant/actions', {
@@ -678,11 +762,14 @@ function App() {
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '切换当前任务失败');
+      const rejected = payload.results?.find((item) => !item.ok);
+      if (rejected) throw new Error(rejected.reason || '切换当前任务失败');
       applyAssistantData(payload);
       loadThreads();
     } catch (error) {
-      setNotice(error.message || '切换当前任务失败');
+      await reconcileInteraction(error);
     } finally {
+      finishInteraction(keys);
       setAiBusy(false);
     }
   }
@@ -851,22 +938,23 @@ function App() {
       started: '已建立运行记录', accepted: '已接收消息', agent_started: 'Agent 正在运行',
       finalizing: '正在保存工具结果', completed: '已完成', failed: '运行出现错误'
     };
-    const monitor = async () => {
+    let stream = null;
+    const consumeRunEvent = (event) => {
       try {
-        const statusResponse = await apiFetch(`/api/assistant/runs/${encodeURIComponent(requestId)}`);
-        if (!statusResponse.ok) return;
-        const statusPayload = await statusResponse.json();
-        const latest = statusPayload.run?.events?.at(-1);
-        if (latest?.type === 'agent_event') {
-          const label = latest.item_type === 'command_execution' ? '正在执行工具'
-            : latest.item_type === 'agent_message' ? '正在生成回复'
-              : latest.event_type === 'thread.started' ? 'Agent 会话已连接' : 'Agent 正在处理';
+        const payload = JSON.parse(event.data || '{}');
+        if (payload.type === 'agent_event') {
+          const label = payload.item_type === 'command_execution' ? '正在执行工具'
+            : payload.item_type === 'agent_message' ? '正在生成回复'
+              : payload.event_type === 'thread.started' ? 'Agent 会话已连接' : 'Agent 正在处理';
           setAgentActivity(label);
-        } else if (latest?.type) setAgentActivity(activityLabels[latest.type] || 'Agent 正在处理');
-      } catch { /* the request itself remains the source of truth */ }
+        } else if (payload.type) setAgentActivity(activityLabels[payload.type] || 'Agent 正在处理');
+      } catch { /* ignore malformed keepalive frames */ }
     };
-    const monitorTimer = window.setInterval(monitor, 1200);
-    monitor();
+    try {
+      stream = new EventSource(appPath(`/api/assistant/runs/${encodeURIComponent(requestId)}/events`));
+      ['started', 'accepted', 'agent_started', 'agent_event', 'finalizing', 'completed', 'failed', 'closed'].forEach((name) => stream.addEventListener(name, consumeRunEvent));
+      stream.onerror = () => { /* POST/status remains the source of truth across reconnects */ };
+    } catch { stream = null; }
     try {
       const response = await apiFetch('/api/assistant/respond', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -891,30 +979,27 @@ function App() {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || 'AI 请求失败');
       applyAssistantData(payload);
-      addAssistant(payload.reply || '我已更新计划。');
+      addAssistant(payload.reply || '');
       loadThreads();
       const applied = (payload.actionResults || []).filter((item) => item.ok);
       setNotice(applied.length ? applied.map((item) => item.reason).join(' ') : (payload.plan?.adjustment_reason || '已保存本轮对话。'));
     } catch (error) {
-      setAgentActivity('正在确认后台运行结果');
+      // A short-lived socket failure can happen after the server committed the
+      // run. Reconcile once by request_id before surfacing the transport error.
       let recovered = false;
-      for (let attempt = 0; attempt < 12; attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 2500));
-        try {
-          const statusResponse = await apiFetch(`/api/assistant/runs/${encodeURIComponent(requestId)}`);
-          if (!statusResponse.ok) continue;
-          const statusPayload = await statusResponse.json();
-          if (statusPayload.run?.status === 'completed' && statusPayload.run?.thread_id) {
-            await openThread(statusPayload.run.thread_id);
-            recovered = true;
-            break;
-          }
-          if (statusPayload.run?.status === 'failed') break;
-        } catch { /* keep reconciling while the network recovers */ }
-      }
-      if (!recovered) setNotice(error.message || '本次请求仍在后台处理中');
+      try {
+        const statusResponse = await apiFetch(`/api/assistant/runs/${encodeURIComponent(requestId)}`);
+        const statusPayload = statusResponse.ok ? await statusResponse.json() : null;
+        const run = statusPayload?.run;
+        if (run?.status === 'completed') {
+          if (run.reply) addAssistant(run.reply);
+          if (run.thread_id) await openThread(run.thread_id);
+          recovered = true;
+        }
+      } catch { /* fall through to the original error */ }
+      if (!recovered) addAssistant(error.message || error.name || 'Error');
     } finally {
-      window.clearInterval(monitorTimer);
+      stream?.close();
       setAgentActivity('');
       setAiBusy(false);
     }
@@ -955,6 +1040,7 @@ function App() {
     setMessages([]);
     setMemoryRead([]);
     setThreadId(null);
+    setChatHydrated(true);
     window.localStorage.removeItem('forward.current.thread');
     setShowNewConversation(false);
     setShowConversationOptions(false);
@@ -980,6 +1066,7 @@ function App() {
 
   async function openThread(id, forceAuthentication = false) {
     try {
+      setChatHydrated(false);
       const response = await apiFetch(`/api/assistant/threads/${id}`, {}, forceAuthentication);
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '读取对话失败');
@@ -991,16 +1078,12 @@ function App() {
       setMemoryScope(Boolean(thread.memory_scope));
       setSaveTranscript(Boolean(thread.save_full_conversation));
       setDistillMemory(Boolean(thread.allow_memory_distillation));
-      setMessages((thread.messages || []).map((message) => ({
-        id: message.id,
-        role: message.role,
-        time: messageTime(message.created_at),
-        text: message.content,
-        attachments: Array.isArray(message.attachments) ? message.attachments : []
-      })));
+      setMessages(threadMessagesToUi(thread.messages || []));
+      if (!(thread.messages || []).length) setChatHydrated(true);
       setShowHistory(false);
       setNotice('已恢复这段对话及其上下文。');
     } catch (error) {
+      setChatHydrated(true);
       setNotice(error.message || '读取对话失败');
     }
   }
@@ -1183,7 +1266,7 @@ function App() {
               <div className="compact-next"><span>下一件事</span><strong>{next ? `${next.start} · ${next.title}` : '暂无'}</strong></div>
             </section>
 
-            <div className="conversation-stream">
+            <div className="conversation-stream" data-chat-ready={chatHydrated ? 'true' : 'false'}>
               <div className="unread-marker"><span>今天</span></div>
               {messages.map((message) => (
                 <article className={`message ${message.role}`} key={message.id}>
@@ -1192,7 +1275,7 @@ function App() {
                 </article>
               ))}
               {agentActivity && <div className="agent-live-status"><Sparkles size={14} /><span>{agentActivity}</span><span className="agent-live-dots" aria-hidden="true">···</span></div>}
-              {notice && <div className="change-note"><Sparkles size={15} /><span>{notice}</span></div>}
+              {(Object.keys(pendingInteractions).length > 0 || notice) && <div className="change-note" role="status"><Sparkles size={15} /><span>{Object.values(pendingInteractions)[0] || notice}</span></div>}
               <div ref={endRef} />
             </div>
 

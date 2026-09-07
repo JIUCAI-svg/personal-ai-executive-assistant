@@ -54,8 +54,18 @@ export const ASSISTANT_TOOLS = Object.freeze([
   },
   {
     name: 'schedule_followup',
-    description: '安排一次未来的主动唤醒；到时间后系统会再次让 AI 判断是否需要发消息或调整计划。',
-    parameters: { after_minutes: '多少分钟后唤醒', instruction: '到时间时需要重新判断的事项', reason: '安排原因' }
+    description: '安排一次未来的主动唤醒。用户明确要求“几分钟后给我发消息/提醒我”时，必须传 notify_user=true 和直接通知文案，手机到点必定显示该通知；只有“过会儿再判断”才让 AI 到点重新决定是否行动。',
+    parameters: { after_minutes: '多少分钟后唤醒', instruction: '到时间时需要重新判断的事项或用户原始提醒意图', notify_user: '明确直接提醒时为 true，否则为 false', message: 'notify_user=true 时要显示给用户的通知内容', reason: '安排原因' }
+  },
+  {
+    name: 'schedule_self_check',
+    description: '安排下一次主动状态检查，不直接通知用户；最长 10080 分钟。',
+    parameters: { after_minutes: '多少分钟后检查', instruction: '到时间时重新判断的事项', reason: '安排原因' }
+  },
+  {
+    name: 'send_proactive_message',
+    description: '发送一条主动提醒；只有确实需要打扰用户时调用。',
+    parameters: { message: '要展示给用户的消息', title: '可选通知标题', reason: '发送原因' }
   },
   {
     name: 'cancel_alarm',
@@ -175,7 +185,7 @@ export const ASSISTANT_TOOLS = Object.freeze([
 export const ASSISTANT_TOOL_NAMES = new Set(ASSISTANT_TOOLS.map((tool) => tool.name));
 
 const NUMBER_PARAMETERS = new Set(['estimated_minutes', 'daily_minutes', 'priority', 'target_minutes', 'minutes', 'after_minutes', 'limit']);
-const BOOLEAN_PARAMETERS = new Set(['visible', 'start_timer']);
+const BOOLEAN_PARAMETERS = new Set(['visible', 'start_timer', 'notify_user']);
 const REQUIRED_PARAMETERS = {
   get_now: [], get_today_plan: [], list_tasks: [], list_projects: [], get_app_usage: [],
   set_sleep_time: ['time'],
@@ -183,6 +193,8 @@ const REQUIRED_PARAMETERS = {
   set_buffer_minutes: ['minutes'],
   set_alarm: ['time'],
   schedule_followup: ['after_minutes', 'instruction'],
+  schedule_self_check: ['after_minutes', 'instruction'],
+  send_proactive_message: ['message'],
   cancel_task: ['task'],
   defer_task: ['task'],
   create_task: ['title'],
@@ -229,6 +241,11 @@ export const ASSISTANT_SKILLS = Object.freeze([
     name: 'daily_review',
     description: '围绕完成情况、阻碍、事件和明日优先级组织复盘。',
     tools: ['capture_memory', 'create_task', 'create_long_task', 'replan_today']
+  },
+  {
+    name: 'proactive_assistant',
+    description: '处理时间、任务、手机使用、计划偏差和主动复查信号。',
+    tools: ['send_proactive_message', 'schedule_self_check', 'schedule_followup']
   }
 ]);
 

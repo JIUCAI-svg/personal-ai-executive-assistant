@@ -1,4 +1,4 @@
-import { AssistantStateStore, createDefaultAssistantState, repairAssistantState } from './state-store.mjs';
+import { AssistantStateStore, createDefaultAssistantState, repairAssistantState, ensureDailyTaskInstances, stateWithPlan } from './state-store.mjs';
 
 function shanghaiTimestamp() {
   const parts = new Intl.DateTimeFormat('en-CA', {
@@ -17,7 +17,7 @@ function cloudError(message, code = 'SUPABASE_SYNC_ERROR') {
 }
 
 export class SupabaseStateStore extends AssistantStateStore {
-  constructor({ url, anonKey, accessToken, userId }) {
+  constructor({ url, anonKey, accessToken, userId, requestScoped = false }) {
     super('');
     this.url = String(url || '').replace(/\/$/, '');
     this.anonKey = String(anonKey || '');
@@ -25,6 +25,8 @@ export class SupabaseStateStore extends AssistantStateStore {
     this.userId = String(userId || '');
     this.revision = 0;
     this.snapshotExists = false;
+    this.requestScoped = requestScoped;
+    this.cachedState = null;
     this.pending = Promise.resolve();
   }
 
@@ -77,8 +79,21 @@ export class SupabaseStateStore extends AssistantStateStore {
   }
 
   async read() {
+    if (this.requestScoped && this.cachedState) return this.cachedState;
     const snapshot = await this.loadSnapshot();
-    return snapshot ? repairAssistantState(snapshot.state) : createDefaultAssistantState();
+    const state = snapshot ? repairAssistantState(snapshot.state) : createDefaultAssistantState();
+    if (this.requestScoped) this.cachedState = state;
+    return state;
+  }
+
+  async bootstrap() {
+    let state = await this.read();
+    // Cloud existence is determined by its snapshot, not the local vault path.
+    // Only initialization and actual day-rollover maintenance need a write.
+    if (!this.snapshotExists || ensureDailyTaskInstances(state)) {
+      state = await this.mutate((draft) => draft);
+    }
+    return stateWithPlan(state, this.revision, `cloud:${this.userId}`);
   }
 
   async save(state, expectedRevision) {
@@ -99,14 +114,18 @@ export class SupabaseStateStore extends AssistantStateStore {
     const work = this.pending.then(async () => {
       let lastError;
       for (let attempt = 0; attempt < 2; attempt += 1) {
-        const state = await this.read();
+        const state = structuredClone(await this.read());
         const expectedRevision = this.revision;
+        ensureDailyTaskInstances(state);
         const result = await operation(state);
         state.updated_at = shanghaiTimestamp();
+        state.state_revision = expectedRevision + 1;
         try {
           await this.save(state, expectedRevision);
+          if (this.requestScoped) this.cachedState = state;
           return result;
         } catch (error) {
+          this.cachedState = null;
           lastError = error;
           if (error?.code !== 'STATE_CONFLICT') throw error;
         }

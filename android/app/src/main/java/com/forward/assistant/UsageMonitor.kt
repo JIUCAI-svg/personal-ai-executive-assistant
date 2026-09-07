@@ -34,27 +34,90 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.time.LocalDate
 import java.time.LocalDateTime
+import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 private const val USAGE_CHECK_INTERVAL_MS = 5 * 60 * 1000L
 private const val USAGE_UPLOAD_INTERVAL_MS = 15 * 60 * 1000L
+private const val ACTION_PROCESS_FOLLOWUP = "com.forward.assistant.action.PROCESS_FOLLOWUP"
+private const val PROACTIVE_THRESHOLD_MINUTES = 10
+private const val DEFAULT_SLEEP_MINUTES = 23 * 60 + 30
+private const val DEFAULT_WAKE_MINUTES = 8 * 60
+
+/** Stable keys let the gateway collapse the five-minute polling repeats. */
+internal fun phoneUsageIdempotencyKey(
+    packageName: String,
+    sessionStartedAt: Long,
+    currentSessionMinutes: Int,
+    thresholdMinutes: Int = PROACTIVE_THRESHOLD_MINUTES
+): String {
+    val threshold = thresholdMinutes.coerceAtLeast(1)
+    // Keep one key for the entire foreground session. Polling may observe the
+    // same session at 10, 15 and 20 minutes, but it remains one signal window.
+    return "phone_usage:${packageName.trim()}:$sessionStartedAt:threshold_$threshold"
+}
+
+internal fun selfCheckIdempotencyKey(followupId: String): String =
+    "schedule_self_check:${followupId.trim()}"
+
+internal fun isWithinLocalSleepWindow(now: LocalTime, sleep: LocalTime, wake: LocalTime): Boolean {
+    val currentMinutes = now.toSecondOfDay() / 60
+    val sleepMinutes = sleep.toSecondOfDay() / 60
+    val wakeMinutes = wake.toSecondOfDay() / 60
+    if (sleepMinutes == wakeMinutes) return false
+    return if (sleepMinutes > wakeMinutes) {
+        currentMinutes >= sleepMinutes || currentMinutes < wakeMinutes
+    } else {
+        currentMinutes >= sleepMinutes && currentMinutes < wakeMinutes
+    }
+}
+
+private fun configuredSleepWindow(context: Context): Pair<LocalTime, LocalTime> {
+    val prefs = context.getSharedPreferences("planner", Context.MODE_PRIVATE)
+    val sleep = usageLocalTimeFromMinutes(prefs.getInt("sleep_time", DEFAULT_SLEEP_MINUTES))
+    val wake = usageLocalTimeFromMinutes(prefs.getInt("wake_time", DEFAULT_WAKE_MINUTES))
+    return sleep to wake
+}
+
+private fun usageLocalTimeFromMinutes(minutes: Int): LocalTime =
+    LocalTime.of((minutes / 60).coerceIn(0, 23), (minutes % 60).coerceIn(0, 59))
+
+private fun isWithinConfiguredSleepWindow(context: Context, now: LocalTime = LocalTime.now(ZoneId.systemDefault())): Boolean {
+    val (sleep, wake) = configuredSleepWindow(context)
+    return isWithinLocalSleepWindow(now, sleep, wake)
+}
+
+private fun normalizedDeviceActionType(type: String): String? = when (type.trim()) {
+    "set_alarm", "cancel_alarm", "schedule_followup" -> type.trim()
+    // The server keeps this semantic name; Android schedules it through the
+    // same local follow-up receiver and dispatcher.
+    "schedule_self_check" -> "schedule_followup"
+    else -> null
+}
 
 private fun assistantDeviceActionsFromJson(array: JSONArray?): List<AssistantAction> {
     if (array == null) return emptyList()
     return (0 until array.length()).mapNotNull { index ->
         val action = array.optJSONObject(index) ?: return@mapNotNull null
-        val type = action.optString("type").trim()
-        if (type != "set_alarm" && type != "cancel_alarm") return@mapNotNull null
+        val sourceType = action.optString("type").trim()
+        val type = normalizedDeviceActionType(sourceType) ?: return@mapNotNull null
         AssistantAction(
             type = type,
             time = action.optString("time").ifBlank { null },
             date = action.optString("date").ifBlank { null },
             label = action.optString("label").ifBlank { null },
             repeat = action.optString("repeat").ifBlank { null },
-            alarmId = action.optString("id").ifBlank {
+            alarmId = if (type == "schedule_followup") null else action.optString("id").ifBlank {
                 action.optString("alarm_id").ifBlank { null }
-            }
+            },
+            followupId = if (type == "schedule_followup") action.optString("id").ifBlank {
+                action.optString("followup_id").ifBlank { null }
+            } else null,
+            afterMinutes = if (action.has("after_minutes")) action.optInt("after_minutes") else null,
+            instruction = action.optString("instruction").ifBlank { action.optString("reason").ifBlank { null } },
+            notifyUser = action.optBoolean("notify_user", false),
+            message = action.optString("message").ifBlank { null }
         )
     }
 }
@@ -117,6 +180,7 @@ object UsageMonitorStore {
     private const val KEY_DEVICE_ACTIVITY = "device_activity"
     private const val KEY_AUTO_TOP_TEN = "auto_top_ten"
     private const val KEY_PLAN_SUMMARY = "plan_summary"
+    private const val KEY_LAST_AI_PROACTIVE_PREFIX = "ai_proactive_"
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     fun enabled(context: Context): Boolean = prefs(context).getBoolean("enabled", false)
@@ -278,6 +342,13 @@ object UsageMonitorStore {
         prefs(context).edit().putString("last_event", event).apply()
     }
 
+    fun shouldSendAiProactive(context: Context, key: String): Boolean =
+        key.isNotBlank() && prefs(context).getString(KEY_LAST_AI_PROACTIVE_PREFIX + key, "").orEmpty() != key
+
+    fun markAiProactiveSent(context: Context, key: String) {
+        if (key.isNotBlank()) prefs(context).edit().putString(KEY_LAST_AI_PROACTIVE_PREFIX + key, key).apply()
+    }
+
     fun shouldSendDailyReminder(context: Context, date: LocalDate, packageName: String): Boolean {
         val key = "daily_reminder_$packageName"
         return prefs(context).getString(key, null) != date.toString()
@@ -292,13 +363,6 @@ object UsageMonitorStore {
 
     fun markSessionReminderSent(context: Context, sessionStart: Long, packageName: String) {
         prefs(context).edit().putLong("session_reminder_$packageName", sessionStart).apply()
-    }
-
-    fun shouldSendAiProactive(context: Context, sessionStart: Long, packageName: String): Boolean =
-        sessionStart > 0L && prefs(context).getLong("ai_proactive_$packageName", 0L) != sessionStart
-
-    fun markAiProactiveSent(context: Context, sessionStart: Long, packageName: String) {
-        prefs(context).edit().putLong("ai_proactive_$packageName", sessionStart).apply()
     }
 
     fun shouldUpload(context: Context): Boolean {
@@ -416,7 +480,13 @@ class UsageMonitorService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (!UsageMonitorStore.enabled(this)) stopSelf()
+        if (intent?.action == ACTION_PROCESS_FOLLOWUP) {
+            startForeground(UsageMonitorNotification.ONGOING_ID, buildOngoingNotification())
+            serviceScope.launch {
+                evaluateDueFollowups(UsageMonitorStore.snapshot(this@UsageMonitorService), intent.getStringExtra(AlarmScheduler.EXTRA_ID))
+                if (!UsageMonitorStore.enabled(this@UsageMonitorService)) stopSelf(startId)
+            }
+        } else if (!UsageMonitorStore.enabled(this)) stopSelf()
         else startForeground(UsageMonitorNotification.ONGOING_ID, buildOngoingNotification())
         return START_STICKY
     }
@@ -457,11 +527,13 @@ class UsageMonitorService : Service() {
         evaluateDueFollowups(snapshot)
     }
 
-    private suspend fun evaluateDueFollowups(snapshot: UsageMonitorSnapshot) = withContext(Dispatchers.IO) {
+    private suspend fun evaluateDueFollowups(snapshot: UsageMonitorSnapshot, requestedFollowupId: String? = null) = withContext(Dispatchers.IO) {
+        if (isWithinConfiguredSleepWindow(this@UsageMonitorService)) return@withContext
         val configuredUrl = BuildConfig.AI_GATEWAY_URL.trim()
         if (configuredUrl.isBlank()) return@withContext
         val base = if (configuredUrl.endsWith("/api/assistant/respond")) configuredUrl.removeSuffix("/api/assistant/respond") else configuredUrl.trimEnd('/')
-        val connection = (URL("$base/api/assistant/followups/due").openConnection() as HttpURLConnection).apply {
+        val dueUrl = "$base/api/assistant/followups/due" + requestedFollowupId?.takeIf { it.isNotBlank() }?.let { "?followup_id=${java.net.URLEncoder.encode(it, "UTF-8")}" }.orEmpty()
+        val connection = (URL(dueUrl).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"; connectTimeout = 5_000; readTimeout = 8_000; useCaches = false
             if (BuildConfig.AI_GATEWAY_TOKEN.isNotBlank()) setRequestProperty("x-forward-token", BuildConfig.AI_GATEWAY_TOKEN)
             AssistantSessionStore.token(this@UsageMonitorService).takeIf { it.isNotBlank() }?.let { setRequestProperty("Authorization", "Bearer $it") }
@@ -473,8 +545,15 @@ class UsageMonitorService : Service() {
             for (index in 0 until due.length()) {
                 val item = due.optJSONObject(index) ?: continue
                 val event = item.optString("instruction").ifBlank { "到达了预定的主动检查时间。" }
+                val followupId = item.optString("id").trim()
+                val threadId = AssistantSessionStore.currentThread(this@UsageMonitorService).takeIf { it.isNotBlank() }
                 val payload = JSONObject().apply {
+                    put("type", "schedule_self_check")
+                    put("timezone", ZoneId.systemDefault().id)
+                    put("idempotency_key", selfCheckIdempotencyKey(followupId))
+                    threadId?.let { put("thread_id", it) }
                     put("event", event); put("instruction", item.optString("instruction"));
+                    put("followup_id", followupId)
                     put("app_usage", JSONArray().apply { snapshot.targetApps.forEach { target -> put(JSONObject().apply { put("app", target.appName); put("package_name", target.packageName); put("today_minutes", target.dailyMinutes); put("current_session_minutes", target.currentSessionMinutes); put("in_foreground", target.isInForeground); put("date", LocalDate.now().toString()); put("source", "android-usage-monitor") }) } })
                 }.toString().toByteArray(Charsets.UTF_8)
                 val proactive = (URL("$base/api/assistant/proactive").openConnection() as HttpURLConnection).apply {
@@ -488,9 +567,14 @@ class UsageMonitorService : Service() {
                     if (proactive.responseCode in 200..299) {
                         val result = proactive.inputStream.bufferedReader().use { it.readText() }
                         val responseJson = JSONObject(result)
+                        val responseThreadId = responseJson.optString("thread_id").ifBlank {
+                            responseJson.optJSONObject("thread")?.optString("id").orEmpty()
+                        }.ifBlank { threadId.orEmpty() }.takeIf { it.isNotBlank() }
                         assistantDeviceActionsFromJson(responseJson.optJSONArray("deviceActions"))
                             .forEach { action -> AlarmScheduler.apply(this@UsageMonitorService, action) }
-                        responseJson.optString("reply").trim().takeIf { it.isNotBlank() }?.let { UsageMonitorNotification.send(this@UsageMonitorService, "向前", it) }
+                        responseJson.optString("reply").trim().takeIf { it.isNotBlank() }?.let {
+                            UsageMonitorNotification.sendProactive(this@UsageMonitorService, responseThreadId, it)
+                        }
                     }
                 } finally { proactive.disconnect() }
             }
@@ -498,13 +582,23 @@ class UsageMonitorService : Service() {
     }
 
     private suspend fun evaluateAiProactive(targetSnapshots: List<UsageAppSnapshot>, snapshot: UsageMonitorSnapshot) {
-        targetSnapshots.filter { it.isInForeground && it.currentSessionMinutes >= 10 && UsageMonitorStore.shouldSendAiProactive(this, it.sessionStartedAt, it.packageName) }
+        if (isWithinConfiguredSleepWindow(this@UsageMonitorService)) return
+        // The gateway owns whether an event warrants a response. A stable key
+        // is also persisted locally so five-minute polling cannot re-trigger
+        // the same foreground session after the gateway has accepted it.
+        targetSnapshots.filter { it.isInForeground && it.currentSessionMinutes >= PROACTIVE_THRESHOLD_MINUTES && it.sessionStartedAt > 0L }
             .forEach { target ->
-                UsageMonitorStore.markAiProactiveSent(this, target.sessionStartedAt, target.packageName)
                 val configuredUrl = BuildConfig.AI_GATEWAY_URL.trim()
                 if (configuredUrl.isBlank()) return@forEach
+                val idempotencyKey = phoneUsageIdempotencyKey(target.packageName, target.sessionStartedAt, target.currentSessionMinutes)
+                if (!UsageMonitorStore.shouldSendAiProactive(this@UsageMonitorService, idempotencyKey)) return@forEach
                 val endpoint = if (configuredUrl.endsWith("/api/assistant/respond")) configuredUrl.removeSuffix("/api/assistant/respond") + "/api/assistant/proactive" else configuredUrl.trimEnd('/') + "/api/assistant/proactive"
+                val threadId = AssistantSessionStore.currentThread(this@UsageMonitorService).takeIf { it.isNotBlank() }
                 val payload = JSONObject().apply {
+                    put("type", "phone_usage")
+                    put("timezone", ZoneId.systemDefault().id)
+                    put("idempotency_key", idempotencyKey)
+                    threadId?.let { put("thread_id", it) }
                     put("event", "手机检测到 ${target.appName} 已连续使用约 ${target.currentSessionMinutes} 分钟。")
                     put("app_usage", JSONArray().put(JSONObject().apply {
                         put("enabled", snapshot.enabled); put("app", target.appName); put("package_name", target.packageName)
@@ -524,14 +618,18 @@ class UsageMonitorService : Service() {
                         connection.outputStream.use { output -> output.write(payload) }
                         val body = (if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream)?.bufferedReader()?.use { it.readText() }.orEmpty()
                         if (connection.responseCode !in 200..299) error(JSONObject(body).optString("error", "主动判断请求失败"))
+                        UsageMonitorStore.markAiProactiveSent(this@UsageMonitorService, idempotencyKey)
                         val responseJson = JSONObject(body)
+                        val responseThreadId = responseJson.optString("thread_id").ifBlank {
+                            responseJson.optJSONObject("thread")?.optString("id").orEmpty()
+                        }.ifBlank { threadId.orEmpty() }.takeIf { it.isNotBlank() }
                         assistantDeviceActionsFromJson(responseJson.optJSONArray("deviceActions"))
                             .forEach { action ->
                                 val outcome = AlarmScheduler.apply(this, action)
                                 if (!outcome.ok) UsageMonitorStore.saveEvent(this, "主动闹钟操作失败：${outcome.message}")
                             }
                         val reply = responseJson.optString("reply").trim()
-                        if (reply.isNotBlank()) UsageMonitorNotification.send(this, "向前", reply)
+                        if (reply.isNotBlank()) UsageMonitorNotification.sendProactive(this, responseThreadId, reply)
                     } finally { connection.disconnect() }
                 }.onFailure { UsageMonitorStore.saveEvent(this, "主动判断请求失败：${it.message.orEmpty()}") }
             }
@@ -693,7 +791,8 @@ class UsageMonitorService : Service() {
                 put("updated_at", snapshot.updatedAt); put("source", "android-usage-monitor")
             }) }
         }.toString().toByteArray(Charsets.UTF_8)
-        val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+        val connection = (URL(gatewayUiUrl(endpoint)).openConnection() as HttpURLConnection).apply {
+            setRequestProperty("X-Assistant-View", "ui")
             requestMethod = "POST"
             connectTimeout = 5_000
             readTimeout = 8_000
@@ -802,5 +901,9 @@ object UsageMonitorNotification {
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
         context.getSystemService(NotificationManager::class.java).notify("$title:$text".hashCode(), notification)
+    }
+
+    fun sendProactive(context: Context, threadId: String?, text: String) {
+        if (proactiveNotificationShouldNotify(threadId)) send(context, "向前", text)
     }
 }

@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import chokidar from 'chokidar';
 import express from 'express';
 import matter from 'gray-matter';
-import { AssistantStateStore } from './state-store.mjs';
+import { AssistantStateStore, projectAssistantUiState } from './state-store.mjs';
 import { SupabaseStateStore } from './supabase-state-store.mjs';
 import { loadAiProviders, normalizeAiProviderDraft, providerCatalog, saveAiProviders, selectAiProvider } from './ai-providers.mjs';
 import { assistantEndpoint, buildAssistantModelRequest, extractAssistantText, extractAssistantToolCalls, upstreamErrorMessage } from './ai-protocol.mjs';
@@ -20,6 +20,7 @@ import {
   assistantToolPrompt
 } from './assistant-tools.mjs';
 import { agentEngineCatalog, runAgentEngine } from './agent-adapters.mjs';
+import { isWithinProactiveSleepWindow, normalizeProactiveSignal } from './proactive-signals.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(__dirname, '..');
@@ -149,6 +150,14 @@ async function persistAgentImages(attachments, directory) {
 // x-forward-token remain supported; arbitrary Internet clients do not.
 app.use('/api/assistant', (request, response, next) => {
   if (!requireGatewayAccess(request, response)) return;
+  // Opt-in wire projection only: internal store, Agent/MCP, export and thread
+  // detail reads continue to operate on the complete immutable source history.
+  if (request.query.view === 'ui' || request.get('x-assistant-view') === 'ui') {
+    const json = response.json.bind(response);
+    response.json = (payload) => json(payload?.state
+      ? { ...payload, state: projectAssistantUiState(payload.state) }
+      : payload);
+  }
   next();
 });
 
@@ -194,8 +203,13 @@ async function requestStateStore(request) {
     return { store: stateStore, source: 'local', user: null };
   }
   const user = await authenticatedSupabaseUser(request);
+  // Short UI requests can reuse their own snapshot. Long-running Agent and
+  // organizer requests must observe mutations from tools/other requests.
+  const endpointPath = String(request.originalUrl || request.url || '').split('?')[0];
+  const requestScoped = /^\/api\/assistant\/(?:state|actions|memories(?:\/|$)|tasks(?:\/|$)|projects(?:\/|$)|long-tasks(?:\/|$)|threads(?:\/|$)|preferences|usage|sleep-wake(?:\/|$)|daily-reviews)$/.test(endpointPath)
+    || /^\/api\/assistant\/(?:memories|tasks|projects|long-tasks|threads|sleep-wake)\//.test(endpointPath);
   return {
-    store: new SupabaseStateStore({ url: supabaseUrl, anonKey: supabaseAnonKey, accessToken: user.accessToken, userId: user.id }),
+    store: new SupabaseStateStore({ url: supabaseUrl, anonKey: supabaseAnonKey, accessToken: user.accessToken, userId: user.id, requestScoped }),
     source: 'cloud',
     user
   };
@@ -661,11 +675,15 @@ function normalizeActions(actions) {
       ...(Number.isFinite(Number(action.priority)) ? { priority: Math.max(1, Math.min(5, Number(action.priority))) } : {}),
       ...(Number.isFinite(Number(action.target_minutes)) ? { target_minutes: Math.max(1, Math.min(720, Number(action.target_minutes))) } : {}),
       ...(Number.isFinite(Number(action.minutes)) ? { minutes: Math.max(0, Math.min(1440, Number(action.minutes))) } : {}),
+      ...(Number.isFinite(Number(action.after_minutes)) ? { after_minutes: Math.max(1, Math.min(10080, Math.round(Number(action.after_minutes)))) } : {}),
       ...(typeof action.visible === 'boolean' ? { visible: action.visible } : {}),
       ...(typeof action.start_timer === 'boolean' ? { start_timer: action.start_timer } : {}),
+      ...(typeof action.notify_user === 'boolean' ? { notify_user: action.notify_user } : {}),
       ...(stringValue(action.project, 80) ? { project: stringValue(action.project, 80) } : {}),
       ...(stringValue(action.due_at, 40) ? { due_at: stringValue(action.due_at, 40) } : {}),
       ...(stringValue(action.date, 10) ? { date: stringValue(action.date, 10) } : {}),
+      ...(stringValue(action.instruction, 500) ? { instruction: stringValue(action.instruction, 500) } : {}),
+      ...(stringValue(action.message, 500) ? { message: stringValue(action.message, 500) } : {}),
       ...(stringValue(action.reason, 240) ? { reason: stringValue(action.reason, 240) } : {})
     }));
 }
@@ -749,6 +767,32 @@ function parseAssistantContent(content) {
   };
 }
 
+function deviceActionsFromExecution(execution) {
+  return execution.results
+    .filter((item) => item.device_required)
+    .map((item) => ({ type: item.type, ...(item.alarm || {}), ...(item.followup || {}) }));
+}
+
+function deviceExecutionReply(reply, execution) {
+  const original = String(reply || '').trim();
+  const deviceResults = (execution?.results || []).filter((item) => item?.device_required);
+  if (!deviceResults.length) return original;
+  const failures = deviceResults.filter((item) => item.ok === false);
+  if (failures.length) {
+    return `${original}\n\n设备执行失败：${failures.map((item) => item.reason || '手机未能执行该操作。').join('；')}`.trim();
+  }
+  const pending = deviceResults.filter((item) => {
+    const entity = item.alarm || item.followup;
+    return ['pending_device', 'cancel_pending_device'].includes(entity?.status)
+      || ['pending', 'cancel_pending'].includes(entity?.device_status);
+  });
+  if (pending.length) {
+    return `${original}\n\n已提交到手机，等待设备执行确认。`.trim();
+  }
+  return original;
+}
+
+
 function parseNaturalAssistantContent(content) {
   const reply = String(content || '').trim();
   return { reply: reply || '我在听。', actions: [], memoryCandidates: [] };
@@ -805,7 +849,8 @@ ${assistantToolPrompt()}
 - 用户说“今天不做、跳过、顺延、明天再做”时，使用 defer_task，该任务保留但移到之后；取消和顺延不能混用。
 - 用户说外出或某段时间不可用时，使用 set_unavailable_period；用户说疲惫时，使用 defer_task 推迟高消耗任务，并使用 replan_today。
 - 用户说“叫我起床”“提醒我”“设置闹钟”时，使用 set_alarm；时间必须明确，日期不明确时设置为下一次即将到来的时间。用户说“取消闹钟”时使用 cancel_alarm。手机执行结果会单独返回，只有收到设备结果后才能说已经设置成功。
-- 当用户要求“过一会儿再提醒我”“多少分钟后再看一下”时，使用 schedule_followup；只记录需要重新判断的事项，不预设固定提醒文案或必然动作。到时间后由 AI 自己决定是否提醒、重排或保持安静。
+- 用户明确要求“多少分钟后给我发信息、提醒我、叫我”时，使用 schedule_followup，并设置 notify_user=true 与简洁的 message。它是手机本地的必达通知，到点后不得再次交给 AI 决定是否保持安静。只有“过一会儿再看一下、之后判断是否要提醒”才使用 notify_user=false；到时间后由 AI 自己决定是否提醒、重排或保持安静。
+- 系统主动事件中，只有调用 send_proactive_message 才算真正向用户投递消息；没有必要打扰时不要调用它。需要稍后再次判断时使用 schedule_self_check，并将 after_minutes 控制在 1 到 10080 之间。
 - 用户新增一件独立事项时，使用 create_task；不要直接声称它已经加入计划而没有 action。若未给预计时长，按合理的最小可执行时长估计，并在回复中说明。
 - 用户说“子任务、下面安排、拆成一项”时，使用 create_subtask，并把 parent_task_id 设置为上下文中对应一级父任务的真实 ID；优先从 project_tasks、today_plan 或 current_task 中匹配，不要只把“子任务”写进标题。子任务自动继承父任务项目，不能创建子子任务。
 - 上下文中的 app_usage 是手机本地监控提供的真实使用摘要和每日记录，不是可选工具。若 current 或 daily_history 存在，必须把它们视为当前事实；可以根据今日累计时长、连续时长、历史趋势和上限解释提醒或重排计划，但不要推断用户在应用中看了什么，也不要把每一次使用记录自动沉淀为长期记忆。
@@ -1041,10 +1086,16 @@ app.post('/api/mcp', async (request, response, next) => {
       return response.status(400).json(mcpError(id, -32602, `未注册的工具：${name || '空工具名'}`));
     }
     const { store, source } = await requestStateStore(request);
+    // MCP clients send the tool call body separately from the connection URL.
+    // Keep the thread/request context in the URL so native Agent calls mutate
+    // the same conversation and their device actions can return to Android.
+    const mcpRequestId = stringValue(params.request_id || request.query.request_id, 120);
+    const mcpThreadId = stringValue(params.thread_id || request.query.thread_id, 80);
+    const mcpProjectId = stringValue(params.project_id || request.query.project_id, 100);
     const thread = await resolveConversationThread(store, {
-      thread_id: params.thread_id,
+      thread_id: mcpThreadId,
       conversation_mode: params.conversation_mode || 'assistant',
-      project_id: params.project_id,
+      project_id: mcpProjectId,
       conversation_options: params.conversation_options
     });
     const argumentsValue = mcpArguments(params.arguments);
@@ -1122,6 +1173,16 @@ app.post('/api/mcp', async (request, response, next) => {
       persist_action_log: thread.mode !== 'temporary' || thread.save_full_conversation
     });
     const result = execution.results[0] || { type: name, ok: false, reason: '工具没有返回执行结果。' };
+    const agentRun = mcpRequestId ? activeRuns.get(mcpRequestId) : null;
+    if (agentRun) {
+      agentRun.agent_action_results = [...(agentRun.agent_action_results || []), result].slice(-80);
+      if (result.device_required && result.ok) {
+        agentRun.agent_device_actions = [
+          ...(agentRun.agent_device_actions || []),
+          { type: result.type, ...(result.alarm || {}), ...(result.followup || {}) }
+        ].slice(-20);
+      }
+    }
     const payload = {
       source,
       thread_id: thread.id,
@@ -1157,6 +1218,33 @@ async function resolveConversationThread(store, body = {}) {
     allow_memory_distillation: options.allow_memory_distillation ?? (mode !== 'temporary')
   });
   return { ...thread, project_name: project?.name || '' };
+}
+
+async function resolveProactiveConversationThread(store, requestedThreadId = '') {
+  const requested = stringValue(requestedThreadId, 160);
+  if (requested) {
+    const existing = await store.getThread(requested);
+    if (existing) return existing;
+  }
+
+  // A monitor may run before the Android process has persisted its current
+  // thread. Reuse the latest durable non-temporary conversation so the reply
+  // remains discoverable in the normal history view.
+  const latest = (await store.listThreads(200))
+    .find((item) => item.mode !== 'temporary');
+  if (latest?.id) {
+    const existing = await store.getThread(latest.id);
+    if (existing) return existing;
+  }
+
+  // A first proactive event still needs a destination. Creating one here
+  // makes the notification deep-linkable and prevents an orphan reply.
+  return store.createThread({
+    mode: 'assistant',
+    memory_scope: true,
+    save_full_conversation: true,
+    allow_memory_distillation: false
+  });
 }
 
 function threadProjectName(thread, state) {
@@ -1502,7 +1590,7 @@ app.post('/api/assistant/actions', async (request, response, next) => {
     });
     response.json({
       ok: true, source, thread, ...execution,
-      deviceActions: execution.results.filter((item) => item.device_required).map((item) => ({ type: item.type, ...(item.alarm || {}) })),
+      deviceActions: deviceActionsFromExecution(execution),
       state: await store.bootstrap()
     });
   } catch (error) { next(error); }
@@ -1660,9 +1748,9 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       project_name: projectName,
       conversation
     };
-    async function finishAssistantResponse(result, degraded = false) {
+    async function finishAssistantResponse(result, degraded = false, executionOverride = null) {
       runEvent(run, 'finalizing', { action_count: Array.isArray(result.actions) ? result.actions.length : 0 });
-      const execution = await store.executeActions(result.actions, {
+      const execution = executionOverride || await store.executeActions(result.actions, {
         thread_id: hydratedThread.id, project_id: hydratedThread.project_id,
         task_id: stringValue(context.current_task_id, 80),
         allow_memory_distillation: hydratedThread.allow_memory_distillation,
@@ -1682,6 +1770,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         else if (deferred) result.reply = `已把「${deferred.title}」顺延，今天不再安排它。`;
         else if (sleep || wake) result.reply = `作息已更新：${sleep ? `今晚 ${sleep.value} 睡觉` : ''}${sleep && wake ? '，' : ''}${wake ? `明天 ${wake.value} 起床` : ''}。我已按新的可用时间重排计划。`;
       }
+      result.reply = deviceExecutionReply(result.reply, execution);
       const pendingMemories = await store.addMemoryCandidates(result.memoryCandidates, hydratedThread);
       const assistantMessage = await store.appendMessage(hydratedThread, 'assistant', result.reply, execution.results, [], { request_id: requestId });
       const transcriptPath = await appendConversationTranscript(hydratedThread, [
@@ -1694,9 +1783,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         toolResults: execution.results,
           memoryCandidates: result.memoryCandidates, pendingMemories, memoryRead: knowledge,
         appUsage: appUsages,
-        deviceActions: execution.results
-          .filter((item) => item.device_required)
-          .map((item) => ({ type: item.type, ...(item.alarm || {}) })),
+        deviceActions: deviceActionsFromExecution(execution),
         plan: execution.plan, transcriptPath, messageIds: { user: userMessage?.id || null, assistant: assistantMessage?.id || null },
         request_id: requestId, state: await store.bootstrap()
       };
@@ -1708,6 +1795,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       try {
         const accessToken = accessTokenFromRequest(request);
         const mcpUrl = `http://127.0.0.1:${port}/api/mcp?thread_id=${encodeURIComponent(hydratedThread.id)}${hydratedThread.project_id ? `&project_id=${encodeURIComponent(hydratedThread.project_id)}` : ''}`;
+        const agentMcpUrl = `${mcpUrl}&request_id=${encodeURIComponent(requestId)}`;
         const agentSessionHome = path.join(appRoot, '.forward-assistant', 'agent-sessions', hydratedThread.id);
         const imagePaths = await persistAgentImages(attachments, agentSessionHome);
         runEvent(run, 'agent_started', { engine: selectedAgent, image_count: imagePaths.length });
@@ -1722,7 +1810,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
           `用户消息：${message}`
         ].join('\n\n');
         const agentResult = await runAgentEngine({
-          engine: selectedAgent, prompt: agentPrompt, provider, appRoot, mcpUrl,
+          engine: selectedAgent, prompt: agentPrompt, provider, appRoot, mcpUrl: agentMcpUrl,
           mcpToken: aiGatewayToken, accessToken,
           nativeSessionId: hydratedThread.agent_session_id || '',
           sessionHome: agentSessionHome,
@@ -1735,10 +1823,22 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         if (agentResult.sessionId && agentResult.sessionId !== hydratedThread.agent_session_id) {
           await store.updateThreadAgentSession(hydratedThread.id, agentResult.sessionId);
         }
-        return finishAssistantResponse({ reply: agentResult.content || '我已经处理好了。', actions: [], memoryCandidates: [] });
+        // Preserve the native Agent result exactly. An empty result is still an
+        // empty result; do not replace it with an application-generated reply.
+        const agentExecution = {
+          results: run.agent_action_results || [],
+          plan: (await store.bootstrap()).plan
+        };
+        return finishAssistantResponse(
+          { reply: agentResult.content || '', actions: [], memoryCandidates: [] },
+          false,
+          agentExecution
+        );
       } catch (error) {
         console.error(`Agent ${selectedAgent} failed`, error?.message || 'unknown');
-        throw requestError(`${selectedAgent === 'codex' ? 'Codex' : 'Claude Code'} 执行失败：${error?.message || '未知错误'}`, 502, 'AGENT_ENGINE_FAILED');
+        // The Agent CLI is the source of truth. Keep its original error text so
+        // callers can distinguish an upstream failure from an app-generated one.
+        throw requestError(error?.message || String(error), Number(error?.status) || 502, 'AGENT_ENGINE_FAILED');
       }
     }
 
@@ -1768,7 +1868,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
     const requestId = stringValue(request.body?.request_id, 120);
     const run = requestId ? activeRuns.get(requestId) : null;
     if (run) finishRun(run, 'failed', { error: error?.message || '请求处理失败。' });
-    if (error instanceof SyntaxError) return response.status(502).json({ error: 'AI 返回格式异常，请重试。' });
+    if (error instanceof SyntaxError) return response.status(502).json({ error: error.message || String(error), code: 'UPSTREAM_PARSE_ERROR' });
     next(error);
   }
 });
@@ -1841,7 +1941,28 @@ app.use((error, _request, response, _next) => {
 const androidApkPath = path.join(appRoot, 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
 app.get('/download/forward.apk', (_request, response) => {
   if (!existsSync(androidApkPath)) return response.status(404).json({ error: 'Android 安装包尚未生成。' });
-  response.download(androidApkPath, 'forward-assistant-v0.7.0-agent-recovery-debug.apk');
+  response.download(androidApkPath, 'forward-assistant-v0.7.0-proactive-signals-debug.apk');
+});
+
+app.post('/api/assistant/device-actions/status', async (request, response, next) => {
+  try {
+    if (!bridgeAuthorized(request, response)) return;
+    const { store, source } = await requestStateStore(request);
+    const event = request.body || {};
+    const result = await store.recordDeviceAction({
+      action: stringValue(event.action || event.type, 40),
+      alarm_id: stringValue(event.alarm_id || event.id, 120),
+      followup_id: stringValue(event.followup_id, 120),
+      device_id: stringValue(event.device_id, 160),
+      status: stringValue(event.status, 40),
+      error: stringValue(event.error || event.message, 500),
+      trigger_at: stringValue(event.trigger_at, 80),
+      event_at: stringValue(event.event_at, 80),
+      event_id: stringValue(event.event_id, 160)
+    });
+    if (!result?.ok) return response.status(404).json({ error: result?.reason || '没有找到对应的设备动作。' });
+    response.json({ ok: true, source, ...result, state: await store.bootstrap() });
+  } catch (error) { next(error); }
 });
 
 app.get('/api/assistant/runs/:id', async (request, response, next) => {
@@ -1871,18 +1992,39 @@ app.get('/api/assistant/runs/:id', async (request, response, next) => {
 
 app.get('/api/assistant/runs/:id/events', async (request, response, next) => {
   try {
-    await requestStateStore(request);
+    const { store } = await requestStateStore(request);
     const requestId = stringValue(request.params.id, 120);
-    const run = activeRuns.get(requestId);
-    response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive' });
-    const send = (event) => response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+    response.write(': connected\n\n');
+    const send = (event) => {
+      if (response.writableEnded) return;
+      response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      if (event.type === 'completed' || event.type === 'failed' || event.type === 'closed') response.end();
+    };
+    // The browser may subscribe just before POST /respond creates the run.
+    // Keep the stream open briefly so that initial started/accepted events are
+    // delivered instead of racing to a misleading `closed` terminal event.
+    let run = activeRuns.get(requestId);
+    if (!run) {
+      const deadline = Date.now() + 10_000;
+      while (!run && !request.destroyed && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        run = activeRuns.get(requestId);
+      }
+    }
     if (run) {
       run.events.forEach(send);
-      run.listeners.add(send);
+      if (run.status === 'processing') run.listeners.add(send);
       request.on('close', () => run.listeners.delete(send));
     } else {
-      send({ type: 'closed', at: new Date().toISOString() });
-      response.end();
+      // Runs are retained in the transcript after the in-memory entry expires;
+      // emit a terminal event so a refreshed client can reconcile by request_id.
+      const state = await store.bootstrap();
+      const messages = (state.messages || []).filter((item) => item.request_id === requestId);
+      const assistant = messages.find((item) => item.role === 'assistant');
+      if (messages.length) {
+        send({ type: assistant ? 'completed' : 'closed', at: new Date().toISOString(), status: assistant ? 'completed' : 'processing', reply: assistant?.content || '' });
+      } else send({ type: 'closed', at: new Date().toISOString(), status: 'unknown' });
     }
   } catch (error) { next(error); }
 });
@@ -1891,17 +2033,8 @@ app.get('/api/assistant/followups/due', async (request, response, next) => {
   try {
     if (!assistantAuthorized(request, response)) return;
     const { store, source } = await requestStateStore(request);
-    const state = await store.bootstrap();
-    const now = Date.now();
-    const due = (state.followups || []).filter((item) => item.status === 'scheduled' && Date.parse(item.due_at) <= now);
-    if (due.length) {
-      await store.mutate((nextState) => {
-        nextState.followups = (nextState.followups || []).map((item) => due.some((entry) => entry.id === item.id)
-          ? { ...item, status: 'dispatched', dispatched_at: new Date().toISOString(), updated_at: new Date().toISOString() }
-          : item);
-        return nextState;
-      });
-    }
+    const followupId = stringValue(request.query.followup_id, 120);
+    const due = await store.claimDueFollowups(Date.now(), followupId);
     response.json({ ok: true, source, followups: due });
   } catch (error) { next(error); }
 });
@@ -1911,40 +2044,104 @@ app.post('/api/assistant/proactive', async (request, response, next) => {
     if (!assistantAuthorized(request, response)) return;
     const { store, source } = await requestStateStore(request);
     const body = request.body || {};
+    const signal = normalizeProactiveSignal(body, {
+      timezone: body.timezone || body.device_timezone
+    });
+    if (!signal.type) return response.status(400).json({ error: '主动信号类型无效。', code: 'PROACTIVE_SIGNAL_INVALID' });
     const state = await store.bootstrap();
-    const usage = normalizeAppUsages(body.app_usage || []);
+    const usage = normalizeAppUsages(signal.payload.app_usage || body.app_usage || []);
     for (const entry of usage) await store.recordAppUsage(entry);
     const current = await store.bootstrap();
+    const followupId = stringValue(body.followup_id, 120);
+    const requestedThreadId = stringValue(body.thread_id || body.followup_thread_id || current.followups?.find((item) => item.id === followupId)?.thread_id, 160);
+    const claimed = await store.claimProactiveRun(signal, { thread_id: requestedThreadId, timezone: signal.timezone });
+    if (!claimed.claimed) {
+      return response.json({ ok: true, source, duplicate: true, signal: claimed.signal, run: claimed.run, thread_id: claimed.run?.thread_id || requestedThreadId || null, reply: '', actions: [], actionResults: [], deviceActions: [], plan: current.plan });
+    }
+    const run = claimed.run;
+    // Proactive events can be raised by the background monitor when the UI has
+    // no current thread loaded. Keep the generated reply in a durable assistant
+    // conversation instead of showing a notification that has no chat record.
+    const proactiveThread = await resolveProactiveConversationThread(store, requestedThreadId);
+    const threadId = proactiveThread?.id || requestedThreadId || null;
+    // Legacy callers that only sent a free-form event remain manual checks.
+    // Explicit device/signal envelopes participate in the persisted sleep gate.
+    const typedSignal = Boolean(body.type || body.signal_type || body.signal || body.followup_id || body.followupId || body.device_activity);
+    const sleeping = typedSignal && isWithinProactiveSleepWindow(current.settings, new Date(signal.observed_at), signal.timezone);
+    if (sleeping) {
+      const finished = await store.finishProactiveRun(run.id, { status: 'suppressed', thread_id: threadId, delivered: false, delivery_status: 'suppressed_sleep' });
+      return response.json({ ok: true, source, suppressed: true, reason: 'sleep_window', signal: claimed.signal, run: finished.run, reply: '', actions: [], actionResults: [], deviceActions: [], plan: current.plan });
+    }
     const provider = selectAiProvider(aiProviderRegistry, current.ai_preferences?.provider_id, current.ai_preferences?.model, aiModel, current.ai_preferences?.reasoning_effort || aiReasoningEffort);
-    if (!provider) return response.status(503).json({ error: '尚未配置可用的 AI 提供商或模型。' });
-    const eventText = stringValue(body.event, 800) || '系统刚刚检测到一项需要重新判断的状态。';
-    const instruction = stringValue(body.instruction, 800);
-    const prompt = `${eventText}${instruction ? `\n需要重新判断：${instruction}` : ''}\n请自行判断是否需要主动提醒、调整计划或安排下一次检查。没有必要时保持安静，不要机械回复。`;
+    if (!provider) {
+      await store.finishProactiveRun(run.id, { status: 'failed', error: '尚未配置可用的 AI 提供商或模型。' });
+      return response.status(503).json({ error: '尚未配置可用的 AI 提供商或模型。', code: 'AI_PROVIDER_NOT_CONFIGURED' });
+    }
+    const eventText = signal.event || '系统刚刚检测到一项需要重新判断的状态。';
+    const instruction = signal.instruction;
+    const prompt = `${eventText}${instruction ? `\n需要重新判断：${instruction}` : ''}\n信号类型：${signal.type}\n请自行判断是否需要主动提醒、调整计划或安排下一次检查。没有必要时保持安静，不要机械回复。`;
+    const recentThreadMessages = proactiveThread ? await store.recentMessages(threadId, 12) : [];
     const plan = current.plan;
-    const result = await requestAssistantModel({
-      provider, model: provider.model, temperature: 0.45,
-      ...(provider.reasoning_effort ? { reasoning_effort: provider.reasoning_effort } : {}),
-      tools: toolDefinitionsForProvider(provider), tool_choice: 'auto',
-      messages: [
-        { role: 'system', content: assistantSystemPrompt() },
-        { role: 'system', content: '这是一个系统主动事件，不是用户普通发言。你拥有完整计划上下文，请根据事实自主决定是否行动；若不需要提醒，回复空内容且不调用工具。' },
-        { role: 'system', content: `当前上下文：${JSON.stringify({ now: plan.now, planning_date: plan.planning_date, today_plan: plan.scheduled, current_task: plan.current_task, sleep_time: plan.sleep_time, wake_time: plan.wake_time, app_usage: usage, followups: current.followups })}` },
-        { role: 'user', content: prompt }
-      ]
+    let result;
+    let execution;
+    try {
+      result = await requestAssistantModel({
+        provider, model: provider.model, temperature: 0.45,
+        ...(provider.reasoning_effort ? { reasoning_effort: provider.reasoning_effort } : {}),
+        tools: toolDefinitionsForProvider(provider), tool_choice: 'auto',
+        messages: [
+          { role: 'system', content: assistantSystemPrompt() },
+          { role: 'system', content: '这是一个系统主动事件，不是用户普通发言。你拥有完整计划上下文，请根据事实自主决定是否行动；若不需要提醒，回复空内容且不调用工具。需要真正打扰用户时必须调用 send_proactive_message；仅仅返回文字不算已投递。' },
+          { role: 'system', content: `当前上下文：${JSON.stringify({ now: plan.now, planning_date: plan.planning_date, today_plan: plan.scheduled, current_task: plan.current_task, sleep_time: plan.sleep_time, wake_time: plan.wake_time, app_usage: usage, followups: current.followups })}` },
+          ...recentThreadMessages.map((item) => ({ role: item.role === 'assistant' ? 'assistant' : 'user', content: stringValue(item.content, 2_000) })).filter((item) => item.content),
+          { role: 'user', content: prompt }
+        ]
+      });
+      execution = await store.executeActions(result.result.actions, {
+        thread_id: threadId,
+        project_id: proactiveThread?.project_id || null,
+        persist_action_log: true
+      });
+    } catch (error) {
+      if (followupId) await store.completeFollowup(followupId, { failed: true, error: error?.message || String(error) });
+      await store.finishProactiveRun(run.id, { status: 'failed', error: error?.message || String(error) });
+      throw error;
+    }
+    const followup = followupId ? await store.completeFollowup(followupId, { reply: result.result.reply || '' }) : null;
+    const deliveredResult = execution.results.find((item) => item.type === 'send_proactive_message' && item.ok && item.delivered === true);
+    let assistantMessage = null;
+    if (deliveredResult && proactiveThread) {
+      assistantMessage = await store.appendProactiveAssistantMessage(
+        proactiveThread,
+        deliveredResult.message || result.result.reply || '',
+        execution.results,
+        { run_id: run.id, signal_id: claimed.signal.signal_id, delivered: true, delivery_status: 'delivered', notification: deliveredResult.notification }
+      );
+    }
+    const finished = await store.finishProactiveRun(run.id, {
+      status: 'completed', thread_id: proactiveThread?.id || threadId || null,
+      reply: deliveredResult?.message || '', delivered: Boolean(deliveredResult),
+      delivery_status: deliveredResult ? 'delivered' : 'silent', action_results: execution.results
     });
-    const execution = await store.executeActions(result.result.actions, { persist_action_log: true });
     response.json({
       ok: true,
       source,
-      reply: result.result.reply || '',
+      thread_id: proactiveThread?.id || threadId || null,
+      reply: deliveredResult?.message || '',
       actions: result.result.actions,
       actionResults: execution.results,
       // Device-only operations are returned separately so Android can execute
       // them locally after the server has persisted the intent.
-      deviceActions: execution.results
-        .filter((item) => item.device_required)
-        .map((item) => ({ type: item.type, ...(item.alarm || {}) })),
-      plan: execution.plan
+      deviceActions: deviceActionsFromExecution(execution),
+      plan: execution.plan,
+      ...(followup ? { followup } : {}),
+      signal: claimed.signal,
+      run: finished.run,
+      delivered: Boolean(deliveredResult),
+      notifications: deliveredResult ? [deliveredResult.notification] : [],
+      ...(assistantMessage ? { message: assistantMessage } : {}),
+      persisted: Boolean(assistantMessage),
+      delivery_status: deliveredResult ? (assistantMessage ? 'delivered' : 'delivered_without_transcript') : 'silent'
     });
   } catch (error) { next(error); }
 });
@@ -2021,11 +2218,22 @@ watcher.on('all', (_event, changedPath) => {
   sendEvent({ revision, change: 'updated', relativePath: path.relative(vaultPath, changedPath).replaceAll('\\', '/') });
 });
 
-app.listen(port, '0.0.0.0', () => {
-  console.log(`Knowledge bridge listening on http://0.0.0.0:${port}`);
-  console.log(`Vault: ${vaultPath}`);
-  console.log('Daily memory organization: server scheduler enabled (Asia/Shanghai, default 22:00)');
-  void maybeRunAutomaticMemoryOrganization();
+// Initialize the local state file before opening the port. Health checks are
+// used by the web/mobile clients as a readiness signal, so returning healthy
+// while the first bootstrap write is still pending creates a startup race.
+async function startServer() {
+  await stateStore.bootstrap();
+  app.listen(port, '0.0.0.0', () => {
+    console.log(`Knowledge bridge listening on http://0.0.0.0:${port}`);
+    console.log(`Vault: ${vaultPath}`);
+    console.log('Daily memory organization: server scheduler enabled (Asia/Shanghai, default 22:00)');
+    void maybeRunAutomaticMemoryOrganization();
+  });
+}
+
+void startServer().catch((error) => {
+  console.error('Knowledge bridge failed to initialize:', error);
+  process.exitCode = 1;
 });
 
 const memoryScheduler = setInterval(() => { void maybeRunAutomaticMemoryOrganization(); }, 30_000);

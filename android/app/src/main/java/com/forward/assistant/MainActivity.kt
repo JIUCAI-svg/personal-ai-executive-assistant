@@ -3,6 +3,7 @@ package com.forward.assistant
 import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.TimePickerDialog
 import android.content.Context
 import android.content.Intent
@@ -242,10 +243,19 @@ data class AssistantAction(
     val label: String? = null,
     val repeat: String? = null,
     val alarmId: String? = null,
+    val followupId: String? = null,
+    val afterMinutes: Int? = null,
+    val instruction: String? = null,
+    val notifyUser: Boolean = false,
+    val message: String? = null,
     val dueAt: String? = null,
     val projectId: String? = null
     , val visible: Boolean? = null
 )
+
+private fun normalizedDeviceActionType(rawType: String): String =
+    if (rawType.trim() == "schedule_self_check") "schedule_followup" else rawType.trim()
+
 data class DeviceActionResult(val action: AssistantAction, val result: AlarmOperationResult)
 data class AssistantResult(
     val reply: String,
@@ -411,8 +421,17 @@ private fun remoteScheduledItem(item: RemotePlanItem, deferred: Boolean): Schedu
 }
 
 private fun normalizeRemotePlanItems(remote: RemotePlan, now: LocalDateTime): List<ScheduledPlanItem> {
-    val displaySource = remote.scheduledDisplay
-    val source = if (displaySource.isNotEmpty()) displaySource else remote.scheduled + remote.sleeping + remote.deferred
+    // Keep every server-side bucket visible in one stable list. Previously the
+    // presence of scheduled_display hid deferred tasks until the scheduled
+    // bucket became empty, which made items appear to jump in around midnight.
+    // The same task can occur in scheduled_display and scheduled, so de-duplicate
+    // by its real id while retaining the server's display order.
+    val source = (remote.scheduledDisplay + remote.scheduled + remote.deferred + remote.sleeping.takeIf { remote.showSleepPlan }.orEmpty())
+        .filter { it.id.isNotBlank() }
+        .distinctBy { it.id }
+    val scheduledIds = remote.scheduled.map { it.id }.toSet()
+    val deferredIds = remote.deferred.map { it.id }.toSet()
+    val sleepingIds = remote.sleeping.map { it.id }.toSet()
     val hasMissingTimes = remote.scheduled.any { it.start.isBlank() || it.end.isBlank() } ||
         (remote.scheduled.isEmpty() && remote.deferred.isNotEmpty())
     // If the gateway gives task totals but no actual slots, the slots are stale
@@ -424,11 +443,18 @@ private fun normalizeRemotePlanItems(remote: RemotePlan, now: LocalDateTime): Li
     // Keep the server order and rebuild only the visual time slots locally.
     var cursor = now.withSecond(0).withNano(0).plusMinutes(5)
     return source.filter { it.status != "done" }.map { item ->
-        val start = cursor
-        val end = cursor.plusMinutes(item.minutes.toLong())
-        cursor = end
         val planItem = PlanItem(item.title, listOf(item.project, item.notes).filter(String::isNotBlank).joinToString(" · "), item.minutes, remoteTone(item.priority), id = item.id, priority = item.priority, actualMinutes = item.actualMinutes, actualSeconds = item.actualSeconds, isSubtask = item.parentTaskId != null, parentTitle = item.parentTitle, displayOnly = item.displayOnly, childCount = item.childCount)
-        ScheduledPlanItem(planItem, start, end)
+        // Only tasks in the real scheduled bucket receive synthetic time slots.
+        // Deferred and sleeping items stay visibly deferred instead of being
+        // presented as if they were executable right now.
+        if (item.displayOnly || item.id in deferredIds || item.id in sleepingIds || item.id !in scheduledIds) {
+            ScheduledPlanItem(planItem, deferredByCapacity = !item.displayOnly)
+        } else {
+            val start = cursor
+            val end = cursor.plusMinutes(item.minutes.toLong())
+            cursor = end
+            ScheduledPlanItem(planItem, start, end)
+        }
     }
 }
 
@@ -548,13 +574,13 @@ private suspend fun requestAssistant(
         })
     }
     val payloadBytes = payload.toString().toByteArray(Charsets.UTF_8)
-    val connection = (URL(aiGatewayUrl).openConnection() as HttpURLConnection).apply {
+    val connection = (URL(gatewayUiUrl(aiGatewayUrl)).openConnection() as HttpURLConnection).apply {
+        setRequestProperty("X-Assistant-View", "ui")
         requestMethod = "POST"
         connectTimeout = 8_000
         // Codex/Claude can legitimately run for a few minutes while using
-        // tools. Result recovery handles disconnects, but avoid ending the
-        // normal request before the Agent has a chance to finish.
-        readTimeout = 180_000
+        // tools, so the foreground request itself has no artificial deadline.
+        readTimeout = 0
         doOutput = true
         useCaches = false
         setFixedLengthStreamingMode(payloadBytes.size)
@@ -570,12 +596,13 @@ private suspend fun requestAssistant(
         check(connection.responseCode in 200..299) { JSONObject(body).optString("error", "AI 网关请求失败") }
         val json = JSONObject(body)
         AssistantResult(
-            reply = json.optString("reply", "我已经处理好了。"),
+            reply = json.optString("reply"),
             actions = json.optJSONArray("actions")?.let { array ->
                 (0 until array.length()).mapNotNull { index ->
                     val action = array.optJSONObject(index) ?: return@mapNotNull null
+                    val type = normalizedDeviceActionType(action.optString("type"))
                     AssistantAction(
-                        type = action.optString("type"),
+                        type = type,
                         minutes = if (action.has("minutes")) action.optInt("minutes") else null,
                         time = action.optString("time").ifBlank { null },
                         task = action.optString("task").ifBlank { null },
@@ -585,7 +612,12 @@ private suspend fun requestAssistant(
                         date = action.optString("date").ifBlank { null },
                         label = action.optString("label").ifBlank { null },
                         repeat = action.optString("repeat").ifBlank { null },
-                        alarmId = action.optString("alarm_id").ifBlank { null }
+                        alarmId = action.optString("alarm_id").ifBlank { null },
+                        followupId = action.optString("followup_id").ifBlank { null },
+                        afterMinutes = if (action.has("after_minutes")) action.optInt("after_minutes") else null,
+                        instruction = action.optString("instruction").ifBlank { action.optString("reason").ifBlank { null } },
+                        notifyUser = action.optBoolean("notify_user", false),
+                        message = action.optString("message").ifBlank { null }
                         , visible = if (action.has("visible")) action.optBoolean("visible") else null
                     )
                 }
@@ -593,14 +625,24 @@ private suspend fun requestAssistant(
             deviceActions = json.optJSONArray("deviceActions")?.let { array ->
                 (0 until array.length()).mapNotNull { index ->
                     val action = array.optJSONObject(index) ?: return@mapNotNull null
+                    val type = normalizedDeviceActionType(action.optString("type"))
+                    val actionId = action.optString("id").ifBlank {
+                        if (type == "schedule_followup") action.optString("followup_id")
+                        else action.optString("alarm_id")
+                    }.ifBlank { null }
                     AssistantAction(
-                        type = action.optString("type"),
+                        type = type,
                         minutes = if (action.has("minutes")) action.optInt("minutes") else null,
                         time = action.optString("time").ifBlank { null },
                         date = action.optString("date").ifBlank { null },
                         label = action.optString("label").ifBlank { null },
                         repeat = action.optString("repeat").ifBlank { null },
-                        alarmId = action.optString("id").ifBlank { action.optString("alarm_id").ifBlank { null } }
+                        alarmId = actionId.takeUnless { type == "schedule_followup" } ,
+                        followupId = actionId.takeIf { type == "schedule_followup" },
+                        afterMinutes = if (action.has("after_minutes")) action.optInt("after_minutes") else null,
+                        instruction = action.optString("instruction").ifBlank { action.optString("reason").ifBlank { null } },
+                        notifyUser = action.optBoolean("notify_user", false),
+                        message = action.optString("message").ifBlank { null }
                     )
                 }
             }.orEmpty(),
@@ -641,9 +683,17 @@ private suspend fun requestAiProviders(context: Context): List<AiProviderOption>
 }
 
 class MainActivity : ComponentActivity() {
+    private val pendingReplyThread = androidx.compose.runtime.mutableStateOf<String?>(null)
+    var resumeGeneration by androidx.compose.runtime.mutableStateOf(0)
+        private set
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingReplyThread.value = threadIdFromReplyDeepLink(intent)
         createNotificationChannel()
+        // Migrate legacy app-owned alarms and restore follow-up schedules.
+        // System-clock alarms are left to the device Clock app.
+        AlarmScheduler.restore(this)
         setContent { ForwardApp(this) }
         if (UsageMonitorStore.enabled(this) && UsageMonitorPermissions.hasUsageAccess(this)) {
             ContextCompat.startForegroundService(this, Intent(this, UsageMonitorService::class.java))
@@ -728,6 +778,68 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        resumeGeneration += 1
+        ReplyNotificationState.setAppInForeground(true)
+    }
+
+    override fun onPause() {
+        ReplyNotificationState.setAppInForeground(false)
+        super.onPause()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        threadIdFromReplyDeepLink(intent)?.let { pendingReplyThread.value = it }
+    }
+
+    fun pendingReplyThreadId(): String? = pendingReplyThread.value
+
+    fun clearPendingReplyThreadId(threadId: String) {
+        if (pendingReplyThread.value == threadId) pendingReplyThread.value = null
+    }
+
+    fun setReplyViewState(chatPageVisible: Boolean, threadId: String?) {
+        ReplyNotificationState.setChatPageVisible(chatPageVisible, threadId)
+    }
+
+    fun showReplyNotificationIfNeeded(threadId: String?, reply: String) {
+        if (threadId.isNullOrBlank() || !proactiveNotificationShouldNotify(threadId)) return
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
+        val deepLinkIntent = Intent(Intent.ACTION_VIEW, replyThreadDeepLink(threadId)).apply {
+            setClass(this@MainActivity, MainActivity::class.java)
+            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            threadId.hashCode(),
+            deepLinkIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val body = reply.trim().replace(Regex("\\s+"), " ").take(240).ifBlank { "你的对话有一条新回复。" }
+        val notification = NotificationCompat.Builder(this, "forward-reminders")
+            .setSmallIcon(com.forward.assistant.R.drawable.ic_forward)
+            .setContentTitle("向前 · 新回复")
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .build()
+        getSystemService(NotificationManager::class.java)
+            .notify(2000 + (threadId.hashCode() and 0x7fffffff) % 100000, notification)
+    }
+
+    fun openNotificationSettings() {
+        startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+            putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+        })
+    }
+
     fun usageMonitorEnabled(): Boolean = UsageMonitorStore.enabled(this)
 
     fun usageSnapshot(): UsageMonitorSnapshot = UsageMonitorStore.snapshot(this)
@@ -777,6 +889,7 @@ private fun ForwardApp(activity: MainActivity) {
         var cancelAllTasks by remember { mutableStateOf(activity.plannerFlag("cancel_all_tasks")) }
         var aiBusy by remember { mutableStateOf(false) }
         var agentActivity by remember { mutableStateOf("") }
+        var agentEventLog by remember { mutableStateOf(emptyList<String>()) }
         var input by remember { mutableStateOf(TextFieldValue()) }
         var sleepTime by remember { mutableStateOf(activity.plannerTime("sleep_time", DEFAULT_SLEEP_MINUTES)) }
         var wakeTime by remember { mutableStateOf(activity.plannerTime("wake_time", DEFAULT_WAKE_MINUTES)) }
@@ -805,6 +918,54 @@ private fun ForwardApp(activity: MainActivity) {
         var showCreateProject by remember { mutableStateOf(false) }
         var drawerOpen by remember { mutableStateOf(false) }
         var projectPageId by remember { mutableStateOf<String?>(null) }
+        val snackbar = remember { SnackbarHostState() }
+        val scope = rememberCoroutineScope()
+        val appliedRevisions = remember { mutableMapOf<String, Long>() }
+        var pendingOperations by remember { mutableStateOf(emptyMap<String, String>()) }
+
+        fun applyRemoteState(state: RemoteState) {
+            if (state.revision < (appliedRevisions[state.stateScope] ?: -1L)) return
+            appliedRevisions[state.stateScope] = state.revision
+            remotePlan = state.plan
+            remoteMemories = state.memories
+            remoteProjects = state.projects
+            remoteTasks = state.tasks
+            remoteLongTasks = state.longTasks
+            showSleepPlan = state.plan?.showSleepPlan ?: showSleepPlan
+            parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
+            parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
+        }
+
+        fun runStateOperation(keys: Set<String>, label: String, operation: suspend () -> RemoteState, onSuccess: () -> Unit = {}) {
+            if (keys.any { it in pendingOperations }) return
+            pendingOperations = pendingOperations + keys.associateWith { label }
+            val sessionToken = AssistantSessionStore.token(activity)
+            scope.launch {
+                try {
+                    val state = operation()
+                    if (sessionToken == AssistantSessionStore.token(activity)) {
+                        applyRemoteState(state)
+                        onSuccess()
+                    }
+                } catch (error: Exception) {
+                    if (error is kotlinx.coroutines.CancellationException) throw error
+                    // A lost response may follow a committed write. Reconcile by
+                    // reading, without resubmitting or claiming it was rolled back.
+                    runCatching { gatewayFetchState(activity) }.onSuccess {
+                        if (sessionToken == AssistantSessionStore.token(activity)) applyRemoteState(it)
+                    }
+                    scope.launch { snackbar.showSnackbar("${error.message ?: label}；请核对最新状态后重试") }
+                } finally {
+                    pendingOperations = pendingOperations - keys
+                }
+            }
+        }
+
+        fun runPlanAction(action: JSONObject, label: String, timer: Boolean = false, onSuccess: () -> Unit = {}) {
+            val taskId = action.optString("task_id").ifBlank { "plan" }
+            val keys = if (timer) setOf("task:$taskId", "timer") else setOf("task:$taskId")
+            runStateOperation(keys, label, { gatewayExecuteAction(activity, remoteThreadId, action) }, onSuccess)
+        }
         val drawerState = androidx.compose.material3.rememberDrawerState(androidx.compose.material3.DrawerValue.Closed)
         LaunchedEffect(drawerOpen) {
             if (drawerOpen) drawerState.open() else drawerState.close()
@@ -827,24 +988,47 @@ private fun ForwardApp(activity: MainActivity) {
         LaunchedEffect(remotePlan) {
             UsageMonitorStore.savePlanSummary(activity, remotePlan)
         }
+        LaunchedEffect(tab, remoteThreadId) {
+            // ProjectScreen (tab 4) embeds the same chat composer and history
+            // view, so it is also a visible chat surface for notification
+            // suppression.
+            activity.setReplyViewState(tab == 1 || tab == 4, remoteThreadId)
+        }
+        suspend fun reconcileCurrentThread() {
+            val target = remoteThreadId?.takeIf { it.isNotBlank() } ?: return
+            if (aiBusy || threadLoading || (tab != 1 && tab != 4)) return
+            runCatching { gatewayLoadThread(activity, target) }
+                .onSuccess { detail ->
+                    if (detail.thread.id == target && detail.messages != messages) messages = detail.messages
+                }
+        }
+        LaunchedEffect(activity.resumeGeneration, tab, remoteThreadId) {
+            reconcileCurrentThread()
+        }
+        LaunchedEffect(tab, remoteThreadId) {
+            // A proactive reply can be created while this screen is already
+            // visible. Poll the durable transcript so it appears in-place;
+            // the notification policy remains responsible for background alerts.
+            while (true) {
+                reconcileCurrentThread()
+                delay(5_000)
+            }
+        }
         LaunchedEffect(Unit) {
+            val initialSession = AssistantSessionStore.token(activity)
             runCatching { gatewayFetchState(activity) }.onSuccess { state ->
-                    remotePlan = state.plan
-                    remoteMemories = state.memories
-                    remoteProjects = state.projects
-                    remoteTasks = state.tasks
-                    remoteLongTasks = state.longTasks
-                    showSleepPlan = state.plan?.showSleepPlan ?: showSleepPlan
+                    if (initialSession == AssistantSessionStore.token(activity)) applyRemoteState(state)
                     runCatching { gatewayMemoryStatus(activity) }.onSuccess { memoryStatus = it }
-                    parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
-                    parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
                 }.also { initialStateLoading = false }
             runCatching { gatewayListThreads(activity) }.onSuccess { loadedThreads ->
                 threads = loadedThreads
+                val pendingDeepLink = activity.pendingReplyThreadId()
                 val savedThreadId = AssistantSessionStore.currentThread(activity)
-                val resume = loadedThreads.firstOrNull { it.id == savedThreadId }
-                    ?: loadedThreads.firstOrNull { it.mode != "temporary" }
-                    ?: loadedThreads.firstOrNull()
+                val resume = if (pendingDeepLink.isNullOrBlank()) {
+                    loadedThreads.firstOrNull { it.id == savedThreadId }
+                        ?: loadedThreads.firstOrNull { it.mode != "temporary" }
+                        ?: loadedThreads.firstOrNull()
+                } else null
                 if (resume != null) {
                     threadLoading = true
                     runCatching { gatewayLoadThread(activity, resume.id) }.onSuccess { detail ->
@@ -873,22 +1057,15 @@ private fun ForwardApp(activity: MainActivity) {
                 // clock advances so midnight and sleep-time boundaries do not leave
                 // yesterday's "tomorrow/deferred" labels on screen.
                 if (!aiBusy && !threadLoading) {
+                    val pollingSession = AssistantSessionStore.token(activity)
                     runCatching { gatewayFetchState(activity) }.onSuccess { state ->
-                        remotePlan = state.plan
-                        remoteMemories = state.memories
-                        remoteProjects = state.projects
-                        remoteTasks = state.tasks
-                        remoteLongTasks = state.longTasks
-                        showSleepPlan = state.plan?.showSleepPlan ?: showSleepPlan
-                        parseClock(state.plan?.sleepTime.orEmpty())?.let { sleepTime = it }
-                        parseClock(state.plan?.wakeTime.orEmpty())?.let { wakeTime = it }
+                        if (pollingSession == AssistantSessionStore.token(activity)) applyRemoteState(state)
                     }
                 }
                 delay(60_000)
             }
         }
-        val snackbar = remember { SnackbarHostState() }
-        val scope = rememberCoroutineScope()
+        var pendingNotificationAction by remember { mutableStateOf<AssistantAction?>(null) }
 
         fun applyLoadedThread(detail: RemoteThreadDetail) {
             remoteThreadId = detail.thread.id
@@ -896,6 +1073,7 @@ private fun ForwardApp(activity: MainActivity) {
             conversationOptions = detail.thread.toConversationOptions()
             messages = detail.messages
             input = TextFieldValue()
+            agentEventLog = emptyList()
         }
 
         fun loadThread(thread: ConversationThread) {
@@ -909,6 +1087,20 @@ private fun ForwardApp(activity: MainActivity) {
             }
         }
 
+        val pendingDeepLinkThreadId = activity.pendingReplyThreadId()
+        LaunchedEffect(pendingDeepLinkThreadId) {
+            val target = pendingDeepLinkThreadId?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+            threadLoading = true
+            runCatching { gatewayLoadThread(activity, target) }
+                .onSuccess { detail ->
+                    applyLoadedThread(detail)
+                    tab = 1
+                }
+                .onFailure { snackbar.showSnackbar(it.message ?: "打开通知对应的对话失败") }
+            threadLoading = false
+            activity.clearPendingReplyThreadId(target)
+        }
+
         fun startConversation(options: ConversationOptions, destinationTab: Int = 1) {
             if (aiBusy || threadLoading) return
             scope.launch {
@@ -920,6 +1112,7 @@ private fun ForwardApp(activity: MainActivity) {
                         conversationOptions = thread.toConversationOptions()
                         messages = emptyList()
                         input = TextFieldValue()
+                        agentEventLog = emptyList()
                         if (thread.saveFullConversation) {
                             threads = listOf(thread) + threads.filterNot { it.id == thread.id }
                         }
@@ -950,10 +1143,16 @@ private fun ForwardApp(activity: MainActivity) {
         }
 
         val notificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            val pending = pendingNotificationAction
+            pendingNotificationAction = null
             if (granted || Build.VERSION.SDK_INT < 33) {
                 activity.showReminder()
-                scope.launch { snackbar.showSnackbar("提醒已开启，已发送一条测试通知") }
-            } else scope.launch { snackbar.showSnackbar("通知权限未开启，应用内计划仍可使用") }
+                if (pending != null) {
+                    val outcome = AlarmScheduler.apply(activity, pending)
+                    scope.launch { snackbar.showSnackbar(outcome.message) }
+                    if (outcome.needsExactPermission) activity.openExactAlarmSettings()
+                } else scope.launch { snackbar.showSnackbar("提醒已开启，已发送一条测试通知") }
+            } else scope.launch { snackbar.showSnackbar("通知权限未开启，本次设备提醒未创建") }
         }
 
         fun beginBreak() {
@@ -980,58 +1179,43 @@ private fun ForwardApp(activity: MainActivity) {
         fun createProject(name: String, kind: String, description: String, priority: Int, dueAt: String?) {
             scope.launch {
                 runCatching { gatewayCreateProject(activity, name, kind, description, priority, dueAt) }
-                    .onSuccess { state -> remotePlan = state.plan; remoteMemories = state.memories; remoteProjects = state.projects; remoteTasks = state.tasks; showCreateProject = false; snackbar.showSnackbar("目标或项目已创建") }
+                    .onSuccess { state -> applyRemoteState(state); showCreateProject = false; snackbar.showSnackbar("目标或项目已创建") }
                     .onFailure { snackbar.showSnackbar(it.message ?: "新建项目失败") }
             }
         }
 
         fun completeTask() {
-            scope.launch {
-                runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "complete_current_task").put("reason", "用户在移动端点击完成当前任务")) }
-                    .onSuccess { state -> remotePlan = state.plan?.copy(activeTimer = null); remoteMemories = state.memories; remoteProjects = state.projects; remoteTasks = state.tasks; currentDone = false; beginBreak() }
-                    .onFailure { snackbar.showSnackbar(it.message ?: "计划更新失败，本次未写入") }
+            val task = remotePlan?.currentTaskId ?: return
+            runPlanAction(JSONObject().put("type", "complete_task").put("task_id", task), "正在完成任务", timer = true) {
+                currentDone = false; beginBreak()
             }
         }
 
         fun startCurrentTimer() {
             val task = remotePlan?.currentTaskId ?: return
-            scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "start_task_timer").put("task_id", task).put("mode", "stopwatch")) }
-                .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks }
-                .onFailure { snackbar.showSnackbar(it.message ?: "开始计时失败") } }
+            runPlanAction(JSONObject().put("type", "start_task_timer").put("task_id", task).put("mode", "stopwatch"), "正在开始计时", timer = true)
         }
 
         fun pauseCurrentTimer() {
             val task = remotePlan?.activeTimer?.taskId ?: return
-            scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "pause_task_timer").put("task_id", task)) }
-                .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks }
-                .onFailure { snackbar.showSnackbar(it.message ?: "暂停计时失败") } }
+            runPlanAction(JSONObject().put("type", "pause_task_timer").put("task_id", task), "正在暂停计时", timer = true)
         }
 
         fun reopenTask(taskId: String) {
-            scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "reopen_task").put("task_id", taskId)) }
-                .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks; snackbar.showSnackbar("任务已重新打开") }
-                .onFailure { snackbar.showSnackbar(it.message ?: "重新打开失败") } }
+            runPlanAction(JSONObject().put("type", "reopen_task").put("task_id", taskId), "正在重新打开任务", timer = true)
         }
 
         fun completeSpecificTask(item: RemotePlanItem) {
             if (item.id.isBlank()) return
-            scope.launch {
-                runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "complete_task").put("task_id", item.id).put("reason", "用户双击今日计划任务完成")) }
-                    .onSuccess { state -> remotePlan = state.plan?.copy(activeTimer = null); remoteProjects = state.projects; remoteTasks = state.tasks }
-                    .onFailure { snackbar.showSnackbar(it.message ?: "完成任务失败") }
-            }
+            runPlanAction(JSONObject().put("type", "complete_task").put("task_id", item.id).put("reason", "用户双击今日计划任务完成"), "正在完成任务", timer = true)
         }
 
         fun editTask(item: RemotePlanItem) {
-            scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "update_task").put("task_id", item.id).put("title", item.title).put("estimated_minutes", item.minutes).put("priority", item.priority)) }
-                .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks; snackbar.showSnackbar("任务已保存") }
-                .onFailure { snackbar.showSnackbar(it.message ?: "保存任务失败") } }
+            runPlanAction(JSONObject().put("type", "update_task").put("task_id", item.id).put("title", item.title).put("estimated_minutes", item.minutes).put("priority", item.priority), "正在保存任务")
         }
 
         fun removeTask(item: RemotePlanItem) {
-            scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "cancel_task").put("task_id", item.id).put("reason", "用户在移动端手动移除任务")) }
-                .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks }
-                .onFailure { snackbar.showSnackbar(it.message ?: "移除任务失败") } }
+            runPlanAction(JSONObject().put("type", "cancel_task").put("task_id", item.id).put("reason", "用户在移动端手动移除任务"), "正在移除任务", timer = true)
         }
 
         fun createTask(title: String, minutes: Int, priority: Int, projectId: String? = null, parentTaskId: String? = null, taskType: String = "one_off", dueAt: String? = null) {
@@ -1050,24 +1234,20 @@ private fun ForwardApp(activity: MainActivity) {
                     .apply { if (parentTaskId.isNullOrBlank()) remoteProjects.firstOrNull { it.id == projectId }?.name?.let { put("project", it) } }
                     .apply { parentTaskId?.takeIf(String::isNotBlank)?.let { put("parent_task_id", it) } }
                     .put("reason", if (parentTaskId.isNullOrBlank()) "用户在移动端手动新建任务" else "用户在移动端手动新建子任务"))
-            }.onSuccess { state -> remotePlan = state.plan; remoteProjects = state.projects; remoteTasks = state.tasks }
+            }.onSuccess { state -> applyRemoteState(state) }
                 .onFailure { snackbar.showSnackbar(it.message ?: "新建任务失败") } }
         }
 
         fun setCurrentAndStart(item: RemotePlanItem) {
             if (item.id.isBlank() || item.displayOnly) return
-            scope.launch {
-                runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_current_task").put("task_id", item.id).put("start_timer", true).put("mode", "stopwatch").put("reason", "用户在移动端选择当前任务并开始计时")) }
-                    .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks }
-                    .onFailure { snackbar.showSnackbar(it.message ?: "切换当前任务失败") }
-            }
+            runPlanAction(JSONObject().put("type", "set_current_task").put("task_id", item.id).put("start_timer", true).put("mode", "stopwatch"), "正在切换计时任务", timer = true)
         }
 
         fun reorderTasks(taskIds: List<String>) {
             val ids = taskIds.filter(String::isNotBlank)
             if (ids.size < 2) return
             scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "reorder_tasks").put("task_ids", JSONArray(ids)))}
-                .onSuccess { state -> remotePlan = state.plan; remoteTasks = state.tasks }
+                .onSuccess { state -> applyRemoteState(state) }
                 .onFailure { snackbar.showSnackbar(it.message ?: "排序失败") } }
         }
 
@@ -1075,7 +1255,7 @@ private fun ForwardApp(activity: MainActivity) {
             if (task.status == "open" || task.status == "in_progress") return
             scope.launch {
                 runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "reopen_task").put("task_id", task.id)) }
-                    .onSuccess { state -> remotePlan = state.plan; remoteProjects = state.projects; remoteTasks = state.tasks }
+                    .onSuccess { state -> applyRemoteState(state) }
                     .onFailure { snackbar.showSnackbar(it.message ?: "加入今日计划失败") }
             }
         }
@@ -1098,7 +1278,7 @@ private fun ForwardApp(activity: MainActivity) {
                                     .put("type", "set_buffer_minutes")
                                     .put("minutes", minutes)
                                     .put("reason", "用户在移动端设置缓冲时间"))
-                            }.onSuccess { state -> remotePlan = state.plan }
+                            }.onSuccess { state -> applyRemoteState(state) }
                         }
                     }
                     "complete_current_task" -> { currentDone = false; beginBreak() }
@@ -1133,10 +1313,16 @@ private fun ForwardApp(activity: MainActivity) {
         }
 
         fun applyDeviceActions(actions: List<AssistantAction>): List<AlarmOperationResult> {
-            return actions.filter { it.type == "set_alarm" || it.type == "cancel_alarm" }.map { action ->
-                if (action.type == "set_alarm" && Build.VERSION.SDK_INT >= 33 &&
+            return actions.filter { it.type == "set_alarm" || it.type == "cancel_alarm" || it.type == "schedule_followup" }.map { action ->
+                if (AlarmScheduler.needsNotificationPermission(activity, action) && Build.VERSION.SDK_INT >= 33 &&
                     ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    pendingNotificationAction = action
                     notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    return@map AlarmOperationResult(false, "正在请求通知权限，允许后会继续创建设备提醒。", needsNotificationPermission = true)
+                }
+                if (AlarmScheduler.needsNotificationPermission(activity, action)) {
+                    activity.openNotificationSettings()
+                    return@map AlarmOperationResult(false, "系统通知已关闭，请开启后重新执行。", needsNotificationPermission = true)
                 }
                 val outcome = AlarmScheduler.apply(activity, action)
                 scope.launch { snackbar.showSnackbar(outcome.message) }
@@ -1209,74 +1395,73 @@ private fun ForwardApp(activity: MainActivity) {
             input = TextFieldValue()
             aiBusy = true
             agentActivity = "正在连接 Agent"
+            agentEventLog = emptyList()
             val requestId = UUID.randomUUID().toString()
             scope.launch {
-                var resolved = true
                 val monitorJob = launch {
                     val labels = mapOf("started" to "已建立运行记录", "accepted" to "已接收消息", "agent_started" to "Agent 正在运行", "finalizing" to "正在保存工具结果", "completed" to "已完成")
-                    repeat(120) {
-                        delay(1500)
-                        val status = runCatching { gatewayRunStatus(activity, requestId) }.getOrNull()
-                        val events = status?.optJSONArray("events")
-                        val latest = events?.optJSONObject((events.length() - 1).coerceAtLeast(0))
-                        if (latest != null) {
-                            agentActivity = if (latest.optString("type") == "agent_event") {
-                                when (latest.optString("item_type")) {
-                                    "command_execution" -> "正在执行工具"
-                                    "agent_message" -> "正在生成回复"
-                                    else -> "Agent 正在处理"
+                    while (true) {
+                        val terminal = runCatching {
+                            gatewayRunEvents(activity, requestId) { event ->
+                                val type = event.optString("_event", event.optString("type"))
+                                val label = if (type == "agent_event") {
+                                    when (event.optString("item_type")) {
+                                        "command_execution" -> "正在执行工具"
+                                        "agent_message" -> "正在生成回复"
+                                        else -> "Agent 正在处理"
+                                    }
+                                } else labels[type] ?: "Agent 正在处理"
+                                val detail = event.optString("text").trim().ifBlank {
+                                    event.optString("stream").takeIf { it.isNotBlank() }?.let { "$it: $type" } ?: type
+                                }.replace(Regex("\\s+"), " ").take(180)
+                                scope.launch(Dispatchers.Main.immediate) {
+                                    agentActivity = label
+                                    if (detail.isNotBlank() && agentEventLog.lastOrNull() != detail) {
+                                        agentEventLog = (agentEventLog + detail).takeLast(20)
+                                    }
                                 }
-                            } else labels[latest.optString("type")] ?: "Agent 正在处理"
-                        }
-                        if (status?.optString("status") == "completed" || status?.optString("status") == "failed") return@launch
+                            }
+                        }.getOrNull()
+                        if (terminal?.optString("_event") in setOf("completed", "failed", "closed")) return@launch
+                        val status = runCatching { gatewayRunStatus(activity, requestId) }.getOrNull()
+                        if (status?.optString("status") in setOf("completed", "failed")) return@launch
+                        delay(1000)
                     }
                 }
                 val result = try {
                     requestAssistant(activity, text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel, agentEngine, remoteThreadId, requestId, conversationOptions, images)
                 } catch (error: Exception) {
-                    // The server may finish after the original socket timed out.
-                    // Reconcile by request id before presenting a failure state.
-                    var recovered: AssistantResult? = null
-                    for (attempt in 0 until 12) {
-                        delay(2500)
-                        val status = runCatching { gatewayRunStatus(activity, requestId) }.getOrNull() ?: continue
-                        val state = status.optString("status")
-                        if (state == "completed") {
-                            val recoveredThreadId = status.optString("thread_id").ifBlank { remoteThreadId.orEmpty() }
-                            val detail = recoveredThreadId.takeIf { it.isNotBlank() }?.let { runCatching { gatewayLoadThread(activity, it) }.getOrNull() }
-                            val reply = detail?.messages?.lastOrNull { it.fromAssistant }?.text.orEmpty().ifBlank { status.optString("reply") }
-                            if (reply.isNotBlank()) recovered = AssistantResult(reply, emptyList(), threadId = recoveredThreadId); break
+                    // If the HTTP response dropped after server commit, recover
+                    // the exact reply by request_id before surfacing the error.
+                    val status = runCatching { gatewayRunStatus(activity, requestId) }.getOrNull()
+                    if (status?.optString("status") == "completed") {
+                        val recoveredThread = status.optString("thread_id").ifBlank { remoteThreadId.orEmpty() }
+                        val detail = recoveredThread.takeIf { it.isNotBlank() }?.let { runCatching { gatewayLoadThread(activity, it) }.getOrNull() }
+                        val recoveredReply = detail?.messages?.lastOrNull { it.fromAssistant }?.text.orEmpty().ifBlank { status.optString("reply") }
+                        if (recoveredReply.isNotBlank()) {
+                            messages = messages + ChatMessage(true, recoveredReply)
+                            activity.showReplyNotificationIfNeeded(recoveredThread, recoveredReply)
                         }
-                        if (state == "failed") break
+                        if (recoveredThread.isNotBlank()) { remoteThreadId = recoveredThread; AssistantSessionStore.saveCurrentThread(activity, recoveredThread) }
+                    } else {
+                        val rawError = error.message.orEmpty().ifBlank { error.javaClass.name }
+                        messages = messages + ChatMessage(true, rawError)
                     }
-                    if (recovered == null) {
-                        resolved = false
-                        agentActivity = "后台运行中，完成后会自动显示"
-                        scope.launch {
-                            repeat(120) {
-                                delay(3000)
-                                val status = runCatching { gatewayRunStatus(activity, requestId) }.getOrNull() ?: return@repeat
-                                if (status.optString("status") == "completed") {
-                                    val recoveredThreadId = status.optString("thread_id").ifBlank { remoteThreadId.orEmpty() }
-                                    val detail = recoveredThreadId.takeIf { it.isNotBlank() }?.let { runCatching { gatewayLoadThread(activity, it) }.getOrNull() }
-                                    val reply = detail?.messages?.lastOrNull { it.fromAssistant }?.text.orEmpty().ifBlank { status.optString("reply") }
-                                    if (reply.isNotBlank()) messages = messages + ChatMessage(true, reply)
-                                    if (recoveredThreadId.isNotBlank()) { remoteThreadId = recoveredThreadId; AssistantSessionStore.saveCurrentThread(activity, recoveredThreadId) }
-                                    agentActivity = ""
-                                    return@launch
-                                }
-                                if (status.optString("status") == "failed") return@launch
-                            }
-                            agentActivity = ""
-                        }
+                    monitorJob.cancel(); agentActivity = ""; aiBusy = false
+                    val queued = queuedMessages.firstOrNull()
+                    if (queued != null) {
+                        queuedMessages = queuedMessages.drop(1)
+                        input = TextFieldValue(queued.first)
+                        pendingImageData = queued.second
+                        sendMessage()
                     }
-                    recovered ?: AssistantResult("", emptyList()).also { scope.launch { snackbar.showSnackbar(error.message ?: "请求仍在后台处理") } }
+                    return@launch
                 }
                 monitorJob.cancel()
                 if (result.plan == null) applyActions(result.actions)
                 val deviceResults = applyDeviceActions(result.deviceActions.ifEmpty { result.actions })
-                result.plan?.let { remotePlan = it }
-                result.state?.let { remoteMemories = it.memories; remoteProjects = it.projects; remoteTasks = it.tasks; if (it.plan != null) remotePlan = it.plan }
+                if (result.state != null) applyRemoteState(result.state)
+                else result.plan?.let { remotePlan = it }
                 result.threadId?.let { id ->
                     remoteThreadId = id
                     AssistantSessionStore.saveCurrentThread(activity, id)
@@ -1290,9 +1475,11 @@ private fun ForwardApp(activity: MainActivity) {
                 } else if (deviceResults.isNotEmpty()) {
                     result.reply + "\n\n" + deviceResults.joinToString("\n") { it.message }
                 } else result.reply
-                if (resolved) messages = messages + ChatMessage(true, displayReply)
+                messages = messages + ChatMessage(true, displayReply)
+                val completedThreadId = result.threadId ?: remoteThreadId
+                activity.showReplyNotificationIfNeeded(completedThreadId, displayReply)
                 aiBusy = false
-                if (resolved) agentActivity = ""
+                agentActivity = ""
                 val queued = queuedMessages.firstOrNull()
                 if (queued != null) {
                     queuedMessages = queuedMessages.drop(1)
@@ -1340,7 +1527,7 @@ private fun ForwardApp(activity: MainActivity) {
                                 Icon(Icons.Default.ArrowForward, null, tint = Green, modifier = Modifier.size(20.dp))
                             } }
                             Spacer(Modifier.width(9.dp))
-                            Column { Text("向前", color = Green, fontWeight = FontWeight.Bold, fontSize = 16.sp); Text("你的执行助手", color = Muted, fontSize = 10.sp) }
+                            Column { Text("向前", color = Green, fontWeight = FontWeight.Bold, fontSize = 16.sp); Text(pendingOperations.values.firstOrNull() ?: "你的执行助手", color = Muted, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }
                         }
                     },
                     actions = {
@@ -1384,18 +1571,23 @@ private fun ForwardApp(activity: MainActivity) {
                     onSetThreadLocked = ::setThreadLocked,
                     onDeleteThreads = ::deleteThreads
                     ,onGallery = { galleryLauncher.launch("image/*") },
-                    onCamera = { cameraLauncher.launch(null) }, imageData = pendingImageData, onRemoveImage = { index -> pendingImageData = pendingImageData.filterIndexed { position, _ -> position != index } }, onClearImage = { pendingImageData = emptyList() }, agentActivity = agentActivity
+                    onCamera = { cameraLauncher.launch(null) }, imageData = pendingImageData, onRemoveImage = { index -> pendingImageData = pendingImageData.filterIndexed { position, _ -> position != index } }, onClearImage = { pendingImageData = emptyList() }, agentActivity = agentActivity, agentEventLog = agentEventLog
                 )
                 2 -> MemoryScreen(
                     padding = padding,
                     activity = activity,
                     memories = remoteMemories,
                     status = memoryStatus,
+                    pendingIds = pendingOperations.keys.filter { it.startsWith("memory:") }.map { it.removePrefix("memory:") }.toSet(),
+                    onUpdateMemory = { memory, status, content, onSaved ->
+                        runStateOperation(setOf("memory:${memory.id}"), if (status == "active") "正在确认记忆" else "正在更新记忆",
+                            { gatewayUpdateMemory(activity, memory.id, status, content) }) {
+                            onSaved()
+                            scope.launch { runCatching { gatewayMemoryStatus(activity) }.onSuccess { memoryStatus = it } }
+                        }
+                    },
                     onStateChanged = { state ->
-                        remoteMemories = state.memories
-                        remotePlan = state.plan ?: remotePlan
-                        remoteProjects = state.projects
-                        remoteTasks = state.tasks
+                        applyRemoteState(state)
                         scope.launch { runCatching { gatewayMemoryStatus(activity) }.onSuccess { memoryStatus = it } }
                     },
                     onStatusChanged = { memoryStatus = it }
@@ -1419,8 +1611,8 @@ private fun ForwardApp(activity: MainActivity) {
                     onUpdateConversationOptions = ::updateConversationOptions,
                     onCreateTask = { title, minutes, priority, projectId, parentTaskId -> createTask(title, minutes, priority, projectId, parentTaskId) },
                     onAddTaskToToday = ::addTaskToToday,
-                    onStartTaskTimer = { task -> scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "start_task_timer").put("task_id", task.id).put("mode", "stopwatch")) }.onSuccess { remotePlan = it.plan; remoteTasks = it.tasks }.onFailure { snackbar.showSnackbar(it.message ?: "开始计时失败") } } },
-                    onPauseTaskTimer = { task -> scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "pause_task_timer").put("task_id", task.id)) }.onSuccess { remotePlan = it.plan; remoteTasks = it.tasks }.onFailure { snackbar.showSnackbar(it.message ?: "暂停计时失败") } } },
+                    onStartTaskTimer = { task -> runPlanAction(JSONObject().put("type", "start_task_timer").put("task_id", task.id).put("mode", "stopwatch"), "正在开始计时", timer = true) },
+                    onPauseTaskTimer = { task -> runPlanAction(JSONObject().put("type", "pause_task_timer").put("task_id", task.id), "正在暂停计时", timer = true) },
                     onBack = { projectPageId = null; tab = 0 }
                 )
                 else -> SettingsScreen(
@@ -1431,11 +1623,11 @@ private fun ForwardApp(activity: MainActivity) {
                     wakeTime,
                     bufferMinutes = remotePlan?.configuredBufferMinutes ?: 60,
                     usageSnapshot = usageSnapshot,
-                    onSleepTime = { time -> sleepTime = time; activity.savePlannerTime("sleep_time", time); scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_sleep_time").put("time", formatClock(time)).put("reason", "用户在移动端设置睡觉时间")) }.onSuccess { remotePlan = it.plan; remoteMemories = it.memories } } },
-                    onWakeTime = { time -> wakeTime = time; activity.savePlannerTime("wake_time", time); scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_wake_time").put("time", formatClock(time)).put("reason", "用户在移动端设置起床时间")) }.onSuccess { remotePlan = it.plan; remoteMemories = it.memories } } },
-                    onBufferMinutes = { minutes -> scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_buffer_minutes").put("minutes", minutes).put("reason", "用户在移动端设置缓冲时间")) }.onSuccess { state -> remotePlan = state.plan; remoteMemories = state.memories }.onFailure { snackbar.showSnackbar(it.message ?: "缓冲时间保存失败") } } },
+                    onSleepTime = { time -> runPlanAction(JSONObject().put("type", "set_sleep_time").put("time", formatClock(time)), "正在保存睡觉时间") { activity.savePlannerTime("sleep_time", time) } },
+                    onWakeTime = { time -> runPlanAction(JSONObject().put("type", "set_wake_time").put("time", formatClock(time)), "正在保存起床时间") { activity.savePlannerTime("wake_time", time) } },
+                    onBufferMinutes = { minutes -> runPlanAction(JSONObject().put("type", "set_buffer_minutes").put("minutes", minutes), "正在保存缓冲时间") },
                     showSleepPlan = showSleepPlan,
-                    onSleepPlanVisibility = { visible -> showSleepPlan = visible; scope.launch { runCatching { gatewayExecuteAction(activity, remoteThreadId, JSONObject().put("type", "set_sleep_plan_visibility").put("visible", visible).put("reason", "用户调整睡眠时段计划显示")) }.onSuccess { state -> remotePlan = state.plan; remoteMemories = state.memories }.onFailure { snackbar.showSnackbar(it.message ?: "睡眠时段显示设置保存失败") } } },
+                    onSleepPlanVisibility = { visible -> runPlanAction(JSONObject().put("type", "set_sleep_plan_visibility").put("visible", visible), "正在保存睡眠显示设置") },
                     aiProviders = aiProviders,
                     selectedProviderId = selectedProviderId,
                     selectedModel = selectedModel,
@@ -1443,7 +1635,7 @@ private fun ForwardApp(activity: MainActivity) {
                     onAgentEngine = { value -> agentEngine = value; activity.saveAiSelection(selectedProviderId, selectedModel, value) },
                     onAiSelection = { providerId, model -> selectedProviderId = providerId; selectedModel = model; activity.saveAiSelection(providerId, model, agentEngine) },
                     onUsageSnapshotChanged = { usageSnapshot = activity.usageSnapshot() },
-                    onRemoteState = { state -> remotePlan = state.plan; remoteMemories = state.memories; remoteProjects = state.projects; remoteTasks = state.tasks },
+                    onRemoteState = ::applyRemoteState,
                     onThreadsRefresh = {
                         scope.launch {
                             runCatching { gatewayListThreads(activity) }
@@ -1664,28 +1856,61 @@ private fun TodayScreen(
     } ?: schedulePlan(plan, now, sleepTime)
     var draggingTaskId by remember { mutableStateOf<String?>(null) }
     var dragOffset by remember { mutableStateOf(0f) }
+    // Keep the list itself still while a pointer gesture is active. Mutating a
+    // LazyColumn's keyed backing list from inside the item's pointer callback
+    // can dispose/recompose the very node that owns the gesture. In particular,
+    // crossing the first visible row used to produce a state race and could
+    // close the Android process. We only remember the intended insertion point
+    // during the gesture, then commit one list mutation after it ends.
+    var dragTargetId by remember { mutableStateOf<String?>(null) }
     var lastDragMoveAt by remember { mutableStateOf(0L) }
+    var reorderPending by remember { mutableStateOf(false) }
     var displayPlan by remember { mutableStateOf(serverPlan) }
     val listState = rememberLazyListState()
     LaunchedEffect(serverPlan.map { "${it.item.id}:${it.start}:${it.end}:${it.deferredByCapacity}" }.joinToString("|")) {
-        if (draggingTaskId == null) displayPlan = serverPlan
+        if (draggingTaskId == null && !reorderPending) displayPlan = serverPlan
     }
-    fun moveDraggedTask(targetId: String) {
+    // Do not leave the optimistic order stuck if a network request fails before
+    // the next server snapshot arrives.
+    LaunchedEffect(reorderPending) {
+        if (reorderPending) {
+            delay(2500)
+            reorderPending = false
+        }
+    }
+    fun itemKey(value: ScheduledPlanItem): String = value.item.id.ifBlank { "legacy:${value.item.title}:${value.start ?: "unscheduled"}" }
+    fun previewDraggedTask(targetId: String) {
         val sourceId = draggingTaskId ?: return
         val sourceIndex = displayPlan.indexOfFirst { it.item.id == sourceId }
         val targetIndex = displayPlan.indexOfFirst { it.item.id == targetId }
         if (sourceIndex < 0 || targetIndex < 0 || sourceIndex == targetIndex) return
-        displayPlan = displayPlan.toMutableList().apply { add(targetIndex, removeAt(sourceIndex)) }
-        // Require another deliberate movement before the next swap. This prevents
-        // one fast swipe from carrying a task across the entire list.
-        dragOffset = 0f
+        dragTargetId = targetId
+        // Require another deliberate movement before the next target change.
+        // This preserves the less-sensitive drag feel without resetting the
+        // visual offset or reshuffling the active LazyColumn items.
         lastDragMoveAt = System.currentTimeMillis()
     }
     fun finishDragging() {
         val dragged = draggingTaskId
+        val target = dragTargetId
         draggingTaskId = null
         dragOffset = 0f
-        if (dragged != null) reorderTasks(displayPlan.filterNot { it.item.displayOnly }.map { it.item.id })
+        dragTargetId = null
+        if (dragged != null && target != null) {
+            val sourceIndex = displayPlan.indexOfFirst { it.item.id == dragged }
+            val targetIndex = displayPlan.indexOfFirst { it.item.id == target }
+            if (sourceIndex < 0 || targetIndex < 0 || sourceIndex == targetIndex) return
+            displayPlan = displayPlan.toMutableList().apply { add(targetIndex, removeAt(sourceIndex)) }
+            val ids = displayPlan.filterNot { it.item.displayOnly || it.item.id.isBlank() }.map { it.item.id }.distinct()
+            if (ids.size < 2) return
+            reorderPending = true
+            reorderTasks(ids)
+        }
+    }
+    fun cancelDragging() {
+        draggingTaskId = null
+        dragOffset = 0f
+        dragTargetId = null
     }
     val scheduledPlan = displayPlan
     val availableMinutes = remotePlan?.availableMinutes?.toLong() ?: minutesUntilSleep(now, sleepTime)
@@ -1693,7 +1918,7 @@ private fun TodayScreen(
     val bufferMinutes = remotePlan?.bufferMinutes?.toLong() ?: (availableMinutes - scheduledMinutes).coerceAtLeast(0)
     val freeMinutes = remotePlan?.freeMinutes?.toLong() ?: 0L
     val currentItem = remotePlan?.currentTaskId?.let { currentId ->
-        scheduledPlan.getOrNull(remotePlan.scheduled.indexOfFirst { it.id == currentId }.takeIf { it >= 0 } ?: -1)
+        scheduledPlan.firstOrNull { it.item.id == currentId && !it.item.displayOnly }
     } ?: scheduledPlan.firstOrNull { it.start != null && !it.item.isBreak && !it.item.done }
     LazyColumn(state = listState, modifier = Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(bottom = 10.dp)) {
         item { Column(Modifier.padding(horizontal = 20.dp, vertical = 18.dp)) {
@@ -1726,7 +1951,7 @@ private fun TodayScreen(
         item { BudgetRow(scheduledMinutes, bufferMinutes, freeMinutes) }
         // Some legacy/local tasks may not have an id yet; keep LazyColumn keys unique
         // so the app can still open and the task can be edited normally.
-        items(scheduledPlan, key = { it.item.id.ifBlank { "task-${it.item.title}-${it.start ?: "unscheduled"}" } }) { item ->
+        items(scheduledPlan, key = ::itemKey) { item ->
             PlanRow(
                 scheduled = item,
                 editTask = { task -> editingTask = task; editTitle = task.title; editMinutes = task.minutes.toString(); editPriority = task.priority.toString() },
@@ -1740,20 +1965,40 @@ private fun TodayScreen(
                 },
                 isDragging = draggingTaskId == item.item.id,
                 dragOffset = if (draggingTaskId == item.item.id) dragOffset else 0f,
-                onDragStart = { if (item.item.id.isNotBlank() && !item.item.done && !item.item.displayOnly) { draggingTaskId = item.item.id; dragOffset = 0f; lastDragMoveAt = 0L } },
+                onDragStart = {
+                    if (item.item.id.isNotBlank() && !item.item.done && !item.item.displayOnly && !reorderPending) {
+                        draggingTaskId = item.item.id
+                        dragOffset = 0f
+                        dragTargetId = null
+                        lastDragMoveAt = 0L
+                    }
+                },
                 onDrag = { delta ->
                     if (draggingTaskId == item.item.id) {
                         dragOffset += delta
-                        val draggedInfo = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == item.item.id }
+                        val draggedInfo = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == itemKey(item) }
                         if (draggedInfo != null) {
                             val center = draggedInfo.offset + dragOffset + draggedInfo.size / 2
-                            val sourceIndex = displayPlan.indexOfFirst { it.item.id == item.item.id }
+                            // Advance the preview anchor one item at a time, but
+                            // don't mutate the list until the pointer has ended.
+                            // This makes a long upward drag safely reach index 0.
                             val direction = if (dragOffset > 0f) 1 else -1
-                            val targetItem = generateSequence(sourceIndex + direction) { it + direction }
+                            val anchorId = dragTargetId ?: item.item.id
+                            val anchorIndex = displayPlan.indexOfFirst { it.item.id == anchorId }
+                            // Search only inside the list bounds. The previous
+                            // unbounded generateSequence(-1) / generateSequence(size)
+                            // path never reached a non-null item after the drag
+                            // reached either edge, blocking the Compose thread.
+                            val targetIndices = when {
+                                anchorIndex < 0 -> emptySequence()
+                                direction > 0 -> (anchorIndex + 1..displayPlan.lastIndex).asSequence()
+                                else -> (anchorIndex - 1 downTo 0).asSequence()
+                            }
+                            val targetItem = targetIndices
                                 .mapNotNull { displayPlan.getOrNull(it) }
-                                .firstOrNull { !it.item.displayOnly }
+                                .firstOrNull { !it.item.displayOnly && it.item.id != item.item.id }
                             val target = targetItem?.let { targetValue ->
-                                listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == targetValue.item.id }
+                                listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == itemKey(targetValue) }
                             }
                             val crossed = target != null && if (direction > 0) {
                                 center > target.offset + target.size * 0.72f
@@ -1761,12 +2006,13 @@ private fun TodayScreen(
                                 center < target.offset + target.size * 0.28f
                             }
                             if (crossed && System.currentTimeMillis() - lastDragMoveAt > 180L) {
-                                target?.key?.toString()?.takeIf { it.isNotBlank() }?.let(::moveDraggedTask)
+                                targetItem?.item?.id?.takeIf { it.isNotBlank() }?.let(::previewDraggedTask)
                             }
                         }
                     }
                 },
-                onDragEnd = ::finishDragging
+                onDragEnd = ::finishDragging,
+                onDragCancel = ::cancelDragging
             )
         }
         if (remotePlan?.completed?.isNotEmpty() == true) {
@@ -2002,7 +2248,8 @@ private fun PlanRow(
     dragOffset: Float = 0f,
     onDragStart: () -> Unit = {},
     onDrag: (Float) -> Unit = {},
-    onDragEnd: () -> Unit = {}
+    onDragEnd: () -> Unit = {},
+    onDragCancel: () -> Unit = {}
 ) {
     val item = scheduled.item
     val time = when {
@@ -2020,7 +2267,9 @@ private fun PlanRow(
     val dragModifier = if (item.id.isNotBlank() && !item.done && !item.displayOnly) Modifier.pointerInput(item.id) {
         detectDragGesturesAfterLongPress(
             onDragStart = { onDragStart() },
-            onDragCancel = { onDragEnd() },
+            // A cancelled system gesture must not write a partially-previewed
+            // ordering to the server.
+            onDragCancel = { onDragCancel() },
             onDragEnd = { onDragEnd() },
             onDrag = { _, amount -> onDrag(amount.y) }
         )
@@ -2033,9 +2282,11 @@ private fun AdjustmentCard(title: String, body: String) { Card(Modifier.padding(
 
 @Composable
 private fun Composer(input: TextFieldValue, onInput: (TextFieldValue) -> Unit, onSend: () -> Unit, aiBusy: Boolean = false, onGallery: () -> Unit = {}, onCamera: () -> Unit = {}, imageSelected: Boolean = false) {
-    val canSend = (input.text.isNotBlank() || imageSelected) && !aiBusy
+    // Input remains available while a run is active; sendMessage enqueues the
+    // new turn so users can continue composing without interrupting the Agent.
+    val canSend = input.text.isNotBlank() || imageSelected
     Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp).fillMaxWidth().clip(RoundedCornerShape(9.dp)).background(Color.White).border(1.dp, Color(0xFFD6DED4), RoundedCornerShape(9.dp)).padding(8.dp), verticalAlignment = Alignment.Bottom) {
-        OutlinedTextField(value = input, onValueChange = onInput, enabled = !aiBusy, placeholder = { Text(if (aiBusy) "向前正在思考…" else "说进展、临时安排，或直接聊天…", color = Color(0xFF94A19C), fontSize = 12.sp) }, modifier = Modifier.weight(1f), minLines = 1, maxLines = 3, colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = Color.Transparent))
+        OutlinedTextField(value = input, onValueChange = onInput, enabled = true, placeholder = { Text(if (aiBusy) "继续输入，发送后将排队…" else "说进展、临时安排，或直接聊天…", color = Color(0xFF94A19C), fontSize = 12.sp) }, modifier = Modifier.weight(1f), minLines = 1, maxLines = 3, colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = Color.Transparent))
         IconButton(onClick = onGallery, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.Image, "图库", tint = Muted) }
         IconButton(onClick = onCamera, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.CameraAlt, "拍照", tint = Muted) }
         IconButton(onClick = onSend, enabled = canSend, modifier = Modifier.size(37.dp).clip(RoundedCornerShape(6.dp)).background(if (canSend) Green else Color(0xFFE9EDE8))) { Icon(Icons.Default.Send, "发送", tint = if (canSend) Color.White else Color(0xFF93A69F), modifier = Modifier.size(18.dp)) }
@@ -2066,16 +2317,27 @@ private fun ChatScreen(
     onRemoveImage: (Int) -> Unit = {},
     onClearImage: () -> Unit = {},
     agentActivity: String = "",
+    agentEventLog: List<String> = emptyList(),
     modifier: Modifier = Modifier
 ) {
     val listState = rememberLazyListState()
+    var previousMessages by remember { mutableStateOf<List<ChatMessage>>(emptyList()) }
     var showHistory by remember { mutableStateOf(false) }
     var showNewConversation by remember { mutableStateOf(false) }
     var showConversationOptions by remember { mutableStateOf(false) }
     val modeTitle = conversationModeLabel(conversationOptions.mode)
     val projectName = projects.firstOrNull { it.id == conversationOptions.projectId }?.name
         ?: threads.firstOrNull { it.projectId == conversationOptions.projectId }?.projectName.orEmpty()
-    LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex) }
+    LaunchedEffect(messages) {
+        if (messages.isNotEmpty()) {
+            val appended = previousMessages.isNotEmpty() &&
+                messages.size >= previousMessages.size &&
+                previousMessages.indices.all { index -> messages[index] === previousMessages[index] }
+            if (appended) listState.animateScrollToItem(messages.lastIndex)
+            else listState.scrollToItem(messages.lastIndex)
+        }
+        previousMessages = messages
+    }
 
     Column(modifier.fillMaxSize().padding(padding)) {
         Row(
@@ -2164,6 +2426,27 @@ private fun ChatScreen(
                     Row(Modifier.padding(start = 16.dp, top = 2.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.AutoAwesome, null, tint = Green, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(7.dp)); Text(agentActivity, color = Muted, fontSize = 11.sp)
+                    }
+                }
+            }
+            if (agentEventLog.isNotEmpty()) {
+                item {
+                    var expanded by remember { mutableStateOf(false) }
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 2.dp, vertical = 2.dp).clickable { expanded = !expanded },
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F4F0)),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown, "展开运行记录", tint = Muted, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp)); Text("运行记录 · ${agentEventLog.size}", color = Muted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                            if (expanded) {
+                                Spacer(Modifier.height(5.dp))
+                                agentEventLog.asReversed().forEach { entry -> Text(entry, color = Muted, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(vertical = 1.dp)) }
+                            }
+                        }
                     }
                 }
             }
@@ -2554,6 +2837,8 @@ private fun MemoryScreen(
     activity: MainActivity,
     memories: List<RemoteMemory>,
     status: MemoryRunStatus?,
+    pendingIds: Set<String>,
+    onUpdateMemory: (RemoteMemory, String, String?, () -> Unit) -> Unit,
     onStateChanged: (RemoteState) -> Unit,
     onStatusChanged: (MemoryRunStatus) -> Unit
 ) {
@@ -2609,26 +2894,14 @@ private fun MemoryScreen(
                             Text(memory.content, color = Ink, fontSize = 13.sp, lineHeight = 19.sp, modifier = Modifier.weight(1f))
                         }
                         Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Text(if (memory.status == "active") "已确认" else "待确认", color = if (memory.status == "active") Color(0xFF4A897D) else Color(0xFFB77D55), fontSize = 10.sp)
+                            Text(if (memory.id in pendingIds) "正在同步" else if (memory.status == "active") "已确认" else "待确认", color = if (memory.status == "active") Color(0xFF4A897D) else Color(0xFFB77D55), fontSize = 10.sp)
                             Spacer(Modifier.weight(1f))
-                            if (memory.status == "pending_review") TextButton(enabled = !busy, onClick = {
-                                scope.launch {
-                                    busy = true
-                                    runCatching { gatewayUpdateMemory(activity, memory.id, "active") }
-                                        .onSuccess(onStateChanged)
-                                        .onFailure { snackbar.showSnackbar(it.message ?: "确认记忆失败") }
-                                    busy = false
-                                }
+                            if (memory.status == "pending_review") TextButton(enabled = !busy && memory.id !in pendingIds, onClick = {
+                                onUpdateMemory(memory, "active", null) {}
                             }) { Text("确认", color = Green, fontSize = 11.sp) }
-                            TextButton(enabled = !busy, onClick = { editing = memory; editText = memory.content }) { Text("编辑", color = Green, fontSize = 11.sp) }
-                            TextButton(enabled = !busy, onClick = {
-                                scope.launch {
-                                    busy = true
-                                    runCatching { gatewayUpdateMemory(activity, memory.id, "archived") }
-                                        .onSuccess(onStateChanged)
-                                        .onFailure { snackbar.showSnackbar(it.message ?: "归档记忆失败") }
-                                    busy = false
-                                }
+                            TextButton(enabled = !busy && memory.id !in pendingIds, onClick = { editing = memory; editText = memory.content }) { Text("编辑", color = Green, fontSize = 11.sp) }
+                            TextButton(enabled = !busy && memory.id !in pendingIds, onClick = {
+                                onUpdateMemory(memory, "archived", null) {}
                             }) { Text("归档", color = Color(0xFF9C4B3B), fontSize = 11.sp) }
                         }
                     }
@@ -2638,21 +2911,15 @@ private fun MemoryScreen(
     }
     editing?.let { memory ->
         AlertDialog(
-            onDismissRequest = { if (!busy) editing = null },
+            onDismissRequest = { if (!busy && memory.id !in pendingIds) editing = null },
             title = { Text("编辑记忆", color = Green, fontWeight = FontWeight.Bold) },
             text = { OutlinedTextField(value = editText, onValueChange = { editText = it }, minLines = 3, maxLines = 6, modifier = Modifier.fillMaxWidth()) },
             confirmButton = {
-                Button(enabled = !busy && editText.isNotBlank(), onClick = {
-                    scope.launch {
-                        busy = true
-                        runCatching { gatewayUpdateMemory(activity, memory.id, memory.status, editText.trim()) }
-                            .onSuccess { state -> editing = null; onStateChanged(state); snackbar.showSnackbar("记忆已更新") }
-                            .onFailure { snackbar.showSnackbar(it.message ?: "更新记忆失败") }
-                        busy = false
-                    }
-                }, colors = ButtonDefaults.buttonColors(containerColor = Green)) { Text("保存") }
+                Button(enabled = !busy && memory.id !in pendingIds && editText.isNotBlank(), onClick = {
+                    onUpdateMemory(memory, memory.status, editText.trim()) { editing = null }
+                }, colors = ButtonDefaults.buttonColors(containerColor = Green)) { Text(if (memory.id in pendingIds) "正在保存" else "保存") }
             },
-            dismissButton = { TextButton(enabled = !busy, onClick = { editing = null }) { Text("取消", color = Muted) } }
+            dismissButton = { TextButton(enabled = !busy && memory.id !in pendingIds, onClick = { editing = null }) { Text("取消", color = Muted) } }
         )
     }
 }

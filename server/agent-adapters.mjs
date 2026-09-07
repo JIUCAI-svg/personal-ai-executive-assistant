@@ -3,11 +3,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-function text(value, limit = 20000) {
-  return String(value || '').trim().slice(0, limit);
+function text(value, limit = Infinity) {
+  const normalized = String(value || '').trim();
+  return Number.isFinite(limit) ? normalized.slice(0, limit) : normalized;
 }
 
-function run(command, args, { env = {}, cwd = process.cwd(), timeoutMs = 120000, onStdout = null } = {}) {
+function run(command, args, { env = {}, cwd = process.cwd(), timeoutMs = null, onStdout = null, onStderr = null } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
@@ -17,17 +18,17 @@ function run(command, args, { env = {}, cwd = process.cwd(), timeoutMs = 120000,
     });
     let stdout = '';
     let stderr = '';
-    const timer = setTimeout(() => {
+    const timer = Number.isFinite(timeoutMs) && timeoutMs > 0 ? setTimeout(() => {
       child.kill('SIGTERM');
       reject(new Error(`${command} 执行超时。`));
-    }, timeoutMs);
+    }, timeoutMs) : null;
     child.stdout.on('data', (chunk) => { stdout += chunk; onStdout?.(String(chunk)); });
-    child.stderr.on('data', (chunk) => { stderr += chunk; });
-    child.on('error', (error) => { clearTimeout(timer); reject(error); });
+    child.stderr.on('data', (chunk) => { stderr += chunk; onStderr?.(String(chunk)); });
+    child.on('error', (error) => { if (timer) clearTimeout(timer); reject(error); });
     child.on('close', (code) => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       if (code !== 0) {
-        reject(new Error(`${command} 返回码 ${code}：${text(stderr || stdout, 800)}`));
+        reject(new Error(`${command} 返回码 ${code}：${text(stderr || stdout, 20000)}`));
         return;
       }
       resolve({ stdout, stderr });
@@ -61,23 +62,79 @@ function parseClaudeOutput(stdout) {
   }
 }
 
+function outputText(value) {
+  if (typeof value === 'string') return text(value);
+  if (Array.isArray(value)) return value.map((item) => outputText(item)).filter(Boolean).join('\n').trim();
+  if (!value || typeof value !== 'object') return '';
+  const candidate = value.text ?? value.output_text ?? value.message ?? value.content ?? value.result ?? '';
+  return typeof candidate === 'string' ? text(candidate) : outputText(candidate);
+}
+
+function eventPhase(event, item = undefined) {
+  return String(item?.phase || event?.phase || event?.payload?.phase || '').trim().toLowerCase();
+}
+
+function isFinalPhase(phase) {
+  return !phase || new Set(['final', 'final_answer', 'answer', 'result', 'completed']).has(phase);
+}
+
 function parseCodexOutput(stdout) {
   const lines = text(stdout).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  let result = '';
+  let completedCandidate = '';
+  let finalResult = '';
   let sessionId = null;
+  let sawJson = false;
   for (const line of lines) {
     try {
       const event = JSON.parse(line);
+      sawJson = true;
       if (event.type === 'thread.started') sessionId = text(event.thread_id || event.threadId) || sessionId;
-      if (event.type === 'item.completed' && event.item?.type === 'agent_message') result = text(event.item.text || event.item.message || result);
-      if (event.type === 'turn.completed' && event.last_message) result = text(event.last_message);
-      if (event.type === 'message' && event.role === 'assistant') result = text(event.content || result);
+      const item = event.item || event.payload?.item;
+      const phase = eventPhase(event, item);
+      // `turn.completed.last_message` is the strongest completion signal. A
+      // commentary message can be emitted before it, so it must never win.
+      if (event.type === 'turn.completed' && event.last_message) {
+        const message = outputText(event.last_message);
+        if (message) finalResult = message;
+      }
+      if (event.type === 'item.completed' && item?.type === 'agent_message') {
+        const message = outputText(item);
+        if (message && isFinalPhase(phase)) completedCandidate = message;
+      }
+      // Codex emits agent_message inside an event_msg envelope on some CLI
+      // versions. The phase is essential here: commentary must stay out of
+      // the final chat reply, while final_answer is valid user-facing text.
+      if (event.type === 'event_msg' && event.payload?.type === 'agent_message') {
+        const message = outputText(event.payload.message || event.payload.content);
+        const payloadPhase = eventPhase(event.payload);
+        if (message && payloadPhase && isFinalPhase(payloadPhase)) finalResult = message;
+      }
+      // Some Codex versions expose response items rather than the normalized
+      // item.completed envelope. Only accept an explicitly final message.
+      const responseItem = event.type === 'response_item' ? (event.payload || event.item || event) : null;
+      if (responseItem?.type === 'message' && responseItem.role === 'assistant' && isFinalPhase(eventPhase(responseItem))) {
+        const message = outputText(responseItem.content);
+        if (message) finalResult = message;
+      }
+      if (event.type === 'message' && event.role === 'assistant' && isFinalPhase(phase)) {
+        const message = outputText(event.content);
+        if (message) finalResult = message;
+      }
+      if (event.type === 'task_complete' && event.last_agent_message) {
+        const message = outputText(event.last_agent_message);
+        if (message) finalResult = message;
+      }
     } catch {
       // Codex can emit human-readable diagnostics alongside JSON events.
     }
   }
-  return { content: result || lines[lines.length - 1] || '', sessionId };
+  // When JSON events are present, returning the last arbitrary line can leak
+  // a commentary/status message into the chat. Non-JSON CLI output remains a
+  // useful fallback for older wrappers that print only plain text.
+  return { content: finalResult || completedCandidate || (sawJson ? '' : lines[lines.length - 1] || ''), sessionId };
 }
+
+export { parseCodexOutput };
 
 function codexConfig(provider, mcpUrl, token) {
   const escaped = (value) => JSON.stringify(String(value || ''));
@@ -125,8 +182,8 @@ export async function runAgentEngine({ engine, prompt, provider, appRoot, mcpUrl
     const output = await run('claude', args, {
       cwd: appRoot,
       env: { ANTHROPIC_API_KEY: provider.api_key, ANTHROPIC_BASE_URL: provider.base_url, CLAUDE_CONFIG_DIR: home },
-      timeoutMs: 150000,
-      onStdout: (chunk) => onEvent?.({ type: 'agent_output', text: chunk.slice(-4000) })
+      onStdout: (chunk) => onEvent?.({ type: 'agent_output', stream: 'stdout', text: chunk.slice(-4000) }),
+      onStderr: (chunk) => onEvent?.({ type: 'agent_output', stream: 'stderr', text: chunk.slice(-4000) })
     });
     const parsed = parseClaudeOutput(output.stdout);
     return { engine: selected, content: parsed.content, sessionId: parsed.sessionId || nativeSessionId || null };
@@ -137,26 +194,46 @@ export async function runAgentEngine({ engine, prompt, provider, appRoot, mcpUrl
     // need a directory argument.
     ? ['exec', 'resume', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', ...imagePaths.flatMap((file) => ['-i', file]), nativeSessionId, prompt]
     : ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', ...imagePaths.flatMap((file) => ['-i', file]), '-C', appRoot, prompt];
+  let flushStdout = null;
   const output = await run('codex', args, {
       cwd: appRoot,
       env: {
         CODEX_HOME: home, OPENAI_API_KEY: provider.api_key,
         FORWARD_MCP_TOKEN: accessToken || mcpToken || '', FORWARD_MCP_ACCESS_TOKEN: accessToken || ''
       },
-      timeoutMs: 150000,
-      onStdout: (chunk) => {
-        for (const line of String(chunk).split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+      onStdout: (() => {
+        // stdout chunks can split a JSON line at any byte boundary. Buffer
+        // until a complete newline-delimited event is available, then retain
+        // the raw event in the run log while parsing it for UI activity.
+        let pending = '';
+        const consume = (input, flush = false) => {
+          pending += String(input || '');
+          const lines = pending.split(/\r?\n/);
+          if (!flush) pending = lines.pop() || '';
+          else pending = '';
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
           try {
-            const event = JSON.parse(line);
+            const event = JSON.parse(trimmed);
             onEvent?.({
               type: event.type || 'agent_event',
               text: event.item?.text || event.item?.message || event.last_message || '',
               item_type: event.item?.type || ''
             });
-          } catch { /* diagnostics are intentionally omitted from the event stream */ }
-        }
-      }
+          } catch {
+            // Keep human-readable CLI diagnostics in the run log as well.
+            onEvent?.({ type: 'agent_output', stream: 'stdout', text: trimmed.slice(-4000) });
+          }
+          }
+        };
+        flushStdout = () => consume('', true);
+        return (chunk) => consume(chunk, false);
+      })(),
+      onStderr: (chunk) => onEvent?.({ type: 'agent_output', stream: 'stderr', text: chunk.slice(-4000) })
     });
+  // Flush a final unterminated line emitted by some CLI wrappers.
+  flushStdout?.();
   const parsed = parseCodexOutput(output.stdout);
   return { engine: selected, content: parsed.content, sessionId: parsed.sessionId || nativeSessionId || null, sessionHome: home };
 }

@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { applyDailyMemoryResult } from './memory-organizer.mjs';
+import { deriveProactiveKey, normalizeProactiveSignal } from './proactive-signals.mjs';
 
 const SHANGHAI_TIME_ZONE = 'Asia/Shanghai';
 const DEFAULT_SETTINGS = {
@@ -185,6 +186,8 @@ export function createDefaultAssistantState() {
     memory_organizer_runs: [],
     daily_reviews: [],
     action_logs: [],
+    proactive_runs: [],
+    proactive_signals: [],
     app_usage_daily: [],
     device_activity_daily: [],
     alarms: [],
@@ -274,10 +277,36 @@ export function repairAssistantState(source) {
     memory_organizer_runs: Array.isArray(state.memory_organizer_runs) ? state.memory_organizer_runs : [],
     daily_reviews: Array.isArray(state.daily_reviews) ? state.daily_reviews : [],
     action_logs: Array.isArray(state.action_logs) ? state.action_logs : [],
+    proactive_runs: Array.isArray(state.proactive_runs) ? state.proactive_runs : [],
+    proactive_signals: Array.isArray(state.proactive_signals) ? state.proactive_signals : [],
     app_usage_daily: Array.isArray(state.app_usage_daily) ? state.app_usage_daily : [],
     device_activity_daily: Array.isArray(state.device_activity_daily) ? state.device_activity_daily : [],
-    alarms: Array.isArray(state.alarms) ? state.alarms : [],
-    followups: Array.isArray(state.followups) ? state.followups : [],
+    alarms: (Array.isArray(state.alarms) ? state.alarms : []).map((alarm) => ({
+      ...alarm,
+      status: ['pending_device', 'active', 'cancel_pending_device', 'cancelled', 'fired', 'failed'].includes(alarm?.status)
+        ? alarm.status
+        : 'pending_device',
+      device_id: normalizeNullableId(alarm?.device_id, 160),
+      device_status: normalizeText(alarm?.device_status, 40) || 'pending',
+      device_error: normalizeText(alarm?.device_error, 500) || '',
+      last_device_event_at: normalizeText(alarm?.last_device_event_at, 80),
+      last_device_event_id: normalizeText(alarm?.last_device_event_id, 160),
+      status_before_cancel: ['pending_device', 'active'].includes(alarm?.status_before_cancel)
+        ? alarm.status_before_cancel
+        : null
+    })),
+    followups: (Array.isArray(state.followups) ? state.followups : []).map((followup) => ({
+      ...followup,
+      status: ['scheduled', 'dispatched', 'completed', 'cancelled', 'failed'].includes(followup?.status) ? followup.status : 'scheduled',
+      notify_user: followup?.notify_user === true,
+      message: normalizeText(followup?.message, 500),
+      device_id: normalizeNullableId(followup?.device_id, 160),
+      device_status: normalizeText(followup?.device_status, 40) || 'pending',
+      device_error: normalizeText(followup?.device_error, 500) || '',
+      retry_count: Math.max(0, Number(followup?.retry_count) || 0),
+      last_device_event_at: normalizeText(followup?.last_device_event_at, 80),
+      last_device_event_id: normalizeText(followup?.last_device_event_id, 160)
+    })),
     ai_preferences: aiPreferences,
     sleep_wake_events: Array.isArray(state.sleep_wake_events) ? state.sleep_wake_events : []
   };
@@ -350,7 +379,7 @@ function finalizeDailyReview(state, date, timestamp) {
   return true;
 }
 
-function ensureDailyTaskInstances(state, current = nowParts()) {
+export function ensureDailyTaskInstances(state, current = nowParts()) {
   const window = todayPlanningWindow(state.settings, current);
   const planningDate = window.planning_date;
   const timestamp = isoAt(current.date, current.time);
@@ -426,7 +455,8 @@ function buildPlan(state, current = nowParts()) {
     .filter((task) => !task.long_task_id || task.occurrence_date === window.planning_date)
     // A child follows its parent project's priority/deadline, so adding a
     // subtask to an urgent parent does not strand it behind unrelated work.
-    .sort((left, right) => (planningParent(right).priority - planningParent(left).priority)
+    .sort((left, right) => ((right.id === state.current_task_id ? 1 : 0) - (left.id === state.current_task_id ? 1 : 0))
+      || (planningParent(right).priority - planningParent(left).priority)
       || (dueWeight(planningParent(left)) - dueWeight(planningParent(right)))
       || ((Number(planningParent(left).sort_order ?? left.sort_order) || 0)
         - (Number(planningParent(right).sort_order ?? right.sort_order) || 0))
@@ -463,9 +493,16 @@ function buildPlan(state, current = nowParts()) {
   const configuredBufferMinutes = Number.isFinite(Number(state.settings.buffer_minutes))
     ? Math.max(0, Math.min(1440, Number(state.settings.buffer_minutes)))
     : DEFAULT_SETTINGS.buffer_minutes;
-  const bufferMinutes = Math.min(configuredBufferMinutes, usableMinutes);
+  const selectedTask = candidateTaskItems.find((task) => task.id === state.current_task_id);
+  // A task the user explicitly selected as current takes precedence over
+  // optional buffer. Preserve whatever buffer still fits before sleep, rather
+  // than hiding an already-running timer from the plan near the day boundary.
+  const selectedMinutes = selectedTask ? Math.max(5, Math.min(720, Number(selectedTask.estimated_minutes) || 45)) : 0;
+  const bufferMinutes = selectedTask
+    ? Math.min(configuredBufferMinutes, Math.max(0, usableMinutes - selectedMinutes))
+    : Math.min(configuredBufferMinutes, usableMinutes);
   const planningLimit = window.end_absolute_minutes - bufferMinutes;
-  let cursor = Math.min(window.end_absolute_minutes, window.current_minutes + 5);
+  let cursor = Math.min(window.end_absolute_minutes, window.current_minutes + (selectedTask ? 0 : 5));
   const scheduled = [];
   const runningSession = (state.time_sessions || []).find((session) => session.status === 'running');
   const activeTimer = runningSession ? {
@@ -621,7 +658,34 @@ function buildPlan(state, current = nowParts()) {
       const selectedIndex = state.current_task_id
         ? scheduled.findIndex((item) => item.id === state.current_task_id)
         : -1;
-      return scheduled[selectedIndex >= 0 ? selectedIndex : 0] || null;
+      if (selectedIndex >= 0) return scheduled[selectedIndex];
+      // A task explicitly selected by the user remains the current context
+      // even when the remaining window is too short (or sleep has started) to
+      // place it on the ordinary timeline. Keep it out of scheduled totals;
+      // the active timer and the compact current-task view must not disappear.
+      if (selectedTask) {
+        return {
+          id: selectedTask.id,
+          title: selectedTask.title,
+          project: taskProject(selectedTask, state.projects)?.name || '未归类',
+          priority: selectedTask.priority,
+          estimated_minutes: selectedMinutes,
+          start: current.time,
+          end: '',
+          date: current.date,
+          status: selectedTask.status,
+          due_at: selectedTask.due_at,
+          notes: selectedTask.notes || '',
+          parent_task_id: selectedTask.parent_task_id || null,
+          parent_title: parentTitle(selectedTask) || null,
+          long_task_id: selectedTask.long_task_id || null,
+          occurrence_date: selectedTask.occurrence_date || null,
+          actual_minutes: selectedTask.actual_minutes || 0,
+          actual_seconds: elapsedSecondsForTask(selectedTask.id),
+          outside_schedule_window: true
+        };
+      }
+      return scheduled[0] || null;
     })(),
     next_task: (() => {
       const selectedIndex = state.current_task_id
@@ -710,6 +774,25 @@ function sleepWakeSummary(state) {
   };
 }
 
+export function stateWithPlan(state, revision = Number(state.state_revision) || 0, scope = 'local') {
+  return { ...state, state_revision: revision, state_scope: scope, plan: buildPlan(state), sleep_wake_summary: sleepWakeSummary(state) };
+}
+
+// A UI response is a projection, never a replacement for the persisted archive.
+// Transcript images and historical logs remain available through scoped APIs/export.
+export function projectAssistantUiState(state) {
+  const keys = ['version', 'updated_at', 'state_revision', 'state_scope', 'current_task_id',
+    'settings', 'projects', 'tasks', 'long_tasks', 'memory_items', 'ai_preferences', 'plan', 'sleep_wake_summary'];
+  return {
+    ...Object.fromEntries(keys.filter((key) => key in state).map((key) => [key, state[key]])),
+    projection: 'ui',
+    history_counts: Object.fromEntries(['threads', 'messages', 'time_sessions', 'action_logs', 'proactive_runs', 'proactive_signals',
+      'daily_reviews', 'daily_memory_summaries', 'memory_organizer_runs', 'app_usage_daily',
+      'device_activity_daily', 'sleep_wake_events', 'alarms', 'followups']
+      .map((key) => [key, Array.isArray(state[key]) ? state[key].length : 0]))
+  };
+}
+
 export class AssistantStateStore {
   constructor(vaultPath) {
     this.rootPath = path.join(vaultPath, '.forward-assistant');
@@ -732,6 +815,7 @@ export class AssistantStateStore {
       ensureDailyTaskInstances(state);
       const result = await operation(state);
       state.updated_at = isoAt(nowParts().date, nowParts().time);
+      state.state_revision = (Number(state.state_revision) || 0) + 1;
       await mkdir(this.rootPath, { recursive: true });
       const temporaryPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
       await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
@@ -752,11 +836,10 @@ export class AssistantStateStore {
     } else {
       state = await this.read();
       if (ensureDailyTaskInstances(state)) {
-        await this.mutate((draft) => draft);
-        state = await this.read();
+        state = await this.mutate((draft) => draft);
       }
     }
-    return { ...state, plan: buildPlan(state), sleep_wake_summary: sleepWakeSummary(state) };
+    return stateWithPlan(state);
   }
 
   async createThread(options = {}) {
@@ -792,12 +875,25 @@ export class AssistantStateStore {
         action_result: actionResult,
         attachments: normalizeMessageAttachments(attachments),
         request_id: normalizeNullableId(metadata?.request_id, 120),
+        ...(metadata?.proactive === true ? { proactive: true } : {}),
+        ...(normalizeNullableId(metadata?.signal_id, 160) ? { signal_id: normalizeNullableId(metadata.signal_id, 160) } : {}),
+        ...(normalizeNullableId(metadata?.run_id, 160) ? { proactive_run_id: normalizeNullableId(metadata.run_id, 160) } : {}),
+        ...(typeof metadata?.delivered === 'boolean' ? { delivered: metadata.delivered } : {}),
+        ...(normalizeText(metadata?.delivery_status, 40) ? { delivery_status: normalizeText(metadata.delivery_status, 40) } : {}),
+        ...(metadata?.notification && typeof metadata.notification === 'object' ? { notification: structuredClone(metadata.notification) } : {}),
         created_at: isoAt(current.date, current.time)
       };
       state.messages.push(message);
       const storedThread = state.threads.find((item) => item.id === thread.id);
       if (storedThread) storedThread.updated_at = message.created_at;
       return message;
+    });
+  }
+
+  async appendProactiveAssistantMessage(thread, content, actionResult = null, metadata = {}) {
+    return this.appendMessage(thread, 'assistant', content, actionResult, [], {
+      ...metadata,
+      proactive: true
     });
   }
 
@@ -813,28 +909,23 @@ export class AssistantStateStore {
   }
 
   async listThreads(limit = 60) {
-    const state = await this.mutate((draft) => {
-      const messageCounts = new Map();
-      for (const message of draft.messages || []) messageCounts.set(message.thread_id, (messageCounts.get(message.thread_id) || 0) + 1);
-      const emptyIds = new Set((draft.threads || []).filter((thread) => !thread.locked && (messageCounts.get(thread.id) || 0) === 0).map((thread) => thread.id));
-      if (emptyIds.size) {
-        draft.threads = draft.threads.filter((thread) => !emptyIds.has(thread.id));
-        draft.messages = draft.messages.filter((message) => !emptyIds.has(message.thread_id));
-      }
-      return draft;
-    });
+    const state = await this.read();
+    const summaries = new Map();
+    for (const message of state.messages) {
+      const previous = summaries.get(message.thread_id);
+      summaries.set(message.thread_id, { count: (previous?.count || 0) + 1, last: message });
+    }
     return state.threads
-      .slice()
+      .filter((thread) => thread.locked || summaries.has(thread.id))
       .sort((left, right) => right.updated_at.localeCompare(left.updated_at))
       .slice(0, Math.max(1, Math.min(200, Number(limit) || 60)))
       .map((thread) => {
-        const messages = state.messages.filter((message) => message.thread_id === thread.id);
-        const lastMessage = messages.at(-1);
+        const summary = summaries.get(thread.id);
         return {
           ...thread,
           project_name: taskProject({ project_id: thread.project_id }, state.projects)?.name || '',
-          message_count: messages.length,
-          preview: normalizeText(lastMessage?.content, 100)
+          message_count: summary?.count || 0,
+          preview: normalizeText(summary?.last?.content, 100)
         };
       });
   }
@@ -955,6 +1046,82 @@ export class AssistantStateStore {
       if (content !== undefined) memory.content = normalizeText(content, 220);
       memory.updated_at = isoAt(nowParts().date, nowParts().time);
       return memory;
+    });
+  }
+
+  async claimProactiveRun(signalInput, details = {}) {
+    const signal = normalizeProactiveSignal(signalInput, details);
+    const key = String(signal.idempotency_key || deriveProactiveKey(signal)).slice(0, 200);
+    return this.mutate((state) => {
+      state.proactive_signals ||= [];
+      state.proactive_runs ||= [];
+      const existingSignal = state.proactive_signals.find((item) => (
+        (key && item.idempotency_key === key) || (signal.signal_id && item.signal_id === signal.signal_id)
+      ));
+      const existingRun = existingSignal?.run_id
+        ? state.proactive_runs.find((item) => item.id === existingSignal.run_id)
+        : state.proactive_runs.find((item) => key && item.idempotency_key === key);
+      if (existingRun) {
+        return { claimed: false, duplicate: true, run: existingRun, signal: existingSignal || null };
+      }
+      const timestamp = new Date().toISOString();
+      const storedSignal = {
+        ...signal,
+        id: signal.signal_id || signal.id || id(),
+        signal_id: signal.signal_id || signal.id,
+        idempotency_key: key,
+        status: 'received',
+        created_at: timestamp,
+        updated_at: timestamp
+      };
+      const run = {
+        id: normalizeNullableId(details.run_id, 160) || id(),
+        signal_id: storedSignal.signal_id,
+        idempotency_key: key,
+        type: storedSignal.type,
+        source: storedSignal.source,
+        status: 'processing',
+        thread_id: normalizeNullableId(details.thread_id, 160),
+        started_at: timestamp,
+        updated_at: timestamp,
+        attempts: 1
+      };
+      storedSignal.run_id = run.id;
+      storedSignal.status = 'processing';
+      state.proactive_signals.push(storedSignal);
+      state.proactive_runs.push(run);
+      state.proactive_signals = state.proactive_signals.slice(-2_000);
+      state.proactive_runs = state.proactive_runs.slice(-2_000);
+      return { claimed: true, duplicate: false, run, signal: storedSignal };
+    });
+  }
+
+  async finishProactiveRun(runId, details = {}) {
+    const normalizedId = normalizeNullableId(runId, 160);
+    if (!normalizedId) return { ok: false, reason: '主动运行缺少记录 ID。' };
+    return this.mutate((state) => {
+      const run = (state.proactive_runs || []).find((item) => item.id === normalizedId);
+      if (!run) return { ok: false, reason: '没有找到对应的主动运行记录。' };
+      const timestamp = new Date().toISOString();
+      const status = ['processing', 'suppressed', 'completed', 'failed', 'duplicate'].includes(details.status)
+        ? details.status
+        : (details.error ? 'failed' : 'completed');
+      run.status = status;
+      run.updated_at = timestamp;
+      run.finished_at = timestamp;
+      if (details.thread_id !== undefined) run.thread_id = normalizeNullableId(details.thread_id, 160);
+      if (details.reply !== undefined) run.reply = normalizeText(details.reply, 2_000);
+      if (details.error !== undefined) run.error = normalizeText(details.error, 1_000);
+      if (details.delivered !== undefined) run.delivered = details.delivered === true;
+      if (details.delivery_status !== undefined) run.delivery_status = normalizeText(details.delivery_status, 40);
+      if (Array.isArray(details.action_results)) run.action_results = structuredClone(details.action_results).slice(-20);
+      const signal = (state.proactive_signals || []).find((item) => item.run_id === normalizedId);
+      if (signal) {
+        signal.status = status;
+        signal.updated_at = timestamp;
+        signal.finished_at = timestamp;
+      }
+      return { ok: true, run, signal: signal || null };
     });
   }
 
@@ -1134,10 +1301,11 @@ export class AssistantStateStore {
       };
       if (operation === 'start') {
         if (active && active.task_id !== taskId) close(active, 'paused');
-        const existing = state.time_sessions
+        const existing = active?.task_id === taskId ? active : state.time_sessions
           .filter((session) => session.task_id === taskId && session.status === 'paused' && values.resume !== false)
           .sort((left, right) => Date.parse(String(right.ended_at || '')) - Date.parse(String(left.ended_at || '')))[0];
-        if (existing) { existing.status = 'running'; existing.started_at = timestamp; existing.ended_at = null; }
+        if (existing?.status === 'running') { /* Repeated starts keep the same clock and session. */ }
+        else if (existing) { existing.status = 'running'; existing.started_at = timestamp; existing.ended_at = null; }
         else state.time_sessions.push({ id: id(), task_id: taskId, mode: values.mode === 'countdown' ? 'countdown' : 'stopwatch', target_minutes: Math.max(1, Number(values.target_minutes) || Number(task.estimated_minutes) || 45), started_at: timestamp, ended_at: null, elapsed_seconds: 0, status: 'running', created_at: timestamp });
         task.status = 'in_progress'; task.updated_at = timestamp;
       } else if (operation === 'pause' || operation === 'stop') {
@@ -1318,6 +1486,133 @@ export class AssistantStateStore {
     });
   }
 
+  // The server records the requested device operation first. Android then
+  // reports its local result so the cloud state reflects the real phone state,
+  // instead of treating a generated command as an already-created alarm.
+  async recordDeviceAction(event = {}) {
+    const action = normalizeText(event.action || event.type, 40);
+    const itemId = normalizeText(event.alarm_id || event.followup_id || event.id, 120);
+    const deviceId = normalizeText(event.device_id, 160);
+    const status = normalizeText(event.status, 40).toLowerCase();
+    const error = normalizeText(event.error, 500);
+    const triggerAt = normalizeText(event.trigger_at, 80);
+    const eventAt = normalizeText(event.event_at, 80) || new Date().toISOString();
+    const eventId = normalizeText(event.event_id, 160);
+    if (!['set_alarm', 'cancel_alarm', 'schedule_followup'].includes(action)) {
+      throw new Error('未识别的设备动作。');
+    }
+    if (!itemId) throw new Error('设备动作缺少记录 ID。');
+    if (!['scheduled', 'cancelled', 'triggered', 'dispatched', 'delivered', 'failed'].includes(status)) {
+      throw new Error('设备动作状态无效。');
+    }
+    const eventMillis = Date.parse(eventAt);
+    const isOlderThan = (item) => {
+      if (eventId && item.last_device_event_id === eventId) return true;
+      const previousMillis = Date.parse(item.last_device_event_at || '');
+      return Number.isFinite(eventMillis) && Number.isFinite(previousMillis) && eventMillis <= previousMillis;
+    };
+    const retryDelay = (attempt) => Math.min(30, 2 ** Math.max(0, attempt - 1)) * 60_000;
+    return this.mutate((state) => {
+      const timestamp = new Date().toISOString();
+      if (action === 'schedule_followup') {
+        const followup = (state.followups || []).find((item) => item.id === itemId);
+        if (!followup) return { ok: false, reason: '没有找到对应的延后唤醒。' };
+        if (isOlderThan(followup) || ['completed', 'cancelled'].includes(followup.status)) {
+          return { ok: true, duplicate: true, type: action, followup };
+        }
+        if (deviceId) followup.device_id = deviceId;
+        followup.device_status = status;
+        followup.device_error = status === 'failed' ? error || '手机未能调度延后唤醒。' : '';
+        followup.last_device_event_at = eventAt;
+        if (eventId) followup.last_device_event_id = eventId;
+        if (triggerAt) followup.device_trigger_at = triggerAt;
+        if (status === 'delivered') {
+          followup.status = 'completed';
+          followup.delivered_at = eventAt;
+        } else if (status === 'failed') {
+          const attempt = (Number(followup.retry_count) || 0) + 1;
+          followup.retry_count = attempt;
+          followup.status = 'scheduled';
+          followup.due_at = new Date(Date.now() + retryDelay(attempt)).toISOString();
+          followup.retry_at = followup.due_at;
+          followup.failed_at = eventAt;
+        }
+        followup.updated_at = timestamp;
+        return { ok: true, type: action, followup };
+      }
+
+      const alarm = (state.alarms || []).find((item) => item.id === itemId);
+      if (!alarm) return { ok: false, reason: '没有找到对应的手机闹钟。' };
+      if (isOlderThan(alarm)) return { ok: true, duplicate: true, type: action, alarm };
+      if (deviceId) alarm.device_id = deviceId;
+      alarm.device_status = status;
+      alarm.device_error = status === 'failed' ? error || '手机未能执行闹钟动作。' : '';
+      alarm.last_device_event_at = eventAt;
+      if (eventId) alarm.last_device_event_id = eventId;
+      if (triggerAt) alarm.device_trigger_at = triggerAt;
+
+      if (action === 'set_alarm') {
+        if (status === 'scheduled' && alarm.status !== 'cancel_pending_device') alarm.status = 'active';
+        else if (status === 'triggered') alarm.status = alarm.repeat === 'daily' ? 'active' : 'fired';
+        else if (status === 'failed' && alarm.status !== 'cancel_pending_device') alarm.status = 'failed';
+      } else if (status === 'cancelled') {
+        alarm.status = 'cancelled';
+        alarm.status_before_cancel = null;
+      } else if (status === 'failed') {
+        alarm.status = alarm.status_before_cancel || 'active';
+        alarm.status_before_cancel = null;
+      }
+      alarm.updated_at = timestamp;
+      return { ok: true, type: action, alarm };
+    });
+  }
+
+  async claimDueFollowups(now = Date.now(), followupId = '') {
+    return this.mutate((state) => {
+      const timestamp = new Date().toISOString();
+      const due = (state.followups || []).filter((item) => {
+        if (item.notify_user === true || (followupId && item.id !== followupId)) return false;
+        if (item.status === 'scheduled') return Date.parse(item.due_at) <= now;
+        return item.status === 'dispatched'
+          && Date.parse(item.dispatched_at) <= now - 120_000
+          && Date.parse(item.due_at) <= now;
+      });
+      for (const followup of due) {
+        followup.status = 'dispatched';
+        followup.dispatched_at = timestamp;
+        followup.dispatch_attempts = (Number(followup.dispatch_attempts) || 0) + 1;
+        followup.updated_at = timestamp;
+      }
+      return due;
+    });
+  }
+
+  async completeFollowup(followupId, details = {}) {
+    const normalizedId = normalizeText(followupId, 120);
+    if (!normalizedId) return { ok: false, reason: '延后唤醒缺少记录 ID。' };
+    return this.mutate((state) => {
+      const followup = (state.followups || []).find((item) => item.id === normalizedId);
+      if (!followup) return { ok: false, reason: '没有找到对应的延后唤醒。' };
+      const timestamp = new Date().toISOString();
+      const failed = Boolean(details.failed);
+      if (failed) {
+        const attempt = (Number(followup.retry_count) || 0) + 1;
+        followup.retry_count = attempt;
+        followup.status = 'scheduled';
+        followup.due_at = new Date(Date.now() + Math.min(30, 2 ** Math.max(0, attempt - 1)) * 60_000).toISOString();
+        followup.retry_at = followup.due_at;
+        followup.failed_at = timestamp;
+      } else {
+        followup.status = 'completed';
+      }
+      followup.completed_at = timestamp;
+      followup.proactive_reply = normalizeText(details.reply, 2_000);
+      followup.device_error = failed ? normalizeText(details.error, 500) || '延后判断未完成。' : '';
+      followup.updated_at = timestamp;
+      return { ok: true, followup };
+    });
+  }
+
   async executeActions(actions, context = {}) {
     return this.mutate((state) => {
       const current = nowParts();
@@ -1368,27 +1663,66 @@ export class AssistantStateStore {
               id: id(), time: value, date,
               label: normalizeText(action.label, 120) || '向前提醒',
               repeat: action.repeat === 'daily' ? 'daily' : 'none',
-              status: 'pending_device', device_id: null,
+              status: 'pending_device', device_id: null, device_status: 'pending', device_error: '',
               created_at: timestamp, updated_at: timestamp
             };
             state.alarms.push(alarm);
             state.alarms = state.alarms.slice(-200);
-            result = { type, ok: true, device_required: true, alarm, reason: action.reason || '已生成手机闹钟请求。' };
+            result = {
+              type, ok: true, device_required: true, alarm,
+              reason: '已生成手机系统闹钟请求，等待手机执行确认。'
+            };
           }
         } else if (type === 'schedule_followup') {
           const afterMinutes = Number(action.after_minutes);
           const instruction = normalizeText(action.instruction, 500);
           if (Number.isFinite(afterMinutes) && afterMinutes >= 1 && afterMinutes <= 10080 && instruction) {
+            const notifyUser = action.notify_user === true;
+            const message = normalizeText(action.message, 500) || (notifyUser ? instruction : '');
             const followup = {
               id: id(), due_at: new Date(Date.now() + Math.round(afterMinutes) * 60000).toISOString(),
               after_minutes: Math.round(afterMinutes), instruction,
+              notify_user: notifyUser, message,
               reason: normalizeText(action.reason, 300), status: 'scheduled',
+              device_id: null, device_status: 'pending', device_error: '',
               thread_id: context.thread_id || null, created_at: timestamp, updated_at: timestamp
             };
             state.followups.push(followup);
-            state.followups = state.followups.filter((item) => item.status === 'scheduled').slice(-200);
-            result = { type, ok: true, followup, reason: action.reason || `已安排 ${afterMinutes} 分钟后重新判断。` };
+            // Retain delivered and failed follow-ups so mobile diagnostics can
+            // distinguish a real delivery from a merely generated command.
+            state.followups = state.followups.slice(-500);
+            result = {
+              type, ok: true, device_required: true, followup,
+              reason: action.reason || (notifyUser
+                ? `已安排 ${afterMinutes} 分钟后的直接提醒。`
+                : `已安排 ${afterMinutes} 分钟后重新判断。`)
+            };
           } else result = { type, ok: false, reason: '延迟唤醒需要 1 到 10080 分钟，以及要重新判断的事项。' };
+        } else if (type === 'schedule_self_check') {
+          const afterMinutes = Number(action.after_minutes);
+          const instruction = normalizeText(action.instruction || action.reason, 500);
+          if (Number.isFinite(afterMinutes) && afterMinutes >= 1 && afterMinutes <= 10080 && instruction) {
+            const followup = {
+              id: id(), due_at: new Date(Date.now() + Math.round(afterMinutes) * 60000).toISOString(),
+              after_minutes: Math.round(afterMinutes), instruction, notify_user: false, message: '',
+              reason: normalizeText(action.reason, 300), status: 'scheduled',
+              device_id: null, device_status: 'pending', device_error: '',
+              thread_id: context.thread_id || null, created_at: timestamp, updated_at: timestamp,
+              self_check: true
+            };
+            state.followups.push(followup);
+            state.followups = state.followups.slice(-500);
+            result = { type, ok: true, device_required: true, followup, reason: '已安排下一次主动检查。' };
+          } else result = { type, ok: false, reason: '主动检查需要 1 到 10080 分钟，以及检查事项。' };
+        } else if (type === 'send_proactive_message') {
+          const message = normalizeText(action.message || action.content, 2_000);
+          if (message) {
+            result = {
+              type, ok: true, delivered: true, delivered_at: timestamp,
+              message, notification: { title: normalizeText(action.title, 120) || '向前', body: message },
+              reason: '主动消息已生成并标记为可投递。'
+            };
+          } else result = { type, ok: false, delivered: false, reason: '主动消息不能为空。' };
         } else if (type === 'cancel_alarm') {
           const requestedId = normalizeText(action.alarm_id, 80);
           const requestedLabel = normalizeText(action.label, 120);
@@ -1403,8 +1737,9 @@ export class AssistantStateStore {
                 && (!requestedTime || item.time === requestedTime)
                 && (!requestedDate || item.date === requestedDate));
           if (alarm) {
-            alarm.status = 'cancelled'; alarm.updated_at = timestamp;
-            result = { type, ok: true, device_required: true, alarm, reason: action.reason || '手机闹钟已标记为取消。' };
+            alarm.status_before_cancel = alarm.status;
+            alarm.status = 'cancel_pending_device'; alarm.device_status = 'cancel_pending'; alarm.device_error = ''; alarm.updated_at = timestamp;
+            result = { type, ok: true, device_required: true, alarm, reason: '已请求手机取消闹钟，等待手机执行确认。' };
           } else {
             result = { type, ok: false, device_required: true, alarm: {
               id: requestedId || '', time: requestedTime || '', date: requestedDate, label: requestedLabel || ''
@@ -1530,10 +1865,11 @@ export class AssistantStateStore {
                 session.status = 'paused';
               };
               if (active && active.task_id !== task.id) closeSession(active);
-              const existing = state.time_sessions
+              const existing = active?.task_id === task.id ? active : state.time_sessions
                 .filter((session) => session.task_id === task.id && session.status === 'paused')
                 .sort((left, right) => Date.parse(String(right.ended_at || '')) - Date.parse(String(left.ended_at || '')))[0];
-              if (existing) { existing.status = 'running'; existing.started_at = timestampNow; existing.ended_at = null; }
+              if (existing?.status === 'running') { /* Preserve a repeated selection's timer. */ }
+              else if (existing) { existing.status = 'running'; existing.started_at = timestampNow; existing.ended_at = null; }
               else state.time_sessions.push({ id: id(), task_id: task.id, mode: action.mode === 'countdown' ? 'countdown' : 'stopwatch', target_minutes: Math.max(1, Number(action.target_minutes) || Number(task.estimated_minutes) || 45), started_at: timestampNow, ended_at: null, elapsed_seconds: 0, status: 'running', created_at: timestampNow });
               task.status = 'in_progress';
             }
@@ -1574,10 +1910,11 @@ export class AssistantStateStore {
                 if (type === 'start_task_timer') {
                   state.current_task_id = task.id;
                   if (active && active.task_id !== task.id) closeSession(active);
-                  const existing = state.time_sessions
+                  const existing = active?.task_id === task.id ? active : state.time_sessions
                     .filter((session) => session.task_id === task.id && session.status === 'paused')
                     .sort((left, right) => Date.parse(String(right.ended_at || '')) - Date.parse(String(left.ended_at || '')))[0];
-                  if (existing) { existing.status = 'running'; existing.started_at = timestamp; existing.ended_at = null; }
+                  if (existing?.status === 'running') { /* Repeated starts are idempotent. */ }
+                  else if (existing) { existing.status = 'running'; existing.started_at = timestamp; existing.ended_at = null; }
                   else state.time_sessions.push({ id: id(), task_id: task.id, mode: action.mode === 'countdown' ? 'countdown' : 'stopwatch', target_minutes: Math.max(1, Number(action.target_minutes) || Number(task.estimated_minutes) || 45), started_at: timestamp, ended_at: null, elapsed_seconds: 0, status: 'running', created_at: timestamp });
                   task.status = 'in_progress'; result = { type, ok: true, task, reason: '已开始计时。' };
                 } else {

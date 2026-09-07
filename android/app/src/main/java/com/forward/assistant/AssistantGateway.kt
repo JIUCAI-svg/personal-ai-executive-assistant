@@ -92,7 +92,9 @@ data class RemoteState(
     val memories: List<RemoteMemory>,
     val projects: List<RemoteProject> = emptyList(),
     val tasks: List<RemoteTask> = emptyList(),
-    val longTasks: List<RemoteLongTask> = emptyList()
+    val longTasks: List<RemoteLongTask> = emptyList(),
+    val revision: Long = 0,
+    val stateScope: String = "local"
 )
 
 /** Conversation metadata is deliberately independent from the selected mode. */
@@ -139,6 +141,9 @@ object AssistantSessionStore {
 }
 
 private fun gatewayBaseUrl(): String = BuildConfig.AI_GATEWAY_URL.trim().removeSuffix("/api/assistant/respond").trimEnd('/')
+
+fun gatewayUiUrl(url: String): String = android.net.Uri.parse(url).buildUpon()
+    .appendQueryParameter("view", "ui").build().toString()
 
 private fun remotePlanItem(item: JSONObject): RemotePlanItem = RemotePlanItem(
     id = item.optString("id"), title = item.optString("title"), project = item.optString("project"), notes = item.optString("notes"),
@@ -206,7 +211,8 @@ fun parseRemoteState(json: JSONObject?): RemoteState {
     val longTasks = state.optJSONArray("long_tasks")?.let { array ->
         (0 until array.length()).mapNotNull { index -> array.optJSONObject(index)?.let(::remoteLongTask) }
     }.orEmpty()
-    return RemoteState(parseRemotePlan(state.optJSONObject("plan")), memories, projects, tasks, longTasks)
+    return RemoteState(parseRemotePlan(state.optJSONObject("plan")), memories, projects, tasks, longTasks,
+        state.optLong("state_revision"), state.optString("state_scope", "local"))
 }
 
 private fun remoteThread(item: JSONObject): ConversationThread = ConversationThread(
@@ -232,7 +238,8 @@ private fun optionsJson(options: ConversationOptions): JSONObject = JSONObject()
 }
 
 private fun gatewayConnection(context: Context, endpoint: String, method: String, body: ByteArray? = null): HttpURLConnection {
-    val connection = (URL("${gatewayBaseUrl()}$endpoint").openConnection() as HttpURLConnection).apply {
+    val connection = (URL(gatewayUiUrl("${gatewayBaseUrl()}$endpoint")).openConnection() as HttpURLConnection).apply {
+        setRequestProperty("X-Assistant-View", "ui")
         requestMethod = method
         connectTimeout = 8_000
         readTimeout = 60_000
@@ -376,11 +383,38 @@ suspend fun gatewayExecuteAction(context: Context, threadId: String?, action: JS
     val connection = gatewayConnection(context, "/api/assistant/actions", "POST", request)
     try {
         connection.outputStream.use { it.write(request) }
-        parseRemoteState(connection.readJsonOrThrow("计划更新失败").optJSONObject("state"))
+        val response = connection.readJsonOrThrow("计划更新失败")
+        val results = response.optJSONArray("results")
+        for (index in 0 until (results?.length() ?: 0)) {
+            val result = results?.optJSONObject(index) ?: continue
+            check(result.optBoolean("ok", false)) { result.optString("reason", "计划更新失败") }
+        }
+        parseRemoteState(response.optJSONObject("state"))
     } finally { connection.disconnect() }
 }
 
 data class SupabaseConfig(val url: String, val anonKey: String)
+
+suspend fun gatewayReportDeviceAction(
+    context: Context,
+    action: AssistantAction,
+    status: String,
+    message: String,
+    triggerAtMillis: Long? = null
+) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val id = action.alarmId?.takeIf { it.isNotBlank() } ?: action.followupId?.takeIf { it.isNotBlank() } ?: return@withContext
+    val request = JSONObject().apply {
+        put("action", action.type)
+        if (action.type == "schedule_followup") put("followup_id", id)
+        else put("alarm_id", id)
+        put("status", status); put("device_id", android.provider.Settings.Secure.getString(context.contentResolver, android.provider.Settings.Secure.ANDROID_ID) ?: "android-${context.packageName}")
+        put("message", message); put("event_at", java.time.Instant.now().toString())
+        put("event_id", "${action.type}:${id}:${status}:${System.currentTimeMillis()}:${java.util.UUID.randomUUID()}")
+        triggerAtMillis?.let { put("trigger_at", java.time.Instant.ofEpochMilli(it).toString()) }
+    }.toString().toByteArray(Charsets.UTF_8)
+    val connection = gatewayConnection(context, "/api/assistant/device-actions/status", "POST", request)
+    try { connection.outputStream.use { it.write(request) }; connection.responseCode } finally { connection.disconnect() }
+}
 
 suspend fun gatewaySupabaseConfig(context: Context): SupabaseConfig = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
     val connection = gatewayConnection(context, "/api/auth/config", "GET")
@@ -423,6 +457,37 @@ suspend fun gatewayRunStatus(context: Context, requestId: String): JSONObject = 
     val connection = gatewayConnection(context, "/api/assistant/runs/${java.net.URLEncoder.encode(requestId, "UTF-8")}", "GET")
     try { connection.readJsonOrThrow("读取运行状态失败").optJSONObject("run") ?: error("服务没有返回运行状态") }
     finally { connection.disconnect() }
+}
+
+/** Stream newline-delimited SSE run events until a terminal event arrives. */
+suspend fun gatewayRunEvents(context: Context, requestId: String, onEvent: (JSONObject) -> Unit): JSONObject? = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val encoded = java.net.URLEncoder.encode(requestId, "UTF-8")
+    val connection = gatewayConnection(context, "/api/assistant/runs/$encoded/events", "GET").apply {
+        readTimeout = 0
+        setRequestProperty("Accept", "text/event-stream")
+    }
+    try {
+        val reader = connection.inputStream.bufferedReader()
+        var eventType = "message"
+        val data = StringBuilder()
+        while (true) {
+            val line = reader.readLine() ?: break
+            when {
+                line.startsWith("event:") -> eventType = line.removePrefix("event:").trim()
+                line.startsWith("data:") -> data.append(line.removePrefix("data:").trim())
+                line.isBlank() && data.isNotEmpty() -> {
+                    val event = runCatching { JSONObject(data.toString()).put("_event", eventType) }.getOrNull()
+                    data.setLength(0)
+                    if (event != null) {
+                        onEvent(event)
+                        if (eventType == "completed" || eventType == "failed" || eventType == "closed") return@withContext event
+                    }
+                    eventType = "message"
+                }
+            }
+        }
+        null
+    } finally { connection.disconnect() }
 }
 
 suspend fun gatewayDeleteThread(context: Context, threadId: String): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {

@@ -62,6 +62,10 @@ test('thread APIs preserve a selected conversation and keep temporary chat out o
     assert.equal(changed.thread.memory_scope, false);
     assert.equal(changed.thread.allow_memory_distillation, false);
 
+    // Subscribe before POST to cover the browser's request/SSE race. The
+    // server must hold this stream until beginRun creates the matching entry.
+    const sse = await fetch(`${baseUrl}/api/assistant/runs/run-test-001/events`);
+    assert.equal(sse.headers.get('content-type')?.startsWith('text/event-stream'), true);
     const reply = await (await fetch(`${baseUrl}/api/assistant/respond`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -72,6 +76,10 @@ test('thread APIs preserve a selected conversation and keep temporary chat out o
         conversation_mode: 'project'
       })
     })).json();
+    const sseText = await sse.text();
+    assert.match(sseText, /event: started/);
+    assert.match(sseText, /event: accepted/);
+    assert.match(sseText, /event: completed/);
     assert.equal(reply.thread.id, created.thread.id);
     assert.equal(reply.request_id, 'run-test-001');
 

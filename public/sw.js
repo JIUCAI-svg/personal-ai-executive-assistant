@@ -1,6 +1,6 @@
 // Bump the shell cache whenever the web build changes. API responses must
 // never be served from Cache Storage because tasks and conversations are live.
-const CACHE = 'forward-shell-v3';
+const CACHE = 'forward-shell-v4';
 const BASE = self.registration.scope.endsWith('/') ? self.registration.scope : `${self.registration.scope}/`;
 const ASSETS = [BASE, `${BASE}index.html`, `${BASE}manifest.webmanifest`, `${BASE}app-icon.svg`];
 
