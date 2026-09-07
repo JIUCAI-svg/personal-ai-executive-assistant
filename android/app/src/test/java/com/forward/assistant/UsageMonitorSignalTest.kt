@@ -8,6 +8,38 @@ import org.junit.Test
 
 class UsageMonitorSignalTest {
     @Test
+    fun anyForegroundAppQualifiesWithoutManualTargetSelection() {
+        val snapshot = UsageAppSnapshot(
+            appName = "短视频",
+            packageName = "com.example.video",
+            dailyMinutes = 12,
+            currentSessionMinutes = 10,
+            dailyLimitMinutes = 30,
+            sessionLimitMinutes = 20,
+            isInForeground = true,
+            sessionStartedAt = 1234L
+        )
+        assertTrue(qualifiesForPhoneUsageProactive(snapshot))
+    }
+
+    @Test
+    fun backgroundOrIncompleteSessionDoesNotQualify() {
+        val base = UsageAppSnapshot(
+            appName = "短视频",
+            packageName = "com.example.video",
+            dailyMinutes = 12,
+            currentSessionMinutes = 12,
+            dailyLimitMinutes = 30,
+            sessionLimitMinutes = 20,
+            isInForeground = true,
+            sessionStartedAt = 1234L
+        )
+        assertFalse(qualifiesForPhoneUsageProactive(base.copy(isInForeground = false)))
+        assertFalse(qualifiesForPhoneUsageProactive(base.copy(currentSessionMinutes = 9)))
+        assertFalse(qualifiesForPhoneUsageProactive(base.copy(sessionStartedAt = 0L)))
+    }
+
+    @Test
     fun phoneUsageKeyIsStableAcrossPollingMinutes() {
         val first = phoneUsageIdempotencyKey("com.example.study", 1234L, 10)
         val later = phoneUsageIdempotencyKey("com.example.study", 1234L, 25)

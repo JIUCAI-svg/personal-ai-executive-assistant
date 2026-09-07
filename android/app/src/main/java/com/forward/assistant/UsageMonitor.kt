@@ -58,6 +58,13 @@ internal fun phoneUsageIdempotencyKey(
     return "phone_usage:${packageName.trim()}:$sessionStartedAt:threshold_$threshold"
 }
 
+internal fun qualifiesForPhoneUsageProactive(
+    snapshot: UsageAppSnapshot,
+    thresholdMinutes: Int = PROACTIVE_THRESHOLD_MINUTES
+): Boolean = snapshot.isInForeground &&
+    snapshot.currentSessionMinutes >= thresholdMinutes.coerceAtLeast(1) &&
+    snapshot.sessionStartedAt > 0L
+
 internal fun selfCheckIdempotencyKey(followupId: String): String =
     "schedule_self_check:${followupId.trim()}"
 
@@ -514,6 +521,12 @@ class UsageMonitorService : Service() {
         val targetSnapshots = calculateTargetUsage(usageManager, targetApps, startOfDay, now)
         val installed = installedUsageApps(this).associateBy { it.packageName }
         val topApps = if (UsageMonitorStore.autoTopTen(this)) calculateTopApps(usageManager, startOfDay, now, installed) else emptyList()
+        // Proactive phone-usage signals are based on whichever user app is
+        // currently in the foreground. Manual targets remain useful for the
+        // daily/session limit reminders, while this separate snapshot means
+        // users do not have to pre-select an app to receive the 10-minute AI
+        // check-in.
+        val foregroundSnapshot = calculateForegroundUsage(usageManager, startOfDay, now, installed)
         val deviceActivity = calculateDeviceActivity(usageManager, startOfDay, now, installed)
         UsageMonitorStore.saveUsage(this, targetSnapshots, topApps, deviceActivity)
         getSystemService(NotificationManager::class.java).notify(
@@ -521,9 +534,16 @@ class UsageMonitorService : Service() {
             buildOngoingNotification()
         )
         val snapshot = UsageMonitorStore.snapshot(this)
-        if (UsageMonitorStore.shouldUpload(this)) uploadUsage(snapshot)
+        if (UsageMonitorStore.shouldUpload(this)) uploadUsage(snapshot, foregroundSnapshot)
         sendTargetReminders(targetSnapshots)
-        evaluateAiProactive(targetSnapshots, snapshot)
+        val proactiveSnapshots = buildList {
+            // Prefer the live foreground calculation when it is also a
+            // manually selected target; it has the authoritative session
+            // start used by the 10-minute trigger.
+            foregroundSnapshot?.let { add(it) }
+            addAll(targetSnapshots.filter { target -> target.packageName != foregroundSnapshot?.packageName })
+        }
+        evaluateAiProactive(proactiveSnapshots, snapshot)
         evaluateDueFollowups(snapshot)
     }
 
@@ -586,7 +606,7 @@ class UsageMonitorService : Service() {
         // The gateway owns whether an event warrants a response. A stable key
         // is also persisted locally so five-minute polling cannot re-trigger
         // the same foreground session after the gateway has accepted it.
-        targetSnapshots.filter { it.isInForeground && it.currentSessionMinutes >= PROACTIVE_THRESHOLD_MINUTES && it.sessionStartedAt > 0L }
+        targetSnapshots.filter { qualifiesForPhoneUsageProactive(it) }
             .forEach { target ->
                 val configuredUrl = BuildConfig.AI_GATEWAY_URL.trim()
                 if (configuredUrl.isBlank()) return@forEach
@@ -678,6 +698,64 @@ class UsageMonitorService : Service() {
         }
     }
 
+    /**
+     * Find the latest user-app foreground session and calculate its duration.
+     * UsageStats events are used instead of a hard-coded app list, so any
+     * launchable third-party app can produce the phone_usage signal.
+     */
+    private fun calculateForegroundUsage(
+        usageManager: UsageStatsManager,
+        startOfDay: Long,
+        now: Long,
+        installed: Map<String, InstalledUsageApp>
+    ): UsageAppSnapshot? {
+        val events = usageManager.queryEvents(startOfDay - 24 * 60 * 60 * 1000L, now)
+        val event = UsageEvents.Event()
+        var foregroundPackage = ""
+        var sessionStart = 0L
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event)
+            val packageName = event.packageName.orEmpty()
+            when (event.eventType) {
+                UsageEvents.Event.MOVE_TO_FOREGROUND -> {
+                    val app = installed[packageName]
+                    if (app == null) {
+                        // A launcher/system surface becoming foreground means
+                        // the previously tracked user app is no longer active.
+                        foregroundPackage = ""
+                        sessionStart = 0L
+                    } else if (foregroundPackage != packageName) {
+                        foregroundPackage = packageName
+                        sessionStart = event.timeStamp
+                    }
+                }
+                UsageEvents.Event.MOVE_TO_BACKGROUND -> {
+                    if (packageName == foregroundPackage) {
+                        foregroundPackage = ""
+                        sessionStart = 0L
+                    }
+                }
+            }
+        }
+        if (foregroundPackage.isBlank() || sessionStart <= 0L || now < sessionStart) return null
+        val app = installed[foregroundPackage] ?: return null
+        val currentMillis = (now - sessionStart).coerceAtLeast(0L)
+        val todayMillis = usageManager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startOfDay, now)
+            .asSequence()
+            .filter { it.packageName == foregroundPackage }
+            .sumOf { it.totalTimeInForeground }
+        return UsageAppSnapshot(
+            appName = app.appName,
+            packageName = app.packageName,
+            dailyMinutes = (todayMillis / 60_000L).toInt(),
+            currentSessionMinutes = (currentMillis / 60_000L).toInt(),
+            dailyLimitMinutes = UsageMonitorStore.dailyLimit(this),
+            sessionLimitMinutes = UsageMonitorStore.sessionLimit(this),
+            isInForeground = true,
+            sessionStartedAt = sessionStart
+        )
+    }
+
     private fun calculateTopApps(usageManager: UsageStatsManager, startOfDay: Long, now: Long, installed: Map<String, InstalledUsageApp>): List<UsagePackageSummary> {
         return usageManager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startOfDay, now)
             .asSequence()
@@ -740,7 +818,7 @@ class UsageMonitorService : Service() {
         }
     }
 
-    private suspend fun uploadUsage(snapshot: UsageMonitorSnapshot) = withContext(Dispatchers.IO) {
+    private suspend fun uploadUsage(snapshot: UsageMonitorSnapshot, foregroundSnapshot: UsageAppSnapshot? = null) = withContext(Dispatchers.IO) {
         UsageMonitorStore.markUploadAttempt(this@UsageMonitorService)
         val configuredUrl = BuildConfig.AI_GATEWAY_URL.trim()
         if (configuredUrl.isBlank()) return@withContext
@@ -781,6 +859,26 @@ class UsageMonitorService : Service() {
                             put("updated_at", snapshot.updatedAt)
                             put("date", LocalDate.now().toString())
                             put("source", "android-auto-top-ten")
+                        })
+                    }
+                }
+                // Keep the live foreground session available to the gateway
+                // even when the user has no manually selected targets. This
+                // is also useful between proactive threshold checks.
+                foregroundSnapshot?.let { current ->
+                    if (snapshot.targetApps.none { it.packageName == current.packageName }) {
+                        put(JSONObject().apply {
+                            put("enabled", snapshot.enabled)
+                            put("app", current.appName)
+                            put("package_name", current.packageName)
+                            put("today_minutes", current.dailyMinutes)
+                            put("current_session_minutes", current.currentSessionMinutes)
+                            put("daily_limit_minutes", 0)
+                            put("session_limit_minutes", 0)
+                            put("in_foreground", true)
+                            put("updated_at", snapshot.updatedAt)
+                            put("date", LocalDate.now().toString())
+                            put("source", "android-current-foreground")
                         })
                     }
                 }
