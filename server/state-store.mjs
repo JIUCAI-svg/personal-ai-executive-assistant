@@ -69,6 +69,31 @@ function normalizeText(value, limit = 240) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
 }
 
+// Run errors are diagnostic payloads rather than display labels. Preserve
+// line breaks from the upstream CLI/gateway so a refreshed client can show
+// the same failure that was returned to the original request.
+function normalizeRunDiagnostic(value, limit = 12_000) {
+  return String(value || '').replace(/\r\n/g, '\n').trim().slice(0, limit);
+}
+
+function normalizeAssistantRunEvents(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(-80).map((event) => ({
+    type: normalizeText(event?.type, 80),
+    at: normalizeRunDiagnostic(event?.at, 80),
+    thread_id: normalizeNullableId(event?.thread_id, 160),
+    action_count: Number.isFinite(Number(event?.action_count)) ? Math.max(0, Number(event.action_count)) : undefined,
+    error: normalizeRunDiagnostic(event?.error, 12_000),
+    error_code: normalizeText(event?.error_code, 120),
+    reply: normalizeRunDiagnostic(event?.reply, 12_000),
+    status: normalizeText(event?.status, 40),
+    engine: normalizeText(event?.engine, 40),
+    event_type: normalizeText(event?.event_type, 80),
+    item_type: normalizeText(event?.item_type, 80),
+    text: normalizeRunDiagnostic(event?.text, 2_000)
+  })).filter((event) => event.type);
+}
+
 // JSON clients often serialize an absent parent as the literal string
 // "null". Treat all such sentinel values as an actual missing relationship.
 function normalizeNullableId(value, limit = 120) {
@@ -186,6 +211,10 @@ export function createDefaultAssistantState() {
     memory_organizer_runs: [],
     daily_reviews: [],
     action_logs: [],
+    // Normal chat/Agent runs are deliberately separate from proactive runs:
+    // they are keyed by client request_id and survive a server restart so a
+    // reconnecting mobile client never mistakes a failed run for processing.
+    assistant_runs: [],
     proactive_runs: [],
     proactive_signals: [],
     app_usage_daily: [],
@@ -270,13 +299,37 @@ export function repairAssistantState(source) {
     })),
     messages: (Array.isArray(state.messages) ? state.messages : []).map((message) => ({
       ...message,
-      attachments: normalizeMessageAttachments(message?.attachments)
+      attachments: normalizeMessageAttachments(message?.attachments),
+      ...(message?.failure === true || message?.is_error === true ? { failure: true, is_error: true } : {}),
+      ...(normalizeText(message?.error_code, 120) ? { error_code: normalizeText(message.error_code, 120) } : {})
     })),
     memory_items: Array.isArray(state.memory_items) ? state.memory_items : [],
     daily_memory_summaries: Array.isArray(state.daily_memory_summaries) ? state.daily_memory_summaries : [],
     memory_organizer_runs: Array.isArray(state.memory_organizer_runs) ? state.memory_organizer_runs : [],
     daily_reviews: Array.isArray(state.daily_reviews) ? state.daily_reviews : [],
     action_logs: Array.isArray(state.action_logs) ? state.action_logs : [],
+    assistant_runs: (Array.isArray(state.assistant_runs) ? state.assistant_runs : []).map((run) => ({
+      ...run,
+      id: normalizeNullableId(run?.id || run?.request_id, 160),
+      request_id: normalizeNullableId(run?.request_id || run?.id, 160),
+      thread_id: normalizeNullableId(run?.thread_id, 160),
+      status: ['processing', 'completed', 'failed', 'cancelled'].includes(run?.status) ? run.status : 'processing',
+      started_at: normalizeRunDiagnostic(run?.started_at, 80),
+      updated_at: normalizeRunDiagnostic(run?.updated_at, 80),
+      finished_at: normalizeRunDiagnostic(run?.finished_at, 80) || null,
+      reply: normalizeRunDiagnostic(run?.reply, 12_000),
+      error: normalizeRunDiagnostic(run?.error, 12_000),
+      error_code: normalizeText(run?.error_code, 120),
+      provider_id: normalizeText(run?.provider_id, 120),
+      model: normalizeText(run?.model, 160),
+      agent_engine: normalizeText(run?.agent_engine, 40),
+      message_ids: {
+        user: normalizeNullableId(run?.message_ids?.user, 160),
+        assistant: normalizeNullableId(run?.message_ids?.assistant, 160),
+        error: normalizeNullableId(run?.message_ids?.error, 160)
+      },
+      events: normalizeAssistantRunEvents(run?.events)
+    })).filter((run) => run.id),
     proactive_runs: Array.isArray(state.proactive_runs) ? state.proactive_runs : [],
     proactive_signals: Array.isArray(state.proactive_signals) ? state.proactive_signals : [],
     app_usage_daily: Array.isArray(state.app_usage_daily) ? state.app_usage_daily : [],
@@ -786,7 +839,7 @@ export function projectAssistantUiState(state) {
   return {
     ...Object.fromEntries(keys.filter((key) => key in state).map((key) => [key, state[key]])),
     projection: 'ui',
-    history_counts: Object.fromEntries(['threads', 'messages', 'time_sessions', 'action_logs', 'proactive_runs', 'proactive_signals',
+    history_counts: Object.fromEntries(['threads', 'messages', 'time_sessions', 'action_logs', 'assistant_runs', 'proactive_runs', 'proactive_signals',
       'daily_reviews', 'daily_memory_summaries', 'memory_organizer_runs', 'app_usage_daily',
       'device_activity_daily', 'sleep_wake_events', 'alarms', 'followups']
       .map((key) => [key, Array.isArray(state[key]) ? state[key].length : 0]))
@@ -875,6 +928,8 @@ export class AssistantStateStore {
         action_result: actionResult,
         attachments: normalizeMessageAttachments(attachments),
         request_id: normalizeNullableId(metadata?.request_id, 120),
+        ...(metadata?.failure === true || metadata?.is_error === true ? { failure: true, is_error: true } : {}),
+        ...(normalizeText(metadata?.error_code, 120) ? { error_code: normalizeText(metadata.error_code, 120) } : {}),
         ...(metadata?.proactive === true ? { proactive: true } : {}),
         ...(normalizeNullableId(metadata?.signal_id, 160) ? { signal_id: normalizeNullableId(metadata.signal_id, 160) } : {}),
         ...(normalizeNullableId(metadata?.run_id, 160) ? { proactive_run_id: normalizeNullableId(metadata.run_id, 160) } : {}),
@@ -1047,6 +1102,102 @@ export class AssistantStateStore {
       memory.updated_at = isoAt(nowParts().date, nowParts().time);
       return memory;
     });
+  }
+
+  async startAssistantRun(details = {}) {
+    const runId = normalizeNullableId(details.id || details.request_id, 160);
+    if (!runId) return null;
+    return this.mutate((state) => {
+      const timestamp = new Date().toISOString();
+      state.assistant_runs = Array.isArray(state.assistant_runs) ? state.assistant_runs : [];
+      let run = state.assistant_runs.find((item) => item.id === runId || item.request_id === runId);
+      if (!run) {
+        run = {
+          id: runId,
+          request_id: runId,
+          thread_id: normalizeNullableId(details.thread_id, 160),
+          status: 'processing',
+          started_at: normalizeRunDiagnostic(details.started_at, 80) || timestamp,
+          updated_at: timestamp,
+          finished_at: null,
+          reply: '',
+          error: '',
+          error_code: '',
+          provider_id: normalizeText(details.provider_id, 120),
+          model: normalizeText(details.model, 160),
+          agent_engine: normalizeText(details.agent_engine, 40),
+          message_ids: { user: null, assistant: null, error: null },
+          events: normalizeAssistantRunEvents(details.events)
+        };
+        state.assistant_runs.push(run);
+        state.assistant_runs = state.assistant_runs.slice(-2_000);
+      } else if (run.status === 'processing') {
+        run.thread_id = normalizeNullableId(details.thread_id, 160) || run.thread_id || null;
+        run.provider_id = normalizeText(details.provider_id, 120) || run.provider_id || '';
+        run.model = normalizeText(details.model, 160) || run.model || '';
+        run.agent_engine = normalizeText(details.agent_engine, 40) || run.agent_engine || '';
+        const events = normalizeAssistantRunEvents(details.events);
+        if (events.length) run.events = events;
+        run.updated_at = timestamp;
+      }
+      return structuredClone(run);
+    });
+  }
+
+  async finishAssistantRun(runId, details = {}) {
+    const normalizedId = normalizeNullableId(runId, 160);
+    if (!normalizedId) return null;
+    return this.mutate((state) => {
+      const run = (state.assistant_runs || []).find((item) => item.id === normalizedId || item.request_id === normalizedId);
+      if (!run) return null;
+      const timestamp = new Date().toISOString();
+      const status = ['completed', 'failed', 'cancelled', 'processing'].includes(details.status)
+        ? details.status
+        : (details.error ? 'failed' : 'completed');
+      run.status = status;
+      run.updated_at = timestamp;
+      run.finished_at = status === 'processing' ? null : (normalizeRunDiagnostic(details.finished_at, 80) || timestamp);
+      if (details.thread_id !== undefined) run.thread_id = normalizeNullableId(details.thread_id, 160);
+      if (details.reply !== undefined) run.reply = normalizeRunDiagnostic(details.reply, 12_000);
+      if (details.error !== undefined) run.error = normalizeRunDiagnostic(details.error, 12_000);
+      if (details.error_code !== undefined) run.error_code = normalizeText(details.error_code, 120);
+      if (details.provider_id !== undefined) run.provider_id = normalizeText(details.provider_id, 120);
+      if (details.model !== undefined) run.model = normalizeText(details.model, 160);
+      if (details.agent_engine !== undefined) run.agent_engine = normalizeText(details.agent_engine, 40);
+      if (details.message_ids && typeof details.message_ids === 'object') {
+        run.message_ids = {
+          ...(run.message_ids || { user: null, assistant: null, error: null }),
+          ...Object.fromEntries(['user', 'assistant', 'error'].map((key) => [key, details.message_ids[key] === undefined
+            ? run.message_ids?.[key] || null
+            : normalizeNullableId(details.message_ids[key], 160)]))
+        };
+      }
+      const events = normalizeAssistantRunEvents(details.events);
+      if (events.length) run.events = events;
+      else {
+        const terminal = {
+          type: status,
+          at: timestamp,
+          thread_id: run.thread_id,
+          ...(run.reply ? { reply: run.reply } : {}),
+          ...(run.error ? { error: run.error } : {}),
+          ...(run.error_code ? { error_code: run.error_code } : {})
+        };
+        const previous = Array.isArray(run.events) ? run.events.at(-1) : null;
+        if (!previous || previous.type !== terminal.type || previous.error !== terminal.error || previous.reply !== terminal.reply) {
+          run.events = [...(Array.isArray(run.events) ? run.events : []), terminal].slice(-80);
+        }
+      }
+      return structuredClone(run);
+    });
+  }
+
+  async getAssistantRun(runId) {
+    const normalizedId = normalizeNullableId(runId, 160);
+    if (!normalizedId) return null;
+    const state = await this.read();
+    const run = (state.assistant_runs || []).find((item) => item.id === normalizedId || item.request_id === normalizedId);
+    return run ? structuredClone(run) : null;
   }
 
   async claimProactiveRun(signalInput, details = {}) {

@@ -1648,11 +1648,40 @@ app.patch('/api/assistant/memories/:id', async (request, response, next) => {
 });
 
 app.post('/api/assistant/respond', async (request, response, next) => {
+  // Keep the request-scoped references outside the main try block so the
+  // failure path can persist the same run even when an upstream Agent exits
+  // before a normal response is returned.
+  let runStore = null;
+  let runRecord = null;
+  let runThread = null;
+  let runUserMessage = null;
+  let runRequestId = '';
+  let runProvider = null;
+  let runAgentEngineId = '';
+  const persistRun = async (details) => {
+    if (!runStore?.finishAssistantRun || !runRequestId) return null;
+    try {
+      return await runStore.finishAssistantRun(runRequestId, {
+        ...details,
+        thread_id: details.thread_id ?? runThread?.id ?? runRecord?.thread_id ?? null,
+        provider_id: details.provider_id ?? runProvider?.id ?? '',
+        model: details.model ?? runProvider?.model ?? '',
+        agent_engine: details.agent_engine ?? runAgentEngineId,
+        events: details.events || runRecord?.events || []
+      });
+    } catch (persistError) {
+      // A diagnostic write must never replace the upstream response/error.
+      console.error('Failed to persist assistant run:', persistError?.message || persistError);
+      return null;
+    }
+  };
   try {
     if (!assistantAuthorized(request, response)) return;
     const { store, source } = await requestStateStore(request);
+    runStore = store;
     const body = request.body || {};
     const requestId = stringValue(body.request_id, 120) || crypto.randomUUID();
+    runRequestId = requestId;
     const attachments = normalizeImageAttachments(body.attachments);
     const message = stringValue(body.message, 4000) || (attachments.length ? '请查看我上传的图片。' : '');
     if (!message && !attachments.length) return response.status(400).json({ error: '需要一条消息或图片。' });
@@ -1663,6 +1692,7 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       aiModel,
       body.reasoning_effort || aiReasoningEffort
     );
+    runProvider = provider;
     if (!provider) return response.status(503).json({ error: '尚未配置可用的 AI 提供商或模型。', code: 'AI_PROVIDER_NOT_CONFIGURED' });
     if (body.provider_id || body.provider || body.model || body.reasoning_effort) {
       await store.updateAiPreferences({
@@ -1675,12 +1705,32 @@ app.post('/api/assistant/respond', async (request, response, next) => {
     const thread = await resolveConversationThread(store, body);
     const stateBefore = await store.bootstrap();
     const selectedAgent = stringValue(body.agent_engine || stateBefore.ai_preferences?.agent_engine || 'legacy', 40).toLowerCase();
+    runAgentEngineId = selectedAgent;
     const projectName = threadProjectName(thread, stateBefore);
     const hydratedThread = { ...thread, project_name: projectName };
+    runThread = hydratedThread;
     const run = activeRuns.get(requestId) || beginRun(requestId, hydratedThread.id);
+    runRecord = run;
     run.thread_id = hydratedThread.id;
     runEvent(run, 'accepted', { thread_id: hydratedThread.id });
+    try {
+      await runStore.startAssistantRun({
+        id: requestId,
+        request_id: requestId,
+        thread_id: hydratedThread.id,
+        provider_id: provider.id,
+        model: provider.model,
+        agent_engine: selectedAgent,
+        started_at: run.started_at,
+        events: run.events
+      });
+    } catch (persistError) {
+      // The in-memory run remains authoritative for this live connection; a
+      // transient persistence failure must not prevent the AI request.
+      console.error('Failed to persist assistant run start:', persistError?.message || persistError);
+    }
     const userMessage = await store.appendMessage(hydratedThread, 'user', message, null, attachments, { request_id: requestId });
+    runUserMessage = userMessage;
     const storedConversation = userMessage
       ? (await store.recentMessages(hydratedThread.id, 16)).filter((entry) => entry.id !== userMessage.id)
       : [];
@@ -1788,6 +1838,12 @@ app.post('/api/assistant/respond', async (request, response, next) => {
         request_id: requestId, state: await store.bootstrap()
       };
       finishRun(run, 'completed', { thread_id: hydratedThread.id, message_ids: payload.messageIds, reply: payload.reply });
+      await persistRun({
+        status: 'completed',
+        reply: payload.reply,
+        message_ids: payload.messageIds,
+        events: run.events
+      });
       return response.json(payload);
     }
 
@@ -1865,11 +1921,62 @@ app.post('/api/assistant/respond', async (request, response, next) => {
       return finishAssistantResponse(localFallbackResult(message, intentContext), true);
     }
   } catch (error) {
-    const requestId = stringValue(request.body?.request_id, 120);
-    const run = requestId ? activeRuns.get(requestId) : null;
-    if (run) finishRun(run, 'failed', { error: error?.message || '请求处理失败。' });
-    if (error instanceof SyntaxError) return response.status(502).json({ error: error.message || String(error), code: 'UPSTREAM_PARSE_ERROR' });
-    next(error);
+    const requestId = runRequestId || stringValue(request.body?.request_id, 120);
+    const run = runRecord || (requestId ? activeRuns.get(requestId) : null);
+    const diagnostic = error?.message || '请求处理失败。';
+    const errorCode = error instanceof SyntaxError
+      ? 'UPSTREAM_PARSE_ERROR'
+      : error?.code || 'ASSISTANT_RUN_FAILED';
+    const statusCode = error instanceof SyntaxError ? 502 : Number(error?.status) || 500;
+    let errorMessage = null;
+    // Keep a visible failure card in the conversation when that thread stores
+    // full history. This is deliberately an assistant error message, not a
+    // successful reply, and the durable run status remains authoritative.
+    if (runStore && runThread?.id && runRequestId && !runUserMessage?.failure) {
+      try {
+        errorMessage = await runStore.appendMessage(
+          runThread,
+          'assistant',
+          diagnostic,
+          null,
+          [],
+          {
+            request_id: runRequestId,
+            failure: true,
+            is_error: true,
+            error_code: errorCode
+          }
+        );
+      } catch (persistError) {
+        console.error('Failed to persist assistant failure message:', persistError?.message || persistError);
+      }
+    }
+    const messageIds = {
+      user: runUserMessage?.id || null,
+      assistant: null,
+      error: errorMessage?.id || null
+    };
+    if (run) finishRun(run, 'failed', { error: diagnostic, error_code: errorCode, message_ids: messageIds });
+    const durableRun = await persistRun({
+      status: 'failed',
+      error: diagnostic,
+      error_code: errorCode,
+      message_ids: messageIds,
+      events: run?.events || []
+    });
+    return response.status(statusCode).json({
+      error: diagnostic,
+      code: errorCode,
+      request_id: requestId || null,
+      thread_id: runThread?.id || run?.thread_id || durableRun?.thread_id || null,
+      run: {
+        id: requestId || durableRun?.id || null,
+        status: 'failed',
+        error: diagnostic,
+        error_code: errorCode,
+        message_ids: messageIds
+      }
+    });
   }
 });
 
@@ -1972,19 +2079,47 @@ app.get('/api/assistant/runs/:id', async (request, response, next) => {
     const run = activeRuns.get(requestId);
     const state = await store.bootstrap();
     const messages = (state.messages || []).filter((item) => item.request_id === requestId);
-    const assistant = messages.find((item) => item.role === 'assistant');
-    if (run) {
+    const assistant = messages.find((item) => item.role === 'assistant' && item.failure !== true && item.is_error !== true);
+    const failureMessage = messages.find((item) => item.role === 'assistant' && (item.failure === true || item.is_error === true));
+    const durableRun = run ? null : await store.getAssistantRun?.(requestId);
+    const storedRun = run || durableRun;
+    if (storedRun) {
+      const result = run?.result || {};
+      const storedMessageIds = durableRun?.message_ids || {};
+      const messageIds = {
+        user: messages.find((item) => item.role === 'user')?.id || storedMessageIds.user || null,
+        assistant: assistant && !failureMessage ? assistant.id : storedMessageIds.assistant || null,
+        error: failureMessage?.id || storedMessageIds.error || null
+      };
       return response.json({ ok: true, source, run: {
-        id: run.id, thread_id: run.thread_id, status: run.status,
-        started_at: run.started_at, updated_at: run.updated_at, finished_at: run.finished_at || null,
-        events: run.events, reply: assistant?.content || run.result?.reply || '', message_ids: {
-          user: messages.find((item) => item.role === 'user')?.id || null, assistant: assistant?.id || null
-        }
+        id: storedRun.id || requestId,
+        request_id: storedRun.request_id || requestId,
+        thread_id: storedRun.thread_id || messages[0]?.thread_id || null,
+        status: storedRun.status,
+        started_at: storedRun.started_at || null,
+        updated_at: storedRun.updated_at || null,
+        finished_at: storedRun.finished_at || null,
+        provider_id: storedRun.provider_id || null,
+        model: storedRun.model || null,
+        agent_engine: storedRun.agent_engine || null,
+        events: storedRun.events || [],
+        reply: assistant && !failureMessage ? assistant.content : result.reply || storedRun.reply || '',
+        error: result.error || storedRun.error || failureMessage?.content || '',
+        error_code: result.error_code || storedRun.error_code || failureMessage?.error_code || '',
+        message_ids: messageIds
       }});
     }
     if (messages.length) return response.json({ ok: true, source, run: {
-      id: requestId, thread_id: messages[0].thread_id, status: assistant ? 'completed' : 'processing',
-      events: [], reply: assistant?.content || '', message_ids: { user: messages.find((item) => item.role === 'user')?.id || null, assistant: assistant?.id || null }
+      id: requestId, request_id: requestId, thread_id: messages[0].thread_id,
+      // A transcript containing only a user message predates durable run
+      // tracking; it is no longer safe to report it as actively processing.
+      status: failureMessage ? 'failed' : assistant ? 'completed' : 'closed', events: [], reply: assistant?.content || '',
+      error: failureMessage?.content || '', error_code: failureMessage?.error_code || '',
+      message_ids: {
+        user: messages.find((item) => item.role === 'user')?.id || null,
+        assistant: assistant && !failureMessage ? assistant.id : null,
+        error: failureMessage?.id || null
+      }
     }});
     response.status(404).json({ error: '未找到这次运行记录。' });
   } catch (error) { next(error); }
@@ -2005,7 +2140,8 @@ app.get('/api/assistant/runs/:id/events', async (request, response, next) => {
     // Keep the stream open briefly so that initial started/accepted events are
     // delivered instead of racing to a misleading `closed` terminal event.
     let run = activeRuns.get(requestId);
-    if (!run) {
+    let durableRun = run ? null : await store.getAssistantRun?.(requestId);
+    if (!run && !durableRun) {
       const deadline = Date.now() + 10_000;
       while (!run && !request.destroyed && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 50));
@@ -2017,14 +2153,45 @@ app.get('/api/assistant/runs/:id/events', async (request, response, next) => {
       if (run.status === 'processing') run.listeners.add(send);
       request.on('close', () => run.listeners.delete(send));
     } else {
-      // Runs are retained in the transcript after the in-memory entry expires;
-      // emit a terminal event so a refreshed client can reconcile by request_id.
-      const state = await store.bootstrap();
-      const messages = (state.messages || []).filter((item) => item.request_id === requestId);
-      const assistant = messages.find((item) => item.role === 'assistant');
-      if (messages.length) {
-        send({ type: assistant ? 'completed' : 'closed', at: new Date().toISOString(), status: assistant ? 'completed' : 'processing', reply: assistant?.content || '' });
-      } else send({ type: 'closed', at: new Date().toISOString(), status: 'unknown' });
+      // Rehydrate the run from durable state after a server restart or the
+      // in-memory TTL. A failed Agent must remain a failed terminal event,
+      // including its original diagnostic, rather than becoming processing.
+      durableRun ||= await store.getAssistantRun?.(requestId);
+      if (durableRun) {
+        const events = Array.isArray(durableRun.events) ? durableRun.events : [];
+        events.forEach(send);
+        const terminalType = ['completed', 'failed', 'cancelled', 'closed'].includes(durableRun.status)
+          ? durableRun.status
+          : '';
+        if (!response.writableEnded && terminalType && !events.some((event) => event.type === terminalType)) {
+          send({
+            type: terminalType,
+            at: durableRun.finished_at || new Date().toISOString(),
+            status: durableRun.status,
+            thread_id: durableRun.thread_id || null,
+            ...(durableRun.reply ? { reply: durableRun.reply } : {}),
+            ...(durableRun.error ? { error: durableRun.error } : {}),
+            ...(durableRun.error_code ? { error_code: durableRun.error_code } : {})
+          });
+        }
+        if (!response.writableEnded && !terminalType) {
+          send({ type: 'closed', at: new Date().toISOString(), status: 'unknown', thread_id: durableRun.thread_id || null });
+        }
+      } else {
+        // Keep support for old records written before assistant_runs. A lone
+        // user message is closed/unknown, never an assertion of processing.
+        const state = await store.bootstrap();
+        const messages = (state.messages || []).filter((item) => item.request_id === requestId);
+        const assistant = messages.find((item) => item.role === 'assistant' && !item.failure && !item.is_error);
+        const failureMessage = messages.find((item) => item.role === 'assistant' && (item.failure || item.is_error));
+        if (assistant) {
+          send({ type: 'completed', at: new Date().toISOString(), status: 'completed', reply: assistant.content || '' });
+        } else if (failureMessage) {
+          send({ type: 'failed', at: new Date().toISOString(), status: 'failed', error: failureMessage.content || '', error_code: failureMessage.error_code || '' });
+        } else {
+          send({ type: 'closed', at: new Date().toISOString(), status: messages.length ? 'unknown' : 'unknown' });
+        }
+      }
     }
   } catch (error) { next(error); }
 });

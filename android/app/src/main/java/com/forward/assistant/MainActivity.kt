@@ -219,7 +219,15 @@ data class ScheduledPlanItem(
     val deferredByCapacity: Boolean = false
 )
 
-data class ChatMessage(val fromAssistant: Boolean, val text: String, val imageData: List<String> = emptyList())
+data class ChatMessage(
+    val fromAssistant: Boolean,
+    val text: String,
+    val imageData: List<String> = emptyList(),
+    /** A gateway/Agent failure, not a successful assistant turn. */
+    val isError: Boolean = false,
+    /** Lets a durable run result be reconciled with this local error card. */
+    val requestId: String? = null
+)
 
 private fun decodeImageData(data: String?): Bitmap? = runCatching {
     val encoded = data?.substringAfter(',', "")?.takeIf { it.isNotBlank() } ?: return null
@@ -508,7 +516,9 @@ private suspend fun requestAssistant(
         if (model.isNotBlank()) put("model", model)
         if (agentEngine.isNotBlank()) put("agent_engine", agentEngine)
         put("conversation", JSONArray().apply {
-            conversation.takeLast(12).forEach { entry ->
+            // A failed run is UI/run metadata, never an assistant turn that
+            // should be fed back to the model as conversation context.
+            conversation.filterNot { it.isError }.takeLast(12).forEach { entry ->
                 put(JSONObject().apply {
                     put("role", if (entry.fromAssistant) "assistant" else "user")
                     put("content", entry.text)
@@ -594,8 +604,17 @@ private suspend fun requestAssistant(
         connection.outputStream.use { output -> output.write(payloadBytes) }
         val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
         val body = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-        check(connection.responseCode in 200..299) { JSONObject(body).optString("error", "AI 网关请求失败") }
-        val json = JSONObject(body)
+        val json = runCatching { JSONObject(body) }.getOrElse { JSONObject().put("error", body) }
+        if (connection.responseCode !in 200..299) {
+            val upstreamError = json.optString("error", "AI 网关请求失败").trim().ifBlank { "AI 网关请求失败" }
+            throw AssistantGatewayException(
+                message = upstreamError,
+                code = json.optString("code").trim().ifBlank { null },
+                requestId = json.optString("request_id").trim().ifBlank { requestId },
+                threadId = json.optString("thread_id").trim().ifBlank { null },
+                runStatus = json.optJSONObject("run")?.optString("status")?.trim()?.ifBlank { null }
+            )
+        }
         AssistantResult(
             reply = json.optString("reply"),
             actions = json.optJSONArray("actions")?.let { array ->
@@ -1009,7 +1028,10 @@ private fun ForwardApp(activity: MainActivity) {
             if (aiBusy || threadLoading || (tab != 1 && tab != 4)) return
             runCatching { gatewayLoadThread(activity, target) }
                 .onSuccess { detail ->
-                    if (detail.thread.id == target && detail.messages != messages) messages = detail.messages
+                    if (detail.thread.id == target) {
+                        val reconciled = mergeTranscriptWithLocalRunFailures(detail.messages, messages)
+                        if (reconciled != messages) messages = reconciled
+                    }
                 }
         }
         LaunchedEffect(activity.resumeGeneration, tab, remoteThreadId) {
@@ -1045,10 +1067,11 @@ private fun ForwardApp(activity: MainActivity) {
             // the chat screen blank.
             val currentDetail = currentThreadDeferred.await()?.getOrNull()
             if (currentDetail != null) {
+                val locallyDisplayed = messages
                 remoteThreadId = currentDetail.thread.id
                 AssistantSessionStore.saveCurrentThread(activity, currentDetail.thread.id)
                 conversationOptions = currentDetail.thread.toConversationOptions()
-                messages = currentDetail.messages
+                messages = mergeTranscriptWithLocalRunFailures(currentDetail.messages, locallyDisplayed)
             }
             threadLoading = false
             stateDeferred.await().onSuccess { state ->
@@ -1066,10 +1089,11 @@ private fun ForwardApp(activity: MainActivity) {
                     if (resume != null) {
                         threadLoading = true
                         runCatching { gatewayLoadThread(activity, resume.id) }.onSuccess { detail ->
+                            val locallyDisplayed = if (remoteThreadId == detail.thread.id) messages else emptyList()
                             remoteThreadId = detail.thread.id
                             AssistantSessionStore.saveCurrentThread(activity, detail.thread.id)
                             conversationOptions = detail.thread.toConversationOptions()
-                            messages = detail.messages
+                            messages = mergeTranscriptWithLocalRunFailures(detail.messages, locallyDisplayed)
                         }
                     }
                 }
@@ -1106,10 +1130,11 @@ private fun ForwardApp(activity: MainActivity) {
         var pendingNotificationAction by remember { mutableStateOf<AssistantAction?>(null) }
 
         fun applyLoadedThread(detail: RemoteThreadDetail) {
+            val locallyDisplayed = if (remoteThreadId == detail.thread.id) messages else emptyList()
             remoteThreadId = detail.thread.id
             AssistantSessionStore.saveCurrentThread(activity, detail.thread.id)
             conversationOptions = detail.thread.toConversationOptions()
-            messages = detail.messages
+            messages = mergeTranscriptWithLocalRunFailures(detail.messages, locallyDisplayed)
             input = TextFieldValue()
             agentEventLog = emptyList()
         }
@@ -1437,7 +1462,14 @@ private fun ForwardApp(activity: MainActivity) {
             val requestId = UUID.randomUUID().toString()
             scope.launch {
                 val monitorJob = launch {
-                    val labels = mapOf("started" to "已建立运行记录", "accepted" to "已接收消息", "agent_started" to "Agent 正在运行", "finalizing" to "正在保存工具结果", "completed" to "已完成")
+                    val labels = mapOf(
+                        "started" to "已建立运行记录",
+                        "accepted" to "已接收消息",
+                        "agent_started" to "Agent 正在运行",
+                        "finalizing" to "正在保存工具结果",
+                        "completed" to "已完成",
+                        "failed" to "Agent 请求失败"
+                    )
                     while (true) {
                         val terminal = runCatching {
                             gatewayRunEvents(activity, requestId) { event ->
@@ -1475,15 +1507,37 @@ private fun ForwardApp(activity: MainActivity) {
                     if (status?.optString("status") == "completed") {
                         val recoveredThread = status.optString("thread_id").ifBlank { remoteThreadId.orEmpty() }
                         val detail = recoveredThread.takeIf { it.isNotBlank() }?.let { runCatching { gatewayLoadThread(activity, it) }.getOrNull() }
-                        val recoveredReply = detail?.messages?.lastOrNull { it.fromAssistant }?.text.orEmpty().ifBlank { status.optString("reply") }
+                        val recoveredReply = detail?.messages?.lastOrNull { it.fromAssistant && !it.isError }?.text.orEmpty().ifBlank { status.optString("reply") }
                         if (recoveredReply.isNotBlank()) {
                             messages = messages + ChatMessage(true, recoveredReply)
                             activity.showReplyNotificationIfNeeded(recoveredThread, recoveredReply)
                         }
                         if (recoveredThread.isNotBlank()) { remoteThreadId = recoveredThread; AssistantSessionStore.saveCurrentThread(activity, recoveredThread) }
                     } else {
-                        val rawError = error.message.orEmpty().ifBlank { error.javaClass.name }
-                        messages = messages + ChatMessage(true, rawError)
+                        // A failed Agent run is a terminal result, not an
+                        // assistant reply. Prefer the durable run's original
+                        // upstream error; if the server response was lost,
+                        // display its verbatim HTTP error immediately.
+                        val failedThread = status?.optString("thread_id")
+                            ?.ifBlank { (error as? AssistantGatewayException)?.threadId.orEmpty() }
+                            ?.ifBlank { remoteThreadId.orEmpty() }
+                            .orEmpty()
+                        val failedDetail = failedThread.takeIf { it.isNotBlank() }
+                            ?.let { runCatching { gatewayLoadThread(activity, it) }.getOrNull() }
+                        val rawError = agentFailureText(status, error)
+                        val localFailure = ChatMessage(
+                            fromAssistant = true,
+                            text = rawError,
+                            isError = true,
+                            requestId = requestId
+                        )
+                        if (failedDetail != null) {
+                            remoteThreadId = failedDetail.thread.id
+                            AssistantSessionStore.saveCurrentThread(activity, failedDetail.thread.id)
+                            messages = mergeTranscriptWithLocalRunFailures(failedDetail.messages, messages + localFailure)
+                        } else {
+                            messages = messages + localFailure
+                        }
                     }
                     monitorJob.cancel(); agentActivity = ""; aiBusy = false
                     val queued = queuedMessages.firstOrNull()
@@ -2431,16 +2485,32 @@ private fun ChatScreen(
                     verticalAlignment = Alignment.Top
                 ) {
                     if (message.fromAssistant) {
-                        Icon(Icons.Default.SmartToy, null, tint = Color.White, modifier = Modifier.size(28.dp).clip(RoundedCornerShape(7.dp)).background(Green).padding(6.dp))
+                        Icon(
+                            if (message.isError) Icons.Default.NotificationsNone else Icons.Default.SmartToy,
+                            if (message.isError) "Agent 请求失败" else null,
+                            tint = Color.White,
+                            modifier = Modifier.size(28.dp).clip(RoundedCornerShape(7.dp))
+                                .background(if (message.isError) Coral else Green).padding(6.dp)
+                        )
                         Spacer(Modifier.width(7.dp))
                     }
                     Column(
                         modifier = Modifier
                             .widthIn(max = if (message.fromAssistant) 286.dp else 250.dp)
                             .clip(RoundedCornerShape(8.dp))
-                            .background(if (message.fromAssistant) Color(0xFFE9EFEA) else Green)
+                            .background(
+                                when {
+                                    message.isError -> Color(0xFFFFEEE5)
+                                    message.fromAssistant -> Color(0xFFE9EFEA)
+                                    else -> Green
+                                }
+                            )
                             .padding(11.dp)
                     ) {
+                        if (message.isError) {
+                            Text("Agent 请求失败", color = Color(0xFFA64E26), fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                            Spacer(Modifier.height(4.dp))
+                        }
                         message.imageData.forEach { imageData ->
                             decodeImageData(imageData)?.let { bitmap ->
                                 Image(
@@ -2453,7 +2523,7 @@ private fun ChatScreen(
                             }
                         }
                         if (message.text.isNotBlank()) {
-                            if (message.fromAssistant) MarkdownText(message.text, Ink, 13.sp, 21.sp)
+                            if (message.fromAssistant) MarkdownText(message.text, if (message.isError) Color(0xFF6D3218) else Ink, 13.sp, 21.sp)
                             else Text(message.text, color = Color.White, fontSize = 13.sp, lineHeight = 21.sp)
                         }
                     }

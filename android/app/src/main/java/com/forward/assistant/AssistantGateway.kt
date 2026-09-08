@@ -123,6 +123,48 @@ data class ConversationThread(
 
 data class RemoteThreadDetail(val thread: ConversationThread, val messages: List<ChatMessage>)
 
+/**
+ * The assistant gateway deliberately exposes an Agent's upstream failure
+ * verbatim.  Keep its structured metadata so the chat UI can reconcile the
+ * durable run record without converting a failed run into a normal reply.
+ */
+class AssistantGatewayException(
+    message: String,
+    val code: String? = null,
+    val requestId: String? = null,
+    val threadId: String? = null,
+    val runStatus: String? = null
+) : IllegalStateException(message)
+
+internal fun agentFailureText(persistedError: String?, transportError: Throwable): String {
+    val persisted = persistedError.orEmpty().trim()
+    if (persisted.isNotBlank()) return persisted
+    return transportError.message.orEmpty().trim().ifBlank { transportError.javaClass.name }
+}
+
+internal fun agentFailureText(status: JSONObject?, transportError: Throwable): String = agentFailureText(
+    status?.takeIf { it.optString("status") == "failed" }?.optString("error"),
+    transportError
+)
+
+/**
+ * A local error card must survive transcript polling until the matching
+ * durable terminal message has been written for the same request.
+ */
+internal fun mergeTranscriptWithLocalRunFailures(
+    transcript: List<ChatMessage>,
+    displayed: List<ChatMessage>
+): List<ChatMessage> {
+    val persistedTerminalRequestIds = transcript.asSequence()
+        .filter { it.fromAssistant }
+        .mapNotNull { it.requestId }
+        .toSet()
+    val localFailures = displayed.filter { message ->
+        message.isError && (message.requestId.isNullOrBlank() || message.requestId !in persistedTerminalRequestIds)
+    }
+    return transcript + localFailures
+}
+
 object AssistantSessionStore {
     private const val PREFS = "assistant_session"
     private const val ACCESS_TOKEN = "supabase_access_token"
@@ -146,7 +188,12 @@ object AssistantSessionStore {
         (0 until array.length()).mapNotNull { index ->
             array.optJSONObject(index)?.let { item ->
                 val text = item.optString("text")
-                if (text.isBlank()) null else ChatMessage(item.optBoolean("from_assistant"), text)
+                if (text.isBlank()) null else ChatMessage(
+                    fromAssistant = item.optBoolean("from_assistant"),
+                    text = text,
+                    isError = item.optBoolean("is_error", false),
+                    requestId = item.optString("request_id").trim().ifBlank { null }
+                )
             }
         }
     }.getOrDefault(emptyList())
@@ -157,7 +204,9 @@ object AssistantSessionStore {
             if (message.text.isNotBlank()) {
                 array.put(JSONObject()
                     .put("from_assistant", message.fromAssistant)
-                    .put("text", message.text.take(12_000)))
+                    .put("text", message.text.take(12_000))
+                    .put("is_error", message.isError)
+                    .put("request_id", message.requestId ?: JSONObject.NULL))
             }
         }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
@@ -325,7 +374,13 @@ suspend fun gatewayLoadThread(context: Context, threadId: String, limit: Int = 2
                     }
                 }.orEmpty()
                 if (content.isNotBlank() || imageData.isNotEmpty()) {
-                    ChatMessage(message.optString("role") == "assistant", content, imageData)
+                    ChatMessage(
+                        fromAssistant = message.optString("role") == "assistant",
+                        text = content,
+                        imageData = imageData,
+                        isError = message.optBoolean("failure", false) || message.optBoolean("is_error", false),
+                        requestId = message.optString("request_id").trim().ifBlank { null }
+                    )
                 } else null
             } }
         }.orEmpty()

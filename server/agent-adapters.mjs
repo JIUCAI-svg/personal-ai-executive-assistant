@@ -8,6 +8,18 @@ function text(value, limit = Infinity) {
   return Number.isFinite(limit) ? normalized.slice(0, limit) : normalized;
 }
 
+function commandPrefix(environmentKey, fallbackExecutable) {
+  const executable = text(process.env[`${environmentKey}_EXECUTABLE`]) || fallbackExecutable;
+  let args = [];
+  try {
+    const parsed = JSON.parse(process.env[`${environmentKey}_EXECUTABLE_ARGS`] || '[]');
+    if (Array.isArray(parsed)) args = parsed.map((item) => String(item));
+  } catch {
+    // An invalid optional override behaves like no extra arguments.
+  }
+  return { executable, args };
+}
+
 function run(command, args, { env = {}, cwd = process.cwd(), timeoutMs = null, onStdout = null, onStderr = null } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -179,7 +191,8 @@ export async function runAgentEngine({ engine, prompt, provider, appRoot, mcpUrl
     // The absolute paths are also included in the prompt for deterministic
     // discovery across CLI versions.
     args.push(prompt);
-    const output = await run('claude', args, {
+    const claudeCommand = commandPrefix('FORWARD_CLAUDE', 'claude');
+    const output = await run(claudeCommand.executable, [...claudeCommand.args, ...args], {
       cwd: appRoot,
       env: { ANTHROPIC_API_KEY: provider.api_key, ANTHROPIC_BASE_URL: provider.base_url, CLAUDE_CONFIG_DIR: home },
       onStdout: (chunk) => onEvent?.({ type: 'agent_output', stream: 'stdout', text: chunk.slice(-4000) }),
@@ -195,7 +208,8 @@ export async function runAgentEngine({ engine, prompt, provider, appRoot, mcpUrl
     ? ['exec', 'resume', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', ...imagePaths.flatMap((file) => ['-i', file]), nativeSessionId, prompt]
     : ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', ...imagePaths.flatMap((file) => ['-i', file]), '-C', appRoot, prompt];
   let flushStdout = null;
-  const output = await run('codex', args, {
+  const codexCommand = commandPrefix('FORWARD_CODEX', 'codex');
+  const output = await run(codexCommand.executable, [...codexCommand.args, ...args], {
       cwd: appRoot,
       env: {
         CODEX_HOME: home, OPENAI_API_KEY: provider.api_key,
