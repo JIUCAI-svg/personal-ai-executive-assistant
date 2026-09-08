@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { AssistantStateStore } from '../server/state-store.mjs';
 
 const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const upstreamFailurePattern = /upstream fixture failure/i;
@@ -78,6 +79,26 @@ async function jsonResponse(response) {
     throw new Error(`expected JSON response (${response.status}): ${raw}`);
   }
 }
+
+test('persisted failure cards stay visible but do not become model context', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'forward-agent-failure-context-'));
+  try {
+    const store = new AssistantStateStore(root);
+    const thread = await store.createThread({ mode: 'assistant', save_full_conversation: true });
+    await store.appendMessage(thread, 'user', '第一条用户消息');
+    await store.appendMessage(thread, 'assistant', 'upstream fixture failure', null, [], {
+      request_id: 'failed-request', failure: true, is_error: true, error_code: 'AGENT_ENGINE_FAILED'
+    });
+    await store.appendMessage(thread, 'user', '失败后的用户消息');
+
+    const context = await store.recentMessages(thread.id, 16);
+    assert.deepEqual(context.map((message) => message.content), ['第一条用户消息', '失败后的用户消息']);
+    const detail = await store.getThreadMessages(thread.id);
+    assert.equal(detail.messages.some((message) => message.failure === true), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test('Agent failure is persisted, recoverable after restart, and rendered as a failed run', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'forward-agent-failure-api-'));

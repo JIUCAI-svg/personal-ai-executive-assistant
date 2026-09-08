@@ -12,7 +12,8 @@ function stateFixture() {
     messages: [
       { id: 'm1', thread_id: 'normal', role: 'user', content: '我决定每天晚上十点半开始复盘。', created_at: '2026-08-26T10:00:00+08:00' },
       { id: 'm2', thread_id: 'normal', role: 'assistant', content: '已记录。', created_at: '2026-08-26T10:01:00+08:00' },
-      { id: 'm3', thread_id: 'temp', role: 'user', content: '临时秘密内容', created_at: '2026-08-26T10:02:00+08:00' }
+      { id: 'm3', thread_id: 'temp', role: 'user', content: '临时秘密内容', created_at: '2026-08-26T10:02:00+08:00' },
+      { id: 'm4', thread_id: 'normal', role: 'assistant', content: 'upstream fixture failure', failure: true, is_error: true, created_at: '2026-08-26T10:03:00+08:00' }
     ],
     memory_items: [], daily_memory_summaries: []
   };

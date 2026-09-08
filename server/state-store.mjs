@@ -920,15 +920,16 @@ export class AssistantStateStore {
     if (!thread?.id || !thread.save_full_conversation) return null;
     return this.mutate((state) => {
       const current = nowParts();
+      const isFailureMessage = metadata?.failure === true || metadata?.is_error === true;
       const message = {
         id: id(),
         thread_id: thread.id,
         role: role === 'assistant' ? 'assistant' : 'user',
-        content: normalizeText(content, 12000),
+        content: isFailureMessage ? normalizeRunDiagnostic(content, 12000) : normalizeText(content, 12000),
         action_result: actionResult,
         attachments: normalizeMessageAttachments(attachments),
         request_id: normalizeNullableId(metadata?.request_id, 120),
-        ...(metadata?.failure === true || metadata?.is_error === true ? { failure: true, is_error: true } : {}),
+        ...(isFailureMessage ? { failure: true, is_error: true } : {}),
         ...(normalizeText(metadata?.error_code, 120) ? { error_code: normalizeText(metadata.error_code, 120) } : {}),
         ...(metadata?.proactive === true ? { proactive: true } : {}),
         ...(normalizeNullableId(metadata?.signal_id, 160) ? { signal_id: normalizeNullableId(metadata.signal_id, 160) } : {}),
@@ -954,7 +955,12 @@ export class AssistantStateStore {
 
   async recentMessages(threadId, limit = 16) {
     const state = await this.read();
-    return state.messages.filter((item) => item.thread_id === threadId).slice(-limit);
+    // Error cards remain in the transcript for inspection, but are transport
+    // diagnostics rather than conversational turns. Never feed them back to
+    // an Agent or legacy model as if the assistant had answered normally.
+    return state.messages
+      .filter((item) => item.thread_id === threadId && item.failure !== true && item.is_error !== true)
+      .slice(-limit);
   }
 
   async getThread(threadId) {

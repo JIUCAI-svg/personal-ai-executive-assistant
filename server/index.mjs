@@ -1142,7 +1142,9 @@ app.post('/api/mcp', async (request, response, next) => {
           .map((item) => item.id));
         data = (state.messages || []).filter((item) => {
           if (!query) return false;
-          return searchableThreads.has(item.thread_id) && String(item.content || '').toLocaleLowerCase('zh-CN').includes(query);
+          return searchableThreads.has(item.thread_id)
+            && item.failure !== true && item.is_error !== true
+            && String(item.content || '').toLocaleLowerCase('zh-CN').includes(query);
         }).slice(-readLimit).map((item) => ({
           id: item.id, thread_id: item.thread_id, role: item.role,
           content: stringValue(item.content, 1800), created_at: item.created_at

@@ -22,6 +22,7 @@ export function rawMessagesForDay(state, date) {
   const threads = new Map((Array.isArray(state?.threads) ? state.threads : []).map((thread) => [thread.id, thread]));
   return (Array.isArray(state?.messages) ? state.messages : [])
     .filter((message) => dateFromTimestamp(message.created_at) === date)
+    .filter((message) => message.failure !== true && message.is_error !== true)
     .filter((message) => {
       const thread = threads.get(message.thread_id);
       return thread && thread.mode !== 'temporary' && thread.save_full_conversation !== false;
