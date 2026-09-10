@@ -7,10 +7,10 @@ http://YOUR-SERVER-IP {
     @forward_api path /forward-assistant/api/*
     handle @forward_api {
         uri strip_prefix /forward-assistant
-        reverse_proxy 127.0.0.1:8787 {
-            # The browser never receives this private gateway token.
-            header_up x-forward-token forward-local-9b4179d4a8e547d8a95e0b5e35838d8a
-        }
+        reverse_proxy 127.0.0.1:8787
+        # 切勿在此注入 x-forward-token：注入会让所有经代理的请求自动通过
+        # 网关鉴权，令牌校验形同虚设。浏览器同源请求（Sec-Fetch-Site/Origin）
+        # 与 Android 内置令牌本身就是两条合法通道。
     }
 
     @forward_download path /forward-assistant/download/*
