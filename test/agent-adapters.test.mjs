@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { parseCodexOutput } from '../server/agent-adapters.mjs';
+import { codexConfig, parseCodexOutput } from '../server/agent-adapters.mjs';
 
 test('Codex parser keeps commentary out of the final reply', () => {
   const output = [
@@ -32,4 +32,21 @@ test('Codex parser preserves long completed replies', () => {
   const reply = '长回复'.repeat(6000);
   const output = JSON.stringify({ type: 'turn.completed', last_message: reply });
   assert.equal(parseCodexOutput(output).content, reply);
+});
+
+test('Codex config keeps responses wire protocol (codex dropped chat wire)', () => {
+  const chatProvider = {
+    base_url: 'https://metapi.example/v1', api_key: 'sk-test',
+    model: 'glm-5.3-flash-group', api_mode: 'chat_completions'
+  };
+  // Current codex CLI builds refuse `wire_api = "chat"` at config-load time,
+  // so the generated config must stay responses-only; protocol conversion
+  // belongs to the gateway, not to the generated config.
+  const chatConfig = codexConfig(chatProvider, 'https://gateway.example/mcp', 'token');
+  assert.ok(!chatConfig.includes('wire_api'));
+  assert.match(chatConfig, /base_url = "https:\/\/metapi\.example\/v1"/);
+
+  const responsesProvider = { ...chatProvider, api_mode: 'responses' };
+  const responsesConfig = codexConfig(responsesProvider, 'https://gateway.example/mcp', 'token');
+  assert.ok(!responsesConfig.includes('wire_api'));
 });

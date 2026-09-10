@@ -1,0 +1,1 @@
+Implemented proactive-signals.mjs; state store claim/finish; API route; tools. Tests syntax + proactive/device pass.

@@ -1888,8 +1888,16 @@ app.post('/api/assistant/respond', async (request, response, next) => {
           ...(imagePaths.length ? [`用户上传了 ${imagePaths.length} 张图片，请先读取并分析这些文件：${imagePaths.join('、')}`] : []),
           `用户消息：${message}`
         ].join('\n\n');
+        // The Codex engine speaks the Responses protocol only. When a local
+        // protocol bridge (e.g. LiteLLM) is configured, route codex traffic
+        // through it so chat-completions relays like a self-hosted metapi
+        // work too; other engines keep the provider's own endpoint.
+        const codexBridgeUrl = process.env.FORWARD_CODEX_GATEWAY_URL || '';
+        const engineProvider = selectedAgent === 'codex' && codexBridgeUrl
+          ? { ...provider, base_url: codexBridgeUrl }
+          : provider;
         const agentResult = await runAgentEngine({
-          engine: selectedAgent, prompt: agentPrompt, provider, appRoot, mcpUrl: agentMcpUrl,
+          engine: selectedAgent, prompt: agentPrompt, provider: engineProvider, appRoot, mcpUrl: agentMcpUrl,
           mcpToken: aiGatewayToken, accessToken,
           nativeSessionId: hydratedThread.agent_session_id || '',
           sessionHome: agentSessionHome,

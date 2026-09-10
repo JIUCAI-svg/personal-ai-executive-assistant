@@ -148,8 +148,11 @@ function parseCodexOutput(stdout) {
 
 export { parseCodexOutput };
 
-function codexConfig(provider, mcpUrl, token) {
+export function codexConfig(provider, mcpUrl, token) {
   const escaped = (value) => JSON.stringify(String(value || ''));
+  // Codex speaks the Responses protocol only: current CLI versions refuse to
+  // load a provider with `wire_api = "chat"`, so protocol conversion has to
+  // happen on the gateway side (the provider must serve /v1/responses).
   return [
     'model = ' + escaped(provider.model),
     'model_provider = "forward"',
