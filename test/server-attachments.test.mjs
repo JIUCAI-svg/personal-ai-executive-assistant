@@ -49,6 +49,26 @@ test('appendMessage persists inline images as gateway file references', async ()
   }
 });
 
+test('appendMessage also converts the url-shaped inline payload from normalizeImageAttachments', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'forward-att-urlshape-'));
+  try {
+    const store = new AssistantStateStore(directory);
+    const thread = await store.createThread({ mode: 'assistant', save_full_conversation: true });
+    // This is exactly what normalizeImageAttachments() hands to appendMessage:
+    // the inline payload placed in `url`, not data_url.
+    const message = await store.appendMessage(
+      { id: thread.id, save_full_conversation: true },
+      'user', 'url 形状的图片也要落盘', null,
+      [{ url: TINY_PNG, name: 'u.png', type: 'image/png' }]
+    );
+    assert.match(message.attachments[0].url, /^\/api\/attachments\/.+/);
+    assert.ok(!message.attachments[0].data_url, 'inline payload must not be persisted');
+    assert.ok(existsSync(store.attachmentFilePath(path.basename(message.attachments[0].url))));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('migrateMessageAttachmentsToFiles moves legacy inline images out of the state', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'forward-att-migrate-'));
   try {

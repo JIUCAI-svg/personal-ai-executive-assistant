@@ -891,7 +891,12 @@ export class AssistantStateStore {
     if (!Array.isArray(attachments)) return [];
     const stored = [];
     for (const [index, entry] of attachments.entries()) {
-      const inline = typeof entry === 'string' ? entry : entry?.data_url || entry?.dataUrl || '';
+      // Attachments arrive from two shapes: the raw client shape with
+      // data_url/dataUrl, and normalizeImageAttachments() output where the
+      // inline payload sits in `url`. Both must be converted to files.
+      const inline = typeof entry === 'string'
+        ? entry
+        : entry?.data_url || entry?.dataUrl || entry?.url || '';
       if (typeof inline === 'string' && inline.startsWith('data:')) {
         const saved = await this.storeAttachmentDataUrl(inline, `${baseName}-${index + 1}`);
         if (saved) {

@@ -95,9 +95,12 @@ test('thread APIs preserve a selected conversation and keep temporary chat out o
     const detail = await (await fetch(`${baseUrl}/api/assistant/threads/${created.thread.id}`)).json();
     assert.equal(detail.thread.messages.length, 2);
     assert.deepEqual(detail.thread.messages.map((message) => message.role), ['user', 'assistant']);
-    assert.deepEqual(detail.thread.messages[0].attachments, [{
-      name: 'progress.png', type: 'image/png', data_url: 'data:image/png;base64,aGVsbG8='
-    }]);
+    // Inline uploads are converted to gateway file references on persist.
+    const attachment = detail.thread.messages[0].attachments[0];
+    assert.equal(attachment.name, 'progress.png');
+    assert.equal(attachment.type, 'image/png');
+    assert.match(attachment.url, /^\/api\/attachments\/.+\.png$/);
+    assert.ok(!attachment.data_url);
 
     const temporary = await (await fetch(`${baseUrl}/api/assistant/threads`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
