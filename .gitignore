@@ -11,3 +11,5 @@ android/local.properties
 android/app/build/
 output/
 .forward-assistant/
+.proactive-agent-status.txt
+android/.kotlin/
