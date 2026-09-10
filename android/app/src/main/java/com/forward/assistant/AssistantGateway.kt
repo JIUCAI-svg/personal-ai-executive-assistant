@@ -121,7 +121,7 @@ data class ConversationThread(
     val locked: Boolean = false
 )
 
-data class RemoteThreadDetail(val thread: ConversationThread, val messages: List<ChatMessage>)
+data class RemoteThreadDetail(val thread: ConversationThread, val messages: List<ChatMessage>, val incremental: Boolean = false)
 
 /**
  * The assistant gateway deliberately exposes an Agent's upstream failure
@@ -165,6 +165,34 @@ internal fun mergeTranscriptWithLocalRunFailures(
     return transcript + localFailures
 }
 
+/**
+ * Pure per-thread draft persistence logic, deliberately independent of Android
+ * so that key construction and the save/load/clear semantics are unit-testable
+ * without a Context. Preferences simply apply the returned write entries.
+ */
+internal object ThreadDrafts {
+    internal data class Switch(val previousThreadId: String?, val previousDraft: String, val targetDraft: String)
+    internal data class Snapshot(val threadId: String?, val draft: String)
+    internal fun switch(previousThreadId: String?, previousDraft: String, targetDraft: String): Switch = Switch(previousThreadId, previousDraft, targetDraft)
+    internal fun snapshot(threadId: String?, draft: String): Snapshot = Snapshot(threadId, draft)
+
+    internal fun key(threadId: String?): String {
+        val id = threadId?.trim().orEmpty()
+        return if (id.isBlank()) "thread_draft:<empty>" else "thread_draft:$id"
+    }
+
+    /** The preference write needed to persist [draft]: a null value removes the key. */
+    internal fun write(threadId: String?, draft: String): Pair<String, String?> =
+        key(threadId) to draft.takeIf { it.isNotBlank() }
+
+    /** The preference write needed to drop the draft for [threadId]. */
+    internal fun clear(threadId: String?): Pair<String, String?> =
+        key(threadId) to null
+
+    internal fun read(store: (String) -> String?, threadId: String?): String =
+        store(key(threadId)).orEmpty()
+}
+
 object AssistantSessionStore {
     private const val PREFS = "assistant_session"
     private const val ACCESS_TOKEN = "supabase_access_token"
@@ -179,6 +207,20 @@ object AssistantSessionStore {
         val editor = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(CURRENT_THREAD, threadId.orEmpty())
         if (threadId.isNullOrBlank()) editor.remove(CURRENT_MESSAGES_THREAD).remove(CURRENT_MESSAGES)
         editor.apply()
+    }
+    fun saveDraft(context: Context, threadId: String?, draft: String) {
+        val (key, value) = ThreadDrafts.write(threadId, draft)
+        val editor = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+        if (value == null) editor.remove(key) else editor.putString(key, value)
+        editor.apply()
+    }
+    fun loadDraft(context: Context, threadId: String?): String = ThreadDrafts.read(
+        { context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(it, null) },
+        threadId
+    )
+    fun clearDraft(context: Context, threadId: String?) {
+        val (key, _) = ThreadDrafts.clear(threadId)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(key).apply()
     }
     fun currentMessages(context: Context): List<ChatMessage> = runCatching {
         val preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -320,7 +362,7 @@ private fun optionsJson(options: ConversationOptions): JSONObject = JSONObject()
     options.projectName?.takeIf(String::isNotBlank)?.let { put("project", it) }
 }
 
-private fun gatewayConnection(context: Context, endpoint: String, method: String, body: ByteArray? = null): HttpURLConnection {
+internal fun gatewayConnection(context: Context, endpoint: String, method: String, body: ByteArray? = null): HttpURLConnection {
     val connection = (URL(gatewayUiUrl("${gatewayBaseUrl()}$endpoint")).openConnection() as HttpURLConnection).apply {
         setRequestProperty("X-Assistant-View", "ui")
         requestMethod = method
@@ -360,17 +402,23 @@ suspend fun gatewayListThreads(context: Context, limit: Int = 60): List<Conversa
     } finally { connection.disconnect() }
 }
 
-suspend fun gatewayLoadThread(context: Context, threadId: String, limit: Int = 200): RemoteThreadDetail = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-    val connection = gatewayConnection(context, "/api/assistant/threads/${threadId.trim()}?limit=${limit.coerceIn(1, 500)}", "GET")
+suspend fun gatewayLoadThread(context: Context, threadId: String, limit: Int = 200, after: String? = null): RemoteThreadDetail = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val afterQuery = after?.takeIf(String::isNotBlank)?.let { "&after=" + java.net.URLEncoder.encode(it, "UTF-8") }.orEmpty()
+    val connection = gatewayConnection(context, "/api/assistant/threads/${threadId.trim()}?limit=${limit.coerceIn(1, 500)}$afterQuery", "GET")
     try {
         val json = connection.readJsonOrThrow("读取这段对话失败")
         val rawThread = json.optJSONObject("thread") ?: error("服务没有返回对话内容")
+        val incremental = rawThread.optBoolean("incremental", false)
         val messages = rawThread.optJSONArray("messages")?.let { array ->
             (0 until array.length()).mapNotNull { index -> array.optJSONObject(index)?.let { message ->
                 val content = message.optString("content").trim()
                 val imageData = message.optJSONArray("attachments")?.let { attachments ->
                     (0 until attachments.length()).mapNotNull { attachmentIndex ->
-                        attachments.optJSONObject(attachmentIndex)?.optString("data_url")?.trim()?.takeIf(String::isNotBlank)
+                        val attachment = attachments.optJSONObject(attachmentIndex) ?: return@mapNotNull null
+                        // Newer transcripts reference gateway files; older ones
+                        // still carry inline data URLs.
+                        attachment.optString("url").trim().takeIf(String::isNotBlank)
+                            ?: attachment.optString("data_url").trim().takeIf(String::isNotBlank)
                     }
                 }.orEmpty()
                 if (content.isNotBlank() || imageData.isNotEmpty()) {
@@ -379,12 +427,14 @@ suspend fun gatewayLoadThread(context: Context, threadId: String, limit: Int = 2
                         text = content,
                         imageData = imageData,
                         isError = message.optBoolean("failure", false) || message.optBoolean("is_error", false),
-                        requestId = message.optString("request_id").trim().ifBlank { null }
+                        requestId = message.optString("request_id").trim().ifBlank { null },
+                        id = message.optString("id").trim().ifBlank { null },
+                        createdAt = message.optString("created_at").trim().ifBlank { null }
                     )
                 } else null
             } }
         }.orEmpty()
-        RemoteThreadDetail(remoteThread(rawThread), messages)
+        RemoteThreadDetail(remoteThread(rawThread), messages, incremental)
     } finally { connection.disconnect() }
 }
 

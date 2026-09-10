@@ -496,7 +496,18 @@ object FollowupDispatcher {
 
 class AlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
-        if (intent?.action == "com.forward.assistant.action.FIRE_ALARM") AlarmScheduler.onTriggered(context, intent)
+        when (intent?.action) {
+            "com.forward.assistant.action.FIRE_ALARM" -> AlarmScheduler.onTriggered(context, intent)
+            // Keep the heartbeat chain alive even if the monitor process was
+            // frozen or killed since the last slot.
+            "com.forward.assistant.action.HEARTBEAT" -> {
+                HeartbeatScheduler.scheduleNext(context)
+                androidx.core.content.ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, UsageMonitorService::class.java).apply { action = "com.forward.assistant.action.HEARTBEAT" }
+                )
+            }
+        }
     }
 }
 

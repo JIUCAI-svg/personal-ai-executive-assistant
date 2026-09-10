@@ -101,7 +101,12 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -226,14 +231,38 @@ data class ChatMessage(
     /** A gateway/Agent failure, not a successful assistant turn. */
     val isError: Boolean = false,
     /** Lets a durable run result be reconciled with this local error card. */
-    val requestId: String? = null
+    val requestId: String? = null,
+    /** Server message id; anchors incremental transcript polling. */
+    val id: String? = null,
+    val createdAt: String? = null
 )
 
-private fun decodeImageData(data: String?): Bitmap? = runCatching {
-    val encoded = data?.substringAfter(',', "")?.takeIf { it.isNotBlank() } ?: return null
-    val bytes = Base64.decode(encoded, Base64.DEFAULT)
-    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-}.getOrNull()
+// Transcript images now load from the gateway as files instead of riding
+// inside the state JSON. Decoded bitmaps are cached because Compose may ask
+// for the same image on every recomposition.
+private val imageDataCache = java.util.concurrent.ConcurrentHashMap<String, Bitmap?>()
+
+fun decodeImageData(context: android.content.Context, data: String?): Bitmap? {
+    if (data.isNullOrBlank()) return null
+    if (imageDataCache.containsKey(data)) return imageDataCache[data]
+    val bitmap = runCatching {
+        if (data.startsWith("data:")) {
+            val encoded = data.substringAfter(',', "").takeIf { it.isNotBlank() } ?: return null
+            val bytes = Base64.decode(encoded, Base64.DEFAULT)
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        } else {
+            val connection = gatewayConnection(context, data, "GET")
+            try {
+                check(connection.responseCode in 200..299) { "HTTP ${connection.responseCode}" }
+                val bytes = connection.inputStream.use { input -> input.readBytes() }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            } finally { connection.disconnect() }
+        }
+    }.getOrNull()
+    if (imageDataCache.size > 64) imageDataCache.clear()
+    imageDataCache[data] = bitmap
+    return bitmap
+}
 
 data class BreakTimerState(
     val remainingSeconds: Long = 15 * 60L,
@@ -717,6 +746,7 @@ class MainActivity : ComponentActivity() {
         setContent { ForwardApp(this) }
         if (UsageMonitorStore.enabled(this) && UsageMonitorPermissions.hasUsageAccess(this)) {
             ContextCompat.startForegroundService(this, Intent(this, UsageMonitorService::class.java))
+            HeartbeatScheduler.scheduleNext(this)
         }
     }
 
@@ -890,6 +920,7 @@ class MainActivity : ComponentActivity() {
         UsageMonitorStore.setEnabled(this, enabled)
         if (enabled) {
             ContextCompat.startForegroundService(this, Intent(this, UsageMonitorService::class.java))
+            HeartbeatScheduler.scheduleNext(this)
         } else {
             stopService(Intent(this, UsageMonitorService::class.java))
         }
@@ -910,7 +941,14 @@ private fun ForwardApp(activity: MainActivity) {
         var aiBusy by remember { mutableStateOf(false) }
         var agentActivity by remember { mutableStateOf("") }
         var agentEventLog by remember { mutableStateOf(emptyList<String>()) }
-        var input by remember { mutableStateOf(TextFieldValue()) }
+        var input by remember {
+            mutableStateOf(
+                TextFieldValue(
+                    AssistantSessionStore.currentThread(activity).takeIf(String::isNotBlank)
+                        ?.let { AssistantSessionStore.loadDraft(activity, it) }.orEmpty()
+                )
+            )
+        }
         var sleepTime by remember { mutableStateOf(activity.plannerTime("sleep_time", DEFAULT_SLEEP_MINUTES)) }
         var wakeTime by remember { mutableStateOf(activity.plannerTime("wake_time", DEFAULT_WAKE_MINUTES)) }
         var usageSnapshot by remember { mutableStateOf(activity.usageSnapshot()) }
@@ -1023,18 +1061,32 @@ private fun ForwardApp(activity: MainActivity) {
             // suppression.
             activity.setReplyViewState(tab == 1 || tab == 4, remoteThreadId)
         }
+        // Newest server message id already mirrored into `messages`. Once set,
+        // the 5-second poll only asks for messages after it instead of
+        // re-downloading the whole transcript every tick.
+        var transcriptSyncedThrough: String? = null
         suspend fun reconcileCurrentThread() {
             val target = remoteThreadId?.takeIf { it.isNotBlank() } ?: return
             if (aiBusy || threadLoading || (tab != 1 && tab != 4)) return
-            runCatching { gatewayLoadThread(activity, target) }
+            val after = transcriptSyncedThrough
+            runCatching { gatewayLoadThread(activity, target, after = after) }
                 .onSuccess { detail ->
-                    if (detail.thread.id == target) {
-                        val reconciled = mergeTranscriptWithLocalRunFailures(detail.messages, messages)
-                        if (reconciled != messages) messages = reconciled
+                    if (detail.thread.id != target) return@onSuccess
+                    if (detail.incremental && after != null) {
+                        if (detail.messages.isNotEmpty()) {
+                            messages = mergeTranscriptWithLocalRunFailures(messages + detail.messages, messages)
+                            transcriptSyncedThrough = detail.messages.mapNotNull { it.id }.lastOrNull() ?: after
+                        }
+                    } else {
+                        messages = mergeTranscriptWithLocalRunFailures(detail.messages, messages)
+                        transcriptSyncedThrough = detail.messages.mapNotNull { it.id }.lastOrNull()
                     }
                 }
         }
         LaunchedEffect(activity.resumeGeneration, tab, remoteThreadId) {
+            // A thread switch must re-sync from scratch; the previous thread's
+            // watermark says nothing about this transcript.
+            transcriptSyncedThrough = null
             reconcileCurrentThread()
         }
         LaunchedEffect(tab, remoteThreadId) {
@@ -1072,6 +1124,7 @@ private fun ForwardApp(activity: MainActivity) {
                 AssistantSessionStore.saveCurrentThread(activity, currentDetail.thread.id)
                 conversationOptions = currentDetail.thread.toConversationOptions()
                 messages = mergeTranscriptWithLocalRunFailures(currentDetail.messages, locallyDisplayed)
+                transcriptSyncedThrough = currentDetail.messages.mapNotNull { it.id }.lastOrNull()
             }
             threadLoading = false
             stateDeferred.await().onSuccess { state ->
@@ -1089,11 +1142,19 @@ private fun ForwardApp(activity: MainActivity) {
                     if (resume != null) {
                         threadLoading = true
                         runCatching { gatewayLoadThread(activity, resume.id) }.onSuccess { detail ->
-                            val locallyDisplayed = if (remoteThreadId == detail.thread.id) messages else emptyList()
+                            val previousThread = remoteThreadId?.takeIf { it.isNotBlank() }
+                            val sameThread = previousThread == detail.thread.id
+                            val draftSwitch = ThreadDrafts.switch(previousThread, input.text, AssistantSessionStore.loadDraft(activity, detail.thread.id))
+                            if (!sameThread) {
+                                draftSwitch.previousThreadId?.let { AssistantSessionStore.saveDraft(activity, it, draftSwitch.previousDraft) }
+                                input = TextFieldValue(draftSwitch.targetDraft)
+                            }
                             remoteThreadId = detail.thread.id
                             AssistantSessionStore.saveCurrentThread(activity, detail.thread.id)
                             conversationOptions = detail.thread.toConversationOptions()
+                            val locallyDisplayed = if (sameThread) messages else emptyList()
                             messages = mergeTranscriptWithLocalRunFailures(detail.messages, locallyDisplayed)
+                            transcriptSyncedThrough = detail.messages.mapNotNull { it.id }.lastOrNull()
                         }
                     }
                 }
@@ -1129,13 +1190,48 @@ private fun ForwardApp(activity: MainActivity) {
         }
         var pendingNotificationAction by remember { mutableStateOf<AssistantAction?>(null) }
 
+        fun saveCurrentDraft() {
+            remoteThreadId?.takeIf { it.isNotBlank() }
+                ?.let { AssistantSessionStore.saveDraft(activity, it, input.text) }
+        }
+
+        fun clearCurrentDraft() {
+            remoteThreadId?.takeIf { it.isNotBlank() }
+                ?.let { AssistantSessionStore.clearDraft(activity, it) }
+        }
+
+        val latestThreadId by rememberUpdatedState(remoteThreadId)
+        val latestInput by rememberUpdatedState(input.text)
+        DisposableEffect(activity) {
+            val observer = LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
+                    val snapshot = ThreadDrafts.snapshot(latestThreadId, latestInput)
+                    snapshot.threadId?.takeIf { it.isNotBlank() }?.let { threadId ->
+                        AssistantSessionStore.saveDraft(activity, threadId, snapshot.draft)
+                    }
+                }
+            }
+            activity.lifecycle.addObserver(observer)
+            onDispose { activity.lifecycle.removeObserver(observer) }
+        }
+        LaunchedEffect(remoteThreadId, input.text) {
+            val threadId = remoteThreadId?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+            delay(150)
+            if (remoteThreadId == threadId) AssistantSessionStore.saveDraft(activity, threadId, input.text)
+        }
+
         fun applyLoadedThread(detail: RemoteThreadDetail) {
             val locallyDisplayed = if (remoteThreadId == detail.thread.id) messages else emptyList()
+            val previousThread = remoteThreadId?.takeIf { it.isNotBlank() }
+            val sameThread = previousThread == detail.thread.id
+            // Persist any in-flight draft before leaving a real thread. A same-thread
+            // reapply (e.g. reconcile/notification) must not wipe the composer.
+            if (!sameThread) previousThread?.let { AssistantSessionStore.saveDraft(activity, it, input.text) }
             remoteThreadId = detail.thread.id
             AssistantSessionStore.saveCurrentThread(activity, detail.thread.id)
             conversationOptions = detail.thread.toConversationOptions()
             messages = mergeTranscriptWithLocalRunFailures(detail.messages, locallyDisplayed)
-            input = TextFieldValue()
+            if (!sameThread) input = TextFieldValue(AssistantSessionStore.loadDraft(activity, detail.thread.id))
             agentEventLog = emptyList()
         }
 
@@ -1170,6 +1266,10 @@ private fun ForwardApp(activity: MainActivity) {
                 threadLoading = true
                 runCatching { gatewayCreateThread(activity, options) }
                     .onSuccess { thread ->
+                        // Save the old thread's in-flight draft before switching to a
+                        // brand-new conversation whose draft always starts empty.
+                        saveCurrentDraft()
+                        AssistantSessionStore.clearDraft(activity, thread.id)
                         remoteThreadId = thread.id
                         AssistantSessionStore.saveCurrentThread(activity, thread.id)
                         conversationOptions = thread.toConversationOptions()
@@ -1449,6 +1549,7 @@ private fun ForwardApp(activity: MainActivity) {
                 queuedMessages = queuedMessages + (text to pendingImageData)
                 pendingImageData = emptyList()
                 input = TextFieldValue()
+                clearCurrentDraft()
                 return
             }
             val priorConversation = messages
@@ -1456,6 +1557,7 @@ private fun ForwardApp(activity: MainActivity) {
             pendingImageData = emptyList()
             messages = messages + ChatMessage(false, text, images)
             input = TextFieldValue()
+            clearCurrentDraft()
             aiBusy = true
             agentActivity = "正在连接 Agent"
             agentEventLog = emptyList()
@@ -1540,6 +1642,9 @@ private fun ForwardApp(activity: MainActivity) {
                         }
                     }
                     monitorJob.cancel(); agentActivity = ""; aiBusy = false
+                    // Local failure cards (and any optimistic turns) must be
+                    // reconciled against the durable transcript once.
+                    transcriptSyncedThrough = null
                     val queued = queuedMessages.firstOrNull()
                     if (queued != null) {
                         queuedMessages = queuedMessages.drop(1)
@@ -1572,6 +1677,10 @@ private fun ForwardApp(activity: MainActivity) {
                 activity.showReplyNotificationIfNeeded(completedThreadId, displayReply)
                 aiBusy = false
                 agentActivity = ""
+                // The optimistic user turn and local reply are reconciled with
+                // the persisted transcript (which now stores file references)
+                // on the next poll.
+                transcriptSyncedThrough = null
                 val queued = queuedMessages.firstOrNull()
                 if (queued != null) {
                     queuedMessages = queuedMessages.drop(1)
@@ -2512,7 +2621,7 @@ private fun ChatScreen(
                             Spacer(Modifier.height(4.dp))
                         }
                         message.imageData.forEach { imageData ->
-                            decodeImageData(imageData)?.let { bitmap ->
+                            decodeImageData(LocalContext.current, imageData)?.let { bitmap ->
                                 Image(
                                     bitmap = bitmap.asImageBitmap(),
                                     contentDescription = "已发送图片",
@@ -2562,7 +2671,7 @@ private fun ChatScreen(
         if (imageData.isNotEmpty()) Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             imageData.forEachIndexed { index, image ->
                 Box(Modifier.size(56.dp).padding(end = 4.dp)) {
-                    decodeImageData(image)?.let { bitmap -> Image(bitmap = bitmap.asImageBitmap(), contentDescription = "待发送图片", contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(6.dp))) }
+                    decodeImageData(LocalContext.current, image)?.let { bitmap -> Image(bitmap = bitmap.asImageBitmap(), contentDescription = "待发送图片", contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(6.dp))) }
                     IconButton(onClick = { onRemoveImage(index) }, modifier = Modifier.size(20.dp).align(Alignment.TopEnd).clip(CircleShape).background(Color.Black.copy(alpha = 0.55f))) { Icon(Icons.Default.Close, "移除图片", tint = Color.White, modifier = Modifier.size(13.dp)) }
                 }
             }

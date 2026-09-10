@@ -1,6 +1,6 @@
 package com.forward.assistant
 
-import java.time.LocalTime
+import java.time.LocalDateTime
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -54,12 +54,19 @@ class UsageMonitorSignalTest {
     }
 
     @Test
-    fun sleepWindowHandlesOvernightBoundary() {
-        val sleep = LocalTime.of(23, 30)
-        val wake = LocalTime.of(8, 0)
-        assertTrue(isWithinLocalSleepWindow(LocalTime.of(23, 45), sleep, wake))
-        assertTrue(isWithinLocalSleepWindow(LocalTime.of(7, 59), sleep, wake))
-        assertFalse(isWithinLocalSleepWindow(LocalTime.of(8, 0), sleep, wake))
-        assertFalse(isWithinLocalSleepWindow(LocalTime.of(14, 0), sleep, wake))
+    fun snapshotDateKeepsItsOwnDayAcrossMidnight() {
+        assertEquals("2026-09-04", snapshotDateFrom("2026-09-04T23:59:09.627"))
+        assertEquals("2026-09-05", snapshotDateFrom("2026-09-05T00:01:02.000"))
+        assertEquals("2026-09-09", snapshotDateFrom("", "2026-09-09"))
+        assertEquals("2026-09-09", snapshotDateFrom("garbage", "2026-09-09"))
+    }
+
+    @Test
+    fun heartbeatKeyCollapsesEachHalfHourSlot() {
+        assertEquals("heartbeat:2026-09-10-00:00", heartbeatIdempotencyKey(LocalDateTime.of(2026, 9, 10, 0, 0)))
+        assertEquals("heartbeat:2026-09-10-00:00", heartbeatIdempotencyKey(LocalDateTime.of(2026, 9, 10, 0, 29, 59)))
+        assertEquals("heartbeat:2026-09-10-00:30", heartbeatIdempotencyKey(LocalDateTime.of(2026, 9, 10, 0, 30)))
+        assertEquals("heartbeat:2026-09-10-08:00", heartbeatIdempotencyKey(LocalDateTime.of(2026, 9, 10, 8, 14)))
+        assertEquals("heartbeat:2026-09-10-23:30", heartbeatIdempotencyKey(LocalDateTime.of(2026, 9, 10, 23, 59)))
     }
 }

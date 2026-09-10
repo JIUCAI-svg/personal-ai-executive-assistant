@@ -36,9 +36,12 @@ test('large retained history stays intact while UI state/action/memory payloads 
     const fullMeasurement = await measuredFetch(`${baseUrl}/api/assistant/state`);
     const full = fullMeasurement.payload;
     assert.equal(fullMeasurement.response.status, 200);
-    assert.ok(fullMeasurement.bytes > 8_000_000);
+    // Images live on disk now, so even with a large retained transcript the
+    // full state read stays small; the history itself is not truncated.
+    assert.ok(fullMeasurement.bytes < 1_500_000);
     assert.equal(full.state.messages.length, 2001);
-    assert.equal(full.state.messages.at(-1).attachments[0].data_url, fixture.image);
+    const storedReference = full.state.messages.at(-1).attachments[0].url;
+    assert.match(storedReference, /^\/api\/attachments\//);
 
     const uiMeasurement = await measuredFetch(`${baseUrl}/api/assistant/state?view=ui`);
     const ui = uiMeasurement.payload;
@@ -77,18 +80,22 @@ test('large retained history stays intact while UI state/action/memory payloads 
     const fullMemoryMeasurement = await measuredFetch(`${baseUrl}/api/assistant/memories/fixture-memory`, {
       ...memoryOptions, headers: { 'Content-Type': 'application/json' }
     });
-    assert.ok(fullMemoryMeasurement.bytes > 8_000_000);
+    assert.ok(fullMemoryMeasurement.bytes < 1_500_000);
     assert.equal(fullMemoryMeasurement.payload.state.memory_items[0].status, 'active');
 
     const history = await (await fetch(`${baseUrl}/api/assistant/threads/${fixture.thread.id}?limit=1`)).json();
     assert.equal(history.thread.messages.length, 1);
-    assert.ok(history.thread.messages[0].attachments[0].data_url.length > 8_000_000);
+    assert.equal(history.thread.messages[0].attachments[0].url, storedReference);
+    // The image bytes are still reachable through the gateway file endpoint.
+    const imageResponse = await fetch(`${baseUrl}${storedReference}`);
+    assert.equal(imageResponse.status, 200);
+    assert.equal(imageResponse.headers.get('content-type'), 'image/png');
     const archive = await (await fetch(`${baseUrl}/api/assistant/memory/export?view=ui`)).json();
     assert.equal(archive.raw_conversations[0].messages.length, 2001);
-    assert.equal(archive.raw_conversations[0].messages.at(-1).attachments[0].data_url, fixture.image);
+    assert.equal(archive.raw_conversations[0].messages.at(-1).attachments[0].url, storedReference);
     const persisted = await fixture.store.read();
     assert.equal(persisted.messages.length, 2001);
-    assert.equal(persisted.messages.at(-1).attachments[0].data_url, fixture.image);
+    assert.equal(persisted.messages.at(-1).attachments[0].url, storedReference);
     assert.equal(persisted.action_logs.filter((item) => item.type === 'fixture').length, 2000);
     assert.equal(persisted.memory_items[0].status, 'active');
     console.log(JSON.stringify({ latency_fixture: [

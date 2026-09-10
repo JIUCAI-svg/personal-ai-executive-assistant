@@ -20,7 +20,7 @@ import {
   assistantToolPrompt
 } from './assistant-tools.mjs';
 import { agentEngineCatalog, runAgentEngine } from './agent-adapters.mjs';
-import { isWithinProactiveSleepWindow, normalizeProactiveSignal } from './proactive-signals.mjs';
+import { normalizeProactiveSignal } from './proactive-signals.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(__dirname, '..');
@@ -1554,9 +1554,30 @@ app.get('/api/assistant/threads', async (request, response, next) => {
 app.get('/api/assistant/threads/:id', async (request, response, next) => {
   try {
     const { store, source } = await requestStateStore(request);
-    const thread = await store.getThreadMessages(stringValue(request.params.id, 80), request.query.limit);
+    const thread = await store.getThreadMessages(
+      stringValue(request.params.id, 80),
+      request.query.limit,
+      stringValue(request.query.after, 40)
+    );
     if (!thread) return response.status(404).json({ error: '未找到这段对话。' });
     response.json({ ok: true, source, thread });
+  } catch (error) { next(error); }
+});
+
+// Message images live on disk after leaving the state file. The strict
+// filename pattern plus gateway token keep this from becoming an open file
+// server; browsers get the token from the reverse proxy automatically.
+app.get('/api/attachments/:file', async (request, response, next) => {
+  try {
+    if (!bridgeAuthorized(request, response)) return;
+    const { store } = await requestStateStore(request);
+    const filePath = store.attachmentFilePath(request.params.file);
+    if (!filePath || !existsSync(filePath)) return response.status(404).json({ error: '附件不存在。' });
+    const ext = path.extname(filePath).toLowerCase();
+    const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/jpeg';
+    response.setHeader('Content-Type', mime);
+    response.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    response.status(200).end(readFileSync(filePath));
   } catch (error) { next(error); }
 });
 
@@ -2050,7 +2071,7 @@ app.use((error, _request, response, _next) => {
 const androidApkPath = path.join(appRoot, 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
 app.get('/download/forward.apk', (_request, response) => {
   if (!existsSync(androidApkPath)) return response.status(404).json({ error: 'Android 安装包尚未生成。' });
-  response.download(androidApkPath, 'forward-assistant-v0.7.0-proactive-signals-debug.apk');
+  response.download(androidApkPath, 'forward-assistant-v0.7.3-attachments-debug.apk');
 });
 
 app.post('/api/assistant/device-actions/status', async (request, response, next) => {
@@ -2233,14 +2254,9 @@ app.post('/api/assistant/proactive', async (request, response, next) => {
     // conversation instead of showing a notification that has no chat record.
     const proactiveThread = await resolveProactiveConversationThread(store, requestedThreadId);
     const threadId = proactiveThread?.id || requestedThreadId || null;
-    // Legacy callers that only sent a free-form event remain manual checks.
-    // Explicit device/signal envelopes participate in the persisted sleep gate.
-    const typedSignal = Boolean(body.type || body.signal_type || body.signal || body.followup_id || body.followupId || body.device_activity);
-    const sleeping = typedSignal && isWithinProactiveSleepWindow(current.settings, new Date(signal.observed_at), signal.timezone);
-    if (sleeping) {
-      const finished = await store.finishProactiveRun(run.id, { status: 'suppressed', thread_id: threadId, delivered: false, delivery_status: 'suppressed_sleep' });
-      return response.json({ ok: true, source, suppressed: true, reason: 'sleep_window', signal: claimed.signal, run: finished.run, reply: '', actions: [], actionResults: [], deviceActions: [], plan: current.plan });
-    }
+    // The proactive sleep gate is disabled by design: the user decided that
+    // late-night signals should still wake the assistant, and the AI keeps the
+    // final say on whether a signal is worth disturbing the user.
     const provider = selectAiProvider(aiProviderRegistry, current.ai_preferences?.provider_id, current.ai_preferences?.model, aiModel, current.ai_preferences?.reasoning_effort || aiReasoningEffort);
     if (!provider) {
       await store.finishProactiveRun(run.id, { status: 'failed', error: '尚未配置可用的 AI 提供商或模型。' });

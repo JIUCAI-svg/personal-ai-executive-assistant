@@ -1,5 +1,6 @@
 package com.forward.assistant
 
+import android.app.AlarmManager
 import android.app.AppOpsManager
 import android.app.Notification
 import android.app.NotificationChannel
@@ -34,16 +35,43 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.time.LocalDate
 import java.time.LocalDateTime
-import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 private const val USAGE_CHECK_INTERVAL_MS = 5 * 60 * 1000L
 private const val USAGE_UPLOAD_INTERVAL_MS = 15 * 60 * 1000L
 private const val ACTION_PROCESS_FOLLOWUP = "com.forward.assistant.action.PROCESS_FOLLOWUP"
+private const val ACTION_HEARTBEAT = "com.forward.assistant.action.HEARTBEAT"
 private const val PROACTIVE_THRESHOLD_MINUTES = 10
-private const val DEFAULT_SLEEP_MINUTES = 23 * 60 + 30
-private const val DEFAULT_WAKE_MINUTES = 8 * 60
+
+internal const val HEARTBEAT_INTERVAL_MS = 30 * 60 * 1000L
+
+/** One wakeup per 30-minute wall-clock slot, so retries inside a slot dedupe on the gateway. */
+internal fun heartbeatIdempotencyKey(now: LocalDateTime): String {
+    val slotMinute = (now.minute / 30) * 30
+    val slot = String.format(
+        java.util.Locale.ROOT, "%04d-%02d-%02d-%02d:%02d",
+        now.year, now.monthValue, now.dayOfMonth, now.hour, slotMinute
+    )
+    return "heartbeat:$slot"
+}
+
+/**
+ * The heartbeat chain keeps waking the monitor even when the OEM freezes the
+ * foreground service: alarm broadcasts are delivered while idle, and game
+ * modes generally let system alarms through.
+ */
+object HeartbeatScheduler {
+    fun scheduleNext(context: Context, intervalMs: Long = HEARTBEAT_INTERVAL_MS) {
+        val manager = context.getSystemService(AlarmManager::class.java) ?: return
+        val intent = Intent(context, AlarmReceiver::class.java).apply { action = ACTION_HEARTBEAT }
+        val pending = PendingIntent.getBroadcast(
+            context, 48879, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        manager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + intervalMs, pending)
+    }
+}
 
 /** Stable keys let the gateway collapse the five-minute polling repeats. */
 internal fun phoneUsageIdempotencyKey(
@@ -68,32 +96,8 @@ internal fun qualifiesForPhoneUsageProactive(
 internal fun selfCheckIdempotencyKey(followupId: String): String =
     "schedule_self_check:${followupId.trim()}"
 
-internal fun isWithinLocalSleepWindow(now: LocalTime, sleep: LocalTime, wake: LocalTime): Boolean {
-    val currentMinutes = now.toSecondOfDay() / 60
-    val sleepMinutes = sleep.toSecondOfDay() / 60
-    val wakeMinutes = wake.toSecondOfDay() / 60
-    if (sleepMinutes == wakeMinutes) return false
-    return if (sleepMinutes > wakeMinutes) {
-        currentMinutes >= sleepMinutes || currentMinutes < wakeMinutes
-    } else {
-        currentMinutes >= sleepMinutes && currentMinutes < wakeMinutes
-    }
-}
-
-private fun configuredSleepWindow(context: Context): Pair<LocalTime, LocalTime> {
-    val prefs = context.getSharedPreferences("planner", Context.MODE_PRIVATE)
-    val sleep = usageLocalTimeFromMinutes(prefs.getInt("sleep_time", DEFAULT_SLEEP_MINUTES))
-    val wake = usageLocalTimeFromMinutes(prefs.getInt("wake_time", DEFAULT_WAKE_MINUTES))
-    return sleep to wake
-}
-
-private fun usageLocalTimeFromMinutes(minutes: Int): LocalTime =
-    LocalTime.of((minutes / 60).coerceIn(0, 23), (minutes % 60).coerceIn(0, 59))
-
-private fun isWithinConfiguredSleepWindow(context: Context, now: LocalTime = LocalTime.now(ZoneId.systemDefault())): Boolean {
-    val (sleep, wake) = configuredSleepWindow(context)
-    return isWithinLocalSleepWindow(now, sleep, wake)
-}
+internal fun snapshotDateFrom(updatedAt: String, today: String = LocalDate.now().toString()): String =
+    updatedAt.take(10).takeIf { it.length == 10 && it[4] == '-' && it[7] == '-' } ?: today
 
 private fun normalizedDeviceActionType(type: String): String? = when (type.trim()) {
     "set_alarm", "cancel_alarm", "schedule_followup" -> type.trim()
@@ -464,6 +468,7 @@ class UsageMonitorBootReceiver : BroadcastReceiver() {
         if (intent?.action != Intent.ACTION_BOOT_COMPLETED) return
         if (!UsageMonitorStore.enabled(context) || !UsageMonitorPermissions.hasUsageAccess(context)) return
         ContextCompat.startForegroundService(context, Intent(context, UsageMonitorService::class.java))
+        HeartbeatScheduler.scheduleNext(context)
     }
 }
 
@@ -483,6 +488,7 @@ class UsageMonitorService : Service() {
         super.onCreate()
         createUsageChannel()
         startForeground(UsageMonitorNotification.ONGOING_ID, buildOngoingNotification())
+        HeartbeatScheduler.scheduleNext(this)
         monitorJob = serviceScope.launch { monitorLoop() }
     }
 
@@ -491,6 +497,15 @@ class UsageMonitorService : Service() {
             startForeground(UsageMonitorNotification.ONGOING_ID, buildOngoingNotification())
             serviceScope.launch {
                 evaluateDueFollowups(UsageMonitorStore.snapshot(this@UsageMonitorService), intent.getStringExtra(AlarmScheduler.EXTRA_ID))
+                if (!UsageMonitorStore.enabled(this@UsageMonitorService)) stopSelf(startId)
+            }
+        } else if (intent?.action == ACTION_HEARTBEAT) {
+            startForeground(UsageMonitorNotification.ONGOING_ID, buildOngoingNotification())
+            HeartbeatScheduler.scheduleNext(this)
+            serviceScope.launch {
+                runCatching { updateUsage() }
+                val snapshot = UsageMonitorStore.snapshot(this@UsageMonitorService)
+                runCatching { evaluateHeartbeat(snapshot) }
                 if (!UsageMonitorStore.enabled(this@UsageMonitorService)) stopSelf(startId)
             }
         } else if (!UsageMonitorStore.enabled(this)) stopSelf()
@@ -548,7 +563,10 @@ class UsageMonitorService : Service() {
     }
 
     private suspend fun evaluateDueFollowups(snapshot: UsageMonitorSnapshot, requestedFollowupId: String? = null) = withContext(Dispatchers.IO) {
-        if (isWithinConfiguredSleepWindow(this@UsageMonitorService)) return@withContext
+        // Keep usage rows attached to the date the snapshot was actually taken
+        // so a followup firing shortly after midnight cannot file yesterday's
+        // totals under today.
+        val snapshotDate = snapshotDateFrom(snapshot.updatedAt)
         val configuredUrl = BuildConfig.AI_GATEWAY_URL.trim()
         if (configuredUrl.isBlank()) return@withContext
         val base = if (configuredUrl.endsWith("/api/assistant/respond")) configuredUrl.removeSuffix("/api/assistant/respond") else configuredUrl.trimEnd('/')
@@ -574,7 +592,7 @@ class UsageMonitorService : Service() {
                     threadId?.let { put("thread_id", it) }
                     put("event", event); put("instruction", item.optString("instruction"));
                     put("followup_id", followupId)
-                    put("app_usage", JSONArray().apply { snapshot.targetApps.forEach { target -> put(JSONObject().apply { put("app", target.appName); put("package_name", target.packageName); put("today_minutes", target.dailyMinutes); put("current_session_minutes", target.currentSessionMinutes); put("in_foreground", target.isInForeground); put("date", LocalDate.now().toString()); put("source", "android-usage-monitor") }) } })
+                    put("app_usage", JSONArray().apply { snapshot.targetApps.forEach { target -> put(JSONObject().apply { put("app", target.appName); put("package_name", target.packageName); put("today_minutes", target.dailyMinutes); put("current_session_minutes", target.currentSessionMinutes); put("in_foreground", target.isInForeground); put("date", snapshotDate); put("source", "android-usage-monitor") }) } })
                 }.toString().toByteArray(Charsets.UTF_8)
                 val proactive = (URL("$base/api/assistant/proactive").openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"; connectTimeout = 8_000; readTimeout = 60_000; doOutput = true; useCaches = false
@@ -602,10 +620,10 @@ class UsageMonitorService : Service() {
     }
 
     private suspend fun evaluateAiProactive(targetSnapshots: List<UsageAppSnapshot>, snapshot: UsageMonitorSnapshot) {
-        if (isWithinConfiguredSleepWindow(this@UsageMonitorService)) return
         // The gateway owns whether an event warrants a response. A stable key
         // is also persisted locally so five-minute polling cannot re-trigger
         // the same foreground session after the gateway has accepted it.
+        val snapshotDate = snapshotDateFrom(snapshot.updatedAt)
         targetSnapshots.filter { qualifiesForPhoneUsageProactive(it) }
             .forEach { target ->
                 val configuredUrl = BuildConfig.AI_GATEWAY_URL.trim()
@@ -624,7 +642,7 @@ class UsageMonitorService : Service() {
                         put("enabled", snapshot.enabled); put("app", target.appName); put("package_name", target.packageName)
                         put("today_minutes", target.dailyMinutes); put("current_session_minutes", target.currentSessionMinutes)
                         put("daily_limit_minutes", target.dailyLimitMinutes); put("session_limit_minutes", target.sessionLimitMinutes)
-                        put("in_foreground", true); put("updated_at", snapshot.updatedAt); put("date", LocalDate.now().toString()); put("source", "android-usage-monitor")
+                        put("in_foreground", true); put("updated_at", snapshot.updatedAt); put("date", snapshotDate); put("source", "android-usage-monitor")
                     }) )
                 }.toString().toByteArray(Charsets.UTF_8)
                 runCatching {
@@ -653,6 +671,71 @@ class UsageMonitorService : Service() {
                     } finally { connection.disconnect() }
                 }.onFailure { UsageMonitorStore.saveEvent(this, "主动判断请求失败：${it.message.orEmpty()}") }
             }
+    }
+
+    /**
+     * Periodic 30-minute wakeup. The AI keeps the final say on whether a
+     * heartbeat is worth disturbing the user; the event text carries the last
+     * device-activity time so it can tell "asleep" from "still playing".
+     */
+    private suspend fun evaluateHeartbeat(snapshot: UsageMonitorSnapshot) = withContext(Dispatchers.IO) {
+        val configuredUrl = BuildConfig.AI_GATEWAY_URL.trim()
+        if (configuredUrl.isBlank()) return@withContext
+        val base = if (configuredUrl.endsWith("/api/assistant/respond")) configuredUrl.removeSuffix("/api/assistant/respond") else configuredUrl.trimEnd('/')
+        val now = LocalDateTime.now()
+        val activity = snapshot.deviceActivity
+        val idleMinutes = activity?.lastActiveAt?.takeIf { it.length >= 16 }?.let { last ->
+            runCatching {
+                java.time.Duration.between(LocalDateTime.parse(last), now).toMinutes().coerceAtLeast(0L)
+            }.getOrNull()
+        }
+        val activityText = when {
+            activity == null || activity.lastActiveAt.isBlank() -> "今日暂无前台活动记录"
+            idleMinutes == null -> "最后一次前台活动：${activity.lastForegroundApp}（${activity.lastActiveAt.take(16)}）"
+            idleMinutes <= 2L -> "用户刚刚还在使用手机，最后前台应用：${activity.lastForegroundApp}"
+            else -> "手机已约 $idleMinutes 分钟没有前台活动，最后一个应用：${activity.lastForegroundApp}"
+        }
+        val payload = JSONObject().apply {
+            put("type", "time")
+            put("timezone", ZoneId.systemDefault().id)
+            put("idempotency_key", heartbeatIdempotencyKey(now))
+            put("event", "定时心跳唤醒（每 30 分钟一次）。$activityText。请结合今日计划、当前任务和该手机状态判断是否有真正值得主动提醒的事项；用户大概率在休息或没有必要打扰时，保持安静不要发消息。")
+            put("app_usage", JSONArray().apply {
+                snapshot.targetApps.forEach { target -> put(JSONObject().apply {
+                    put("app", target.appName); put("package_name", target.packageName)
+                    put("today_minutes", target.dailyMinutes); put("current_session_minutes", target.currentSessionMinutes)
+                    put("in_foreground", target.isInForeground)
+                    put("date", snapshotDateFrom(snapshot.updatedAt)); put("source", "android-heartbeat")
+                }) }
+            })
+        }.toString().toByteArray(Charsets.UTF_8)
+        val connection = (URL("$base/api/assistant/proactive").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"; connectTimeout = 8_000; readTimeout = 60_000; doOutput = true; useCaches = false
+            setFixedLengthStreamingMode(payload.size); setRequestProperty("Content-Type", "application/json; charset=utf-8"); setRequestProperty("Connection", "close")
+            if (BuildConfig.AI_GATEWAY_TOKEN.isNotBlank()) setRequestProperty("x-forward-token", BuildConfig.AI_GATEWAY_TOKEN)
+            AssistantSessionStore.token(this@UsageMonitorService).takeIf { it.isNotBlank() }?.let { setRequestProperty("Authorization", "Bearer $it") }
+        }
+        try {
+            connection.outputStream.use { output -> output.write(payload) }
+            val body = (if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream)?.bufferedReader()?.use { it.readText() }.orEmpty()
+            if (connection.responseCode !in 200..299) {
+                UsageMonitorStore.saveEvent(this@UsageMonitorService, "心跳唤醒失败：${JSONObject(body).optString("error", "HTTP ${connection.responseCode}")}")
+                return@withContext
+            }
+            val responseJson = runCatching { JSONObject(body) }.getOrNull() ?: return@withContext
+            val responseThreadId = responseJson.optString("thread_id").ifBlank {
+                responseJson.optJSONObject("thread")?.optString("id").orEmpty()
+            }.takeIf { it.isNotBlank() }
+            assistantDeviceActionsFromJson(responseJson.optJSONArray("deviceActions"))
+                .forEach { action ->
+                    val outcome = AlarmScheduler.apply(this@UsageMonitorService, action)
+                    if (!outcome.ok) UsageMonitorStore.saveEvent(this@UsageMonitorService, "心跳闹钟操作失败：${outcome.message}")
+                }
+            val reply = responseJson.optString("reply").trim()
+            if (reply.isNotBlank()) UsageMonitorNotification.sendProactive(this@UsageMonitorService, responseThreadId, reply)
+        } catch (error: Exception) {
+            UsageMonitorStore.saveEvent(this@UsageMonitorService, "心跳唤醒失败：${error.message.orEmpty()}")
+        } finally { connection.disconnect() }
     }
 
     private fun calculateTargetUsage(
@@ -819,6 +902,11 @@ class UsageMonitorService : Service() {
     }
 
     private suspend fun uploadUsage(snapshot: UsageMonitorSnapshot, foregroundSnapshot: UsageAppSnapshot? = null) = withContext(Dispatchers.IO) {
+        // Snapshot totals and updatedAt are written by saveUsage during a
+        // previous poll. If the device slept across midnight, re-dating the
+        // stale totals with LocalDate.now() would push yesterday's usage into
+        // today's bucket, so the payload keeps the snapshot's own date.
+        val snapshotDate = snapshotDateFrom(snapshot.updatedAt)
         UsageMonitorStore.markUploadAttempt(this@UsageMonitorService)
         val configuredUrl = BuildConfig.AI_GATEWAY_URL.trim()
         if (configuredUrl.isBlank()) return@withContext
@@ -841,7 +929,7 @@ class UsageMonitorService : Service() {
                         put("in_foreground", target.isInForeground)
                         put("last_event", snapshot.lastEvent)
                         put("updated_at", snapshot.updatedAt)
-                        put("date", LocalDate.now().toString())
+                        put("date", snapshotDate)
                         put("source", "android-usage-monitor")
                     })
                 }
@@ -857,7 +945,7 @@ class UsageMonitorService : Service() {
                             put("session_limit_minutes", 0)
                             put("in_foreground", false)
                             put("updated_at", snapshot.updatedAt)
-                            put("date", LocalDate.now().toString())
+                            put("date", snapshotDate)
                             put("source", "android-auto-top-ten")
                         })
                     }
@@ -877,13 +965,13 @@ class UsageMonitorService : Service() {
                             put("session_limit_minutes", 0)
                             put("in_foreground", true)
                             put("updated_at", snapshot.updatedAt)
-                            put("date", LocalDate.now().toString())
+                            put("date", snapshotDate)
                             put("source", "android-current-foreground")
                         })
                     }
                 }
             })
-            snapshot.deviceActivity?.let { activity -> put("device_activity", JSONObject().apply {
+            snapshot.deviceActivity?.takeIf { it.date == snapshotDate }?.let { activity -> put("device_activity", JSONObject().apply {
                 put("date", activity.date); put("first_active_at", activity.firstActiveAt); put("last_active_at", activity.lastActiveAt)
                 put("first_foreground_app", activity.firstForegroundApp); put("last_foreground_app", activity.lastForegroundApp)
                 put("updated_at", snapshot.updatedAt); put("source", "android-usage-monitor")

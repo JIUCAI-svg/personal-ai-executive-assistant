@@ -10,6 +10,8 @@ import {
 import './styles.css';
 import { createInteractionStateGuard } from './interaction-state.mjs';
 import { shouldAnimateChatScroll } from './chat-scroll.mjs';
+import { readThreadDraft, writeThreadDraft, clearThreadDraft, migrateThreadDraft } from './draft-persistence.mjs';
+import { resolveDraftOnThreadAssignment, acceptsActiveThreadResponse, stateMergeDecision } from './thread-draft-transitions.mjs';
 
 const appBasePath = String(import.meta.env.BASE_URL || '/').replace(/\/$/, '');
 function appPath(path) {
@@ -202,7 +204,11 @@ function App() {
   const [memoryScope, setMemoryScope] = useState(true);
   const [saveTranscript, setSaveTranscript] = useState(true);
   const [distillMemory, setDistillMemory] = useState(false);
-  const [input, setInput] = useState('');
+  const [input, setInput] = useState(() => readThreadDraft(window.localStorage.getItem('forward.current.thread')));
+  const inputRef = useRef(input);
+  inputRef.current = input;
+  const activeThreadIdRef = useRef(threadId);
+  const pendingDraftThreadRef = useRef(threadId);
   const [pendingImages, setPendingImages] = useState([]);
   const [notice, setNotice] = useState('');
   const [notificationStatus, setNotificationStatus] = useState(
@@ -246,7 +252,20 @@ function App() {
   const [pendingInteractions, setPendingInteractions] = useState({});
   const [chatHydrated, setChatHydrated] = useState(true);
 
-  // Keep a small local copy so a slow cloud request never makes an existing
+  useEffect(() => {
+    const previousThreadId = pendingDraftThreadRef.current;
+    if (previousThreadId !== threadId) {
+      writeThreadDraft(previousThreadId, input);
+      setInput(readThreadDraft(threadId));
+      pendingDraftThreadRef.current = threadId;
+    }
+  }, [threadId]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => writeThreadDraft(threadId, input), 150);
+    return () => window.clearTimeout(timer);
+  }, [threadId, input]);
+
   // conversation appear empty on startup. The cloud transcript remains the
   // source of truth and replaces this cache when it arrives.
   useEffect(() => {
@@ -550,20 +569,34 @@ function App() {
     return () => window.clearInterval(id);
   }, []);
 
-  function applyAssistantData(payload) {
-    if (!interactionGuard.current.accepts(payload.state)) return false;
-    const dynamicPlan = payload.plan || payload.state?.plan;
+  const setActiveThread = (nextThreadId) => {
+    activeThreadIdRef.current = nextThreadId;
+    setThreadId(nextThreadId);
+  };
+
+  function applyAssistantData(payload, sourceThreadId = undefined) {
+    if (sourceThreadId !== undefined && !acceptsActiveThreadResponse({ getCurrentThreadId: () => activeThreadIdRef.current, requestThreadId: sourceThreadId, responseThreadId: payload.thread?.id })) return { accepted: false, stateMerged: false };
+    const stateAccepted = interactionGuard.current.accepts(payload.state);
+    const decision = stateMergeDecision(stateAccepted);
+    const dynamicPlan = decision.mergeState ? (payload.plan || payload.state?.plan) : null;
     if (dynamicPlan) {
       setPlanner(dynamicPlan);
       setPlan(dynamicPlanToUi(dynamicPlan));
     }
     if (payload.thread?.id) {
-      setThreadId(payload.thread.id);
-      window.localStorage.setItem('forward.current.thread', payload.thread.id);
+      const nextThreadId = payload.thread.id;
+      const previousThreadId = pendingDraftThreadRef.current;
+      const draftAtResponse = inputRef.current;
+      if (previousThreadId !== nextThreadId) {
+        migrateThreadDraft(previousThreadId, nextThreadId, draftAtResponse);
+        pendingDraftThreadRef.current = nextThreadId;
+      }
+      setActiveThread(nextThreadId);
+      window.localStorage.setItem('forward.current.thread', nextThreadId);
     }
-    if (payload.state) setAssistantState(payload.state);
-    if (Array.isArray(payload.memoryRead)) setMemoryRead(payload.memoryRead);
-    return true;
+    if (decision.mergeState && payload.state) setAssistantState(payload.state);
+    if (decision.mergeState && Array.isArray(payload.memoryRead)) setMemoryRead(payload.memoryRead);
+    return { accepted: true, stateMerged: decision.mergeState };
   }
 
   function beginInteraction(keys, label) {
@@ -971,7 +1004,7 @@ function App() {
     }
   }
 
-  async function handleUserMessage(text, attachments = []) {
+  async function handleUserMessage(text, attachments = [], requestThreadId = threadId) {
     const requestId = crypto.randomUUID();
     setAiBusy(true);
     setAgentActivity('正在连接 Agent');
@@ -1003,7 +1036,7 @@ function App() {
           message: text,
           request_id: requestId,
           attachments,
-          thread_id: threadId,
+          thread_id: requestThreadId,
           conversation_mode: conversationMode,
           project_id: projectId,
           conversation_options: {
@@ -1019,7 +1052,8 @@ function App() {
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || 'AI 请求失败');
-      applyAssistantData(payload);
+      const responseDecision = applyAssistantData(payload, requestThreadId);
+      if (!responseDecision.accepted) return;
       addAssistant(payload.reply || '');
       loadThreads();
       const applied = (payload.actionResults || []).filter((item) => item.ok);
@@ -1052,6 +1086,7 @@ function App() {
     if (!text && pendingImages.length === 0) return;
     const attachments = pendingImages.map((item) => ({ name: item.name, type: item.type, data_url: item.dataUrl }));
     setMessages((items) => [...items, { id: Date.now(), role: 'user', time: timeNow(), text, attachments }]);
+    clearThreadDraft(threadId);
     setInput('');
     setPendingImages([]);
     handleUserMessage(text || '请查看我上传的图片。', attachments);
@@ -1078,9 +1113,13 @@ function App() {
     setMemoryScope(options.memory_scope);
     setSaveTranscript(options.save_full_conversation);
     setDistillMemory(options.allow_memory_distillation);
-    setMessages([]);
+    const pendingInput = inputRef.current;
+    const previousThreadId = threadId;
+    writeThreadDraft(previousThreadId, pendingInput);
     setMemoryRead([]);
-    setThreadId(null);
+    setActiveThread(null);
+    pendingDraftThreadRef.current = null;
+    setInput('');
     setChatHydrated(true);
     window.localStorage.removeItem('forward.current.thread');
     setShowNewConversation(false);
@@ -1096,8 +1135,17 @@ function App() {
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '创建新对话失败');
-      setThreadId(payload.thread?.id || null);
-      if (payload.thread?.id) window.localStorage.setItem('forward.current.thread', payload.thread.id);
+      if (payload.thread?.id) {
+        const nextThreadId = payload.thread.id;
+        const latestInput = inputRef.current;
+        const targetDraft = readThreadDraft(nextThreadId);
+        const resolved = resolveDraftOnThreadAssignment({ currentThreadId: previousThreadId, nextThreadId, currentInput: '', pendingInput: latestInput, targetDraft });
+        if (resolved.migrate) migrateThreadDraft(null, nextThreadId, resolved.draft);
+        window.localStorage.setItem('forward.current.thread', nextThreadId);
+        pendingDraftThreadRef.current = nextThreadId;
+        setInput(resolved.draft);
+        setActiveThread(nextThreadId);
+      }
       setNotice(selected === 'temporary' ? '已打开临时聊天，本次不会读取或沉淀长期内容。' : '已打开新对话。');
       loadThreads();
     } catch (error) {
@@ -1112,7 +1160,12 @@ function App() {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '读取对话失败');
       const thread = payload.thread;
-      setThreadId(thread.id);
+      if (thread.id !== threadId) {
+        writeThreadDraft(threadId, input);
+        setInput(readThreadDraft(thread.id));
+        pendingDraftThreadRef.current = thread.id;
+      }
+        setActiveThread(thread.id);
       window.localStorage.setItem('forward.current.thread', thread.id);
       setConversationMode(thread.mode);
       setProjectId(thread.project_id || '');
@@ -1312,7 +1365,7 @@ function App() {
               {messages.map((message) => (
                 <article className={`message ${message.role}`} key={message.id}>
                   {message.role === 'assistant' && <div className="message-avatar"><Bot size={16} /></div>}
-                  <div><div className="message-meta">{message.role === 'assistant' ? '向前' : '你'} <time>{message.time}</time></div>{message.text && (message.role === 'assistant' ? <div className="message-markdown">{renderAssistantMarkdown(message.text)}</div> : <p>{message.text}</p>)}{message.attachments?.map((image) => <img className="message-image" key={image.data_url} src={image.data_url} alt={image.name || '上传图片'} />)}</div>
+                  <div><div className="message-meta">{message.role === 'assistant' ? '向前' : '你'} <time>{message.time}</time></div>{message.text && (message.role === 'assistant' ? <div className="message-markdown">{renderAssistantMarkdown(message.text)}</div> : <p>{message.text}</p>)}{message.attachments?.map((image) => { const src = image.url ? appPath(image.url) : image.data_url; return <img className="message-image" key={src} src={src} alt={image.name || '上传图片'} />; })}</div>
                 </article>
               ))}
               {agentActivity && <div className="agent-live-status"><Sparkles size={14} /><span>{agentActivity}</span><span className="agent-live-dots" aria-hidden="true">···</span></div>}

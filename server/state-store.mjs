@@ -116,6 +116,17 @@ function addClockMinutes(date, time, offset) {
 function normalizeMessageAttachments(value) {
   if (!Array.isArray(value)) return [];
   return value.slice(0, 4).map((entry, index) => {
+    // Persisted attachments are either gateway file references (the normal
+    // case after images moved out of the state file) or legacy inline data
+    // URLs that predate the migration.
+    const reference = typeof entry === 'object' && entry ? String(entry.url || '').trim() : '';
+    if (reference.startsWith('/api/attachments/')) {
+      return {
+        url: reference,
+        name: normalizeText(typeof entry === 'object' ? entry?.name : `image-${index + 1}`, 160) || `image-${index + 1}`,
+        type: normalizeText(typeof entry === 'object' ? entry?.type : '', 80)
+      };
+    }
     const dataUrl = typeof entry === 'string'
       ? entry
       : String(entry?.data_url || entry?.dataUrl || entry?.url || '').trim();
@@ -850,7 +861,91 @@ export class AssistantStateStore {
   constructor(vaultPath) {
     this.rootPath = path.join(vaultPath, '.forward-assistant');
     this.filePath = path.join(this.rootPath, 'state.json');
+    this.attachmentsPath = path.join(this.rootPath, 'attachments');
     this.pending = Promise.resolve();
+  }
+
+  attachmentFilePath(fileName) {
+    // Attachments are written by this store only; the strict pattern keeps
+    // the public file endpoint from traversing outside the directory.
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(fileName)) return null;
+    return path.join(this.attachmentsPath, fileName);
+  }
+
+  // Inline data URLs used to live inside state.json and dominated its size
+  // (one photo was worth ~2 MB of base64). They now land on disk and the
+  // message keeps only the gateway file reference.
+  async storeAttachmentDataUrl(dataUrl, baseName) {
+    const match = String(dataUrl || '').match(/^data:(image\/[a-z0-9.+-]+);base64,([\s\S]+)$/i);
+    if (!match) return null;
+    const mime = match[1].toLowerCase();
+    const ext = mime.includes('png') ? 'png' : mime.includes('webp') ? 'webp' : mime.includes('gif') ? 'gif' : 'jpg';
+    const safeBase = String(baseName || 'image').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 80) || 'image';
+    const fileName = `${safeBase}-${crypto.randomBytes(4).toString('hex')}.${ext}`;
+    await mkdir(this.attachmentsPath, { recursive: true });
+    await writeFile(path.join(this.attachmentsPath, fileName), Buffer.from(match[2], 'base64'));
+    return { url: `/api/attachments/${fileName}`, type: mime };
+  }
+
+  async persistMessageAttachments(attachments, baseName) {
+    if (!Array.isArray(attachments)) return [];
+    const stored = [];
+    for (const [index, entry] of attachments.entries()) {
+      const inline = typeof entry === 'string' ? entry : entry?.data_url || entry?.dataUrl || '';
+      if (typeof inline === 'string' && inline.startsWith('data:')) {
+        const saved = await this.storeAttachmentDataUrl(inline, `${baseName}-${index + 1}`);
+        if (saved) {
+          stored.push({
+            url: saved.url,
+            name: normalizeText(typeof entry === 'object' ? entry?.name : `image-${index + 1}`, 160) || `image-${index + 1}`,
+            type: normalizeText(typeof entry === 'object' ? entry?.type : saved.type, 80)
+          });
+          continue;
+        }
+      }
+      stored.push(entry);
+    }
+    return stored;
+  }
+
+  // One-shot migration: rewrite every inline message image to a file and keep
+  // only the gateway reference in the state, so the state file returns to a
+  // size the phone can download.
+  async migrateMessageAttachmentsToFiles() {
+    let converted = 0;
+    let bytes = 0;
+    const state = await this.read();
+    const pending = [];
+    for (const message of state.messages || []) {
+      if (!Array.isArray(message.attachments)) continue;
+      for (const [index, attachment] of message.attachments.entries()) {
+        const inline = attachment?.data_url;
+        if (typeof inline !== 'string' || !inline.startsWith('data:')) continue;
+        pending.push({ messageId: message.id, attachments: message.attachments, index, inline });
+      }
+    }
+    for (const item of pending) {
+      const saved = await this.storeAttachmentDataUrl(item.inline, item.messageId || 'image');
+      if (!saved) continue;
+      bytes += item.inline.length;
+      item.attachments[item.index] = {
+        url: saved.url,
+        name: item.attachments[item.index]?.name || `image-${item.index + 1}`,
+        type: item.attachments[item.index]?.type || saved.type
+      };
+      converted += 1;
+    }
+    if (converted) {
+      const byId = new Map();
+      for (const item of pending) if (!byId.has(item.messageId)) byId.set(item.messageId, item.attachments);
+      await this.mutate((draft) => {
+        for (const message of draft.messages || []) {
+          if (byId.has(message.id)) message.attachments = byId.get(message.id);
+        }
+        return null;
+      });
+    }
+    return { scanned: pending.length, converted, bytes };
   }
 
   async read() {
@@ -918,6 +1013,9 @@ export class AssistantStateStore {
 
   async appendMessage(thread, role, content, actionResult = null, attachments = [], metadata = {}) {
     if (!thread?.id || !thread.save_full_conversation) return null;
+    // Inline images are written to the attachment directory before entering
+    // the state file; the transcript keeps only the gateway reference.
+    const storedAttachments = await this.persistMessageAttachments(attachments, `msg-${Date.now()}`);
     return this.mutate((state) => {
       const current = nowParts();
       const isFailureMessage = metadata?.failure === true || metadata?.is_error === true;
@@ -927,7 +1025,7 @@ export class AssistantStateStore {
         role: role === 'assistant' ? 'assistant' : 'user',
         content: isFailureMessage ? normalizeRunDiagnostic(content, 12000) : normalizeText(content, 12000),
         action_result: actionResult,
-        attachments: normalizeMessageAttachments(attachments),
+        attachments: normalizeMessageAttachments(storedAttachments),
         request_id: normalizeNullableId(metadata?.request_id, 120),
         ...(isFailureMessage ? { failure: true, is_error: true } : {}),
         ...(normalizeText(metadata?.error_code, 120) ? { error_code: normalizeText(metadata.error_code, 120) } : {}),
@@ -991,16 +1089,25 @@ export class AssistantStateStore {
       });
   }
 
-  async getThreadMessages(threadId, limit = 200) {
+  async getThreadMessages(threadId, limit = 200, afterId = '') {
     const state = await this.read();
     const thread = state.threads.find((item) => item.id === threadId);
     if (!thread) return null;
+    // Incremental transcript reads (`afterId`) return only messages that come
+    // after the caller's newest known message, so the 5-second chat poll stays
+    // cheap. created_at has minute precision, so the position of the message
+    // ID — not its timestamp — defines the watermark.
+    const afterKey = String(afterId || '').trim();
+    const messages = state.messages.filter((item) => item.thread_id === threadId);
+    const anchor = afterKey ? messages.findIndex((item) => item.id === afterKey) : -1;
+    const visible = anchor >= 0
+      ? messages.slice(anchor + 1)
+      : messages.slice(-Math.max(1, Math.min(500, Number(limit) || 200)));
     return {
       ...thread,
       project_name: taskProject({ project_id: thread.project_id }, state.projects)?.name || '',
-      messages: state.messages
-        .filter((item) => item.thread_id === threadId)
-        .slice(-Math.max(1, Math.min(500, Number(limit) || 200)))
+      incremental: anchor >= 0,
+      messages: visible
     };
   }
 
