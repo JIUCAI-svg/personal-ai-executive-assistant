@@ -44,7 +44,8 @@ android {
     }
     val aiGatewayUrl = (providers.gradleProperty("aiGatewayUrl").orNull
         ?: localProperties.getProperty("aiGatewayUrl")
-        ?: "http://YOUR-SERVER-IP/forward-assistant/api/assistant/respond").replace("\\", "\\\\").replace("\"", "\\\"")
+        // 默认网关地址只从 local.properties / gradle property 读取，不硬编码入库。
+        ?: "https://YOUR-SERVER-HOST/forward-assistant/api/assistant/respond").replace("\\", "\\\\").replace("\"", "\\\"")
     val aiGatewayToken = (providers.gradleProperty("aiGatewayToken").orNull
         ?: localProperties.getProperty("aiGatewayToken")
         ?: "").replace("\\", "\\\\").replace("\"", "\\\"")

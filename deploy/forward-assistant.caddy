@@ -1,5 +1,5 @@
 http://YOUR-SERVER-IP {
-    bind YOUR-INTERNAL-IP
+    bind YOUR-INTERNAL-IP   # 本机网卡 IP，或删除此行
 
     @forward_root path /forward-assistant
     redir @forward_root /forward-assistant/ 308

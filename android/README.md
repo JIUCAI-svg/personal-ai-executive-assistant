@@ -21,7 +21,7 @@ cd E:\ACE\personal-ai-executive-assistant\android
 产物位置：`app\build\outputs\apk\debug\app-debug.apk`。
 
 默认 AI 网关地址为云端公网 IP：
-`http://YOUR-SERVER-IP/forward-assistant/api/assistant/respond`
+`https://YOUR-SERVER-HOST/forward-assistant/api/assistant/respond`
 
 设置页会读取服务器上的 AI 提供商和模型目录，可选择不同中转站与模型；密钥由服务器保存，APK 不内置中转站密钥。
 
