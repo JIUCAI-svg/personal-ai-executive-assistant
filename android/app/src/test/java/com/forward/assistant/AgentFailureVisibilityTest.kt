@@ -36,4 +36,27 @@ class AgentFailureVisibilityTest {
         assertEquals(2, afterPersistence.size)
         assertTrue(afterPersistence.last().isError)
     }
+
+    @Test
+    fun connectionAbortIsATransientTransportError() {
+        assertTrue(isTransientTransportAbort(IllegalStateException("Software caused connection abort")))
+        assertTrue(isTransientTransportAbort(IllegalStateException("Connection reset")))
+    }
+
+    @Test
+    fun connectionAbortCardsAreNotKeptAfterSuccessfulReply() {
+        val abort = ChatMessage(
+            fromAssistant = true,
+            text = "Software caused connection abort",
+            isError = true,
+            requestId = "request-abort"
+        )
+        val reply = ChatMessage(true, "在的。现在是 15:16", requestId = "request-ok")
+        val merged = mergeTranscriptWithLocalRunFailures(
+            listOf(ChatMessage(false, "你好"), reply),
+            listOf(ChatMessage(false, "你好"), reply, abort)
+        )
+        assertEquals(2, merged.size)
+        assertEquals("在的。现在是 15:16", merged.last().text)
+    }
 }

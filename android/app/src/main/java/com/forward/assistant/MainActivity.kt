@@ -1606,18 +1606,20 @@ private fun ForwardApp(activity: MainActivity) {
                 // its terminal state instead. The request just needs the
                 // server to accept and persist it.
                 var submittedResult: AssistantResult? = null
-                val submitted = try {
+                var submitted = false
+                try {
                     submittedResult = requestAssistant(activity, text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel, agentEngine, remoteThreadId, requestId, conversationOptions, images)
-                    true
+                    submitted = true
                 } catch (error: Exception) {
                     // A rejected submit is still terminal: either the server
                     // answered with a real error (run failed / not found) or
                     // the request never reached it. Recover the run state
                     // once before surfacing the error card.
                     val status = runCatching { gatewayRunStatus(activity, requestId) }.getOrNull()
-                    when (status?.optString("status")) {
-                        "completed" -> {
-                            val recoveredThread = status.optString("thread_id").ifBlank { remoteThreadId.orEmpty() }
+                    val runStatus = status?.optString("status").orEmpty()
+                    when {
+                        runStatus == "completed" -> {
+                            val recoveredThread = status!!.optString("thread_id").ifBlank { remoteThreadId.orEmpty() }
                             val detail = recoveredThread.takeIf { it.isNotBlank() }?.let { runCatching { gatewayLoadThread(activity, it) }.getOrNull() }
                             val recoveredReply = detail?.messages?.lastOrNull { it.fromAssistant && !it.isError }?.text.orEmpty().ifBlank { status.optString("reply") }
                             if (recoveredReply.isNotBlank()) {
@@ -1626,8 +1628,8 @@ private fun ForwardApp(activity: MainActivity) {
                             }
                             if (recoveredThread.isNotBlank()) { remoteThreadId = recoveredThread; AssistantSessionStore.saveCurrentThread(activity, recoveredThread) }
                         }
-                        "failed" -> {
-                            val failedThread = status.optString("thread_id")
+                        runStatus == "failed" -> {
+                            val failedThread = status!!.optString("thread_id")
                                 ?.ifBlank { (error as? AssistantGatewayException)?.threadId.orEmpty() }
                                 ?.ifBlank { remoteThreadId.orEmpty() }
                                 .orEmpty()
@@ -1648,9 +1650,17 @@ private fun ForwardApp(activity: MainActivity) {
                                 messages = messages + localFailure
                             }
                         }
+                        runStatus == "processing" || isTransientTransportAbort(error) -> {
+                            // The HTTP wait was aborted, but the Agent is still
+                            // running (or the abort happened after accept). Do
+                            // not insert a fake failure card; poll the run.
+                            submittedResult = AssistantResult(
+                                reply = "",
+                                actions = emptyList(),
+                                threadId = status?.optString("thread_id")?.ifBlank { remoteThreadId }
+                            )
+                        }
                         else -> {
-                            // Unknown request: show the transport error as a
-                            // failure card so the user is never left hanging.
                             val localFailure = ChatMessage(
                                 fromAssistant = true,
                                 text = (error as? AssistantGatewayException)?.message ?: (error.message ?: "AI 网关请求失败"),
@@ -1660,18 +1670,18 @@ private fun ForwardApp(activity: MainActivity) {
                             messages = messages + localFailure
                         }
                     }
-                    monitorJob.cancel(); agentActivity = ""; aiBusy = false
-                    // Local failure cards (and any optimistic turns) must be
-                    // reconciled against the durable transcript once.
-                    transcriptSyncedThrough = null
-                    val queued = queuedMessages.firstOrNull()
-                    if (queued != null) {
-                        queuedMessages = queuedMessages.drop(1)
-                        input = TextFieldValue(queued.first)
-                        pendingImageData = queued.second
-                        sendMessage()
+                    if (runStatus != "processing" && !isTransientTransportAbort(error)) {
+                        monitorJob.cancel(); agentActivity = ""; aiBusy = false
+                        transcriptSyncedThrough = null
+                        val queued = queuedMessages.firstOrNull()
+                        if (queued != null) {
+                            queuedMessages = queuedMessages.drop(1)
+                            input = TextFieldValue(queued.first)
+                            pendingImageData = queued.second
+                            sendMessage()
+                        }
+                        return@launch
                     }
-                    return@launch
                 }
                 if (submitted) {
                     // Apply whatever the submit response carried (thread id),
@@ -2633,7 +2643,7 @@ private fun ChatScreen(
                     }
                 }
             }
-            items(messages) { message ->
+            items(messages.filterNot { it.isError && isTransientTransportAbort(IllegalStateException(it.text)) }) { message ->
                 Row(
                     Modifier.fillMaxWidth().padding(vertical = 6.dp),
                     horizontalArrangement = if (message.fromAssistant) Arrangement.Start else Arrangement.End,

@@ -142,6 +142,18 @@ internal fun agentFailureText(persistedError: String?, transportError: Throwable
     return transportError.message.orEmpty().trim().ifBlank { transportError.javaClass.name }
 }
 
+/** Mobile NAT/Doze abort of an idle HTTP wait is not an Agent failure. */
+internal fun isTransientTransportAbort(error: Throwable): Boolean {
+    val text = sequenceOf(error.message, error.cause?.message)
+        .mapNotNull { it?.lowercase() }
+        .joinToString(" ")
+    return text.contains("software caused connection abort") ||
+        text.contains("connection abort") ||
+        text.contains("econnaborted") ||
+        text.contains("connection reset") ||
+        text.contains("broken pipe")
+}
+
 internal fun agentFailureText(status: JSONObject?, transportError: Throwable): String = agentFailureText(
     status?.takeIf { it.optString("status") == "failed" }?.optString("error"),
     transportError
@@ -160,7 +172,9 @@ internal fun mergeTranscriptWithLocalRunFailures(
         .mapNotNull { it.requestId }
         .toSet()
     val localFailures = displayed.filter { message ->
-        message.isError && (message.requestId.isNullOrBlank() || message.requestId !in persistedTerminalRequestIds)
+        message.isError &&
+            !isTransientTransportAbort(IllegalStateException(message.text)) &&
+            (message.requestId.isNullOrBlank() || message.requestId !in persistedTerminalRequestIds)
     }
     return transcript + localFailures
 }
