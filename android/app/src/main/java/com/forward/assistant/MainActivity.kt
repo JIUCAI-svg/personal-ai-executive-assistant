@@ -1600,44 +1600,63 @@ private fun ForwardApp(activity: MainActivity) {
                         delay(1000)
                     }
                 }
-                val result = try {
-                    requestAssistant(activity, text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel, agentEngine, remoteThreadId, requestId, conversationOptions, images)
+                // Submit and return immediately. The reply is NOT read from
+                // this HTTP response: mobile networks abort multi-minute idle
+                // connections (ECONNABORTED), so the durable run is polled to
+                // its terminal state instead. The request just needs the
+                // server to accept and persist it.
+                var submittedResult: AssistantResult? = null
+                val submitted = try {
+                    submittedResult = requestAssistant(activity, text, now, sleepTime, wakeTime, buildPlan(currentDone, deferredTasks, cancelledTasks, cancelAllTasks), priorConversation, usageSnapshot, selectedProviderId, selectedModel, agentEngine, remoteThreadId, requestId, conversationOptions, images)
+                    true
                 } catch (error: Exception) {
-                    // If the HTTP response dropped after server commit, recover
-                    // the exact reply by request_id before surfacing the error.
+                    // A rejected submit is still terminal: either the server
+                    // answered with a real error (run failed / not found) or
+                    // the request never reached it. Recover the run state
+                    // once before surfacing the error card.
                     val status = runCatching { gatewayRunStatus(activity, requestId) }.getOrNull()
-                    if (status?.optString("status") == "completed") {
-                        val recoveredThread = status.optString("thread_id").ifBlank { remoteThreadId.orEmpty() }
-                        val detail = recoveredThread.takeIf { it.isNotBlank() }?.let { runCatching { gatewayLoadThread(activity, it) }.getOrNull() }
-                        val recoveredReply = detail?.messages?.lastOrNull { it.fromAssistant && !it.isError }?.text.orEmpty().ifBlank { status.optString("reply") }
-                        if (recoveredReply.isNotBlank()) {
-                            messages = messages + ChatMessage(true, recoveredReply)
-                            activity.showReplyNotificationIfNeeded(recoveredThread, recoveredReply)
+                    when (status?.optString("status")) {
+                        "completed" -> {
+                            val recoveredThread = status.optString("thread_id").ifBlank { remoteThreadId.orEmpty() }
+                            val detail = recoveredThread.takeIf { it.isNotBlank() }?.let { runCatching { gatewayLoadThread(activity, it) }.getOrNull() }
+                            val recoveredReply = detail?.messages?.lastOrNull { it.fromAssistant && !it.isError }?.text.orEmpty().ifBlank { status.optString("reply") }
+                            if (recoveredReply.isNotBlank()) {
+                                messages = messages + ChatMessage(true, recoveredReply)
+                                activity.showReplyNotificationIfNeeded(recoveredThread, recoveredReply)
+                            }
+                            if (recoveredThread.isNotBlank()) { remoteThreadId = recoveredThread; AssistantSessionStore.saveCurrentThread(activity, recoveredThread) }
                         }
-                        if (recoveredThread.isNotBlank()) { remoteThreadId = recoveredThread; AssistantSessionStore.saveCurrentThread(activity, recoveredThread) }
-                    } else {
-                        // A failed Agent run is a terminal result, not an
-                        // assistant reply. Prefer the durable run's original
-                        // upstream error; if the server response was lost,
-                        // display its verbatim HTTP error immediately.
-                        val failedThread = status?.optString("thread_id")
-                            ?.ifBlank { (error as? AssistantGatewayException)?.threadId.orEmpty() }
-                            ?.ifBlank { remoteThreadId.orEmpty() }
-                            .orEmpty()
-                        val failedDetail = failedThread.takeIf { it.isNotBlank() }
-                            ?.let { runCatching { gatewayLoadThread(activity, it) }.getOrNull() }
-                        val rawError = agentFailureText(status, error)
-                        val localFailure = ChatMessage(
-                            fromAssistant = true,
-                            text = rawError,
-                            isError = true,
-                            requestId = requestId
-                        )
-                        if (failedDetail != null) {
-                            remoteThreadId = failedDetail.thread.id
-                            AssistantSessionStore.saveCurrentThread(activity, failedDetail.thread.id)
-                            messages = mergeTranscriptWithLocalRunFailures(failedDetail.messages, messages + localFailure)
-                        } else {
+                        "failed" -> {
+                            val failedThread = status.optString("thread_id")
+                                ?.ifBlank { (error as? AssistantGatewayException)?.threadId.orEmpty() }
+                                ?.ifBlank { remoteThreadId.orEmpty() }
+                                .orEmpty()
+                            val failedDetail = failedThread.takeIf { it.isNotBlank() }
+                                ?.let { runCatching { gatewayLoadThread(activity, it) }.getOrNull() }
+                            val rawError = agentFailureText(status, error)
+                            val localFailure = ChatMessage(
+                                fromAssistant = true,
+                                text = rawError,
+                                isError = true,
+                                requestId = requestId
+                            )
+                            if (failedDetail != null) {
+                                remoteThreadId = failedDetail.thread.id
+                                AssistantSessionStore.saveCurrentThread(activity, failedDetail.thread.id)
+                                messages = mergeTranscriptWithLocalRunFailures(failedDetail.messages, messages + localFailure)
+                            } else {
+                                messages = messages + localFailure
+                            }
+                        }
+                        else -> {
+                            // Unknown request: show the transport error as a
+                            // failure card so the user is never left hanging.
+                            val localFailure = ChatMessage(
+                                fromAssistant = true,
+                                text = (error as? AssistantGatewayException)?.message ?: (error.message ?: "AI 网关请求失败"),
+                                isError = true,
+                                requestId = requestId
+                            )
                             messages = messages + localFailure
                         }
                     }
@@ -1654,39 +1673,66 @@ private fun ForwardApp(activity: MainActivity) {
                     }
                     return@launch
                 }
-                monitorJob.cancel()
-                if (result.plan == null) applyActions(result.actions)
-                val deviceResults = applyDeviceActions(result.deviceActions.ifEmpty { result.actions })
-                if (result.state != null) applyRemoteState(result.state)
-                else result.plan?.let { remotePlan = it }
-                result.threadId?.let { id ->
-                    remoteThreadId = id
-                    AssistantSessionStore.saveCurrentThread(activity, id)
-                    if (conversationOptions.saveFullConversation) {
-                        runCatching { gatewayListThreads(activity) }.onSuccess { threads = it }
+                if (submitted) {
+                    // Apply whatever the submit response carried (thread id),
+                    // then wait for the terminal run state on a status poll
+                    // instead of the HTTP connection.
+                    submittedResult?.threadId?.let { id ->
+                        remoteThreadId = id
+                        AssistantSessionStore.saveCurrentThread(activity, id)
+                        if (conversationOptions.saveFullConversation) {
+                            runCatching { gatewayListThreads(activity) }.onSuccess { threads = it }
+                        }
                     }
-                }
-                val deviceFailure = deviceResults.firstOrNull { !it.ok }
-                val displayReply = if (deviceFailure != null) {
-                    "手机端闹钟操作需要进一步处理：${deviceFailure.message}"
-                } else if (deviceResults.isNotEmpty()) {
-                    result.reply + "\n\n" + deviceResults.joinToString("\n") { it.message }
-                } else result.reply
-                messages = messages + ChatMessage(true, displayReply)
-                val completedThreadId = result.threadId ?: remoteThreadId
-                activity.showReplyNotificationIfNeeded(completedThreadId, displayReply)
-                aiBusy = false
-                agentActivity = ""
-                // The optimistic user turn and local reply are reconciled with
-                // the persisted transcript (which now stores file references)
-                // on the next poll.
-                transcriptSyncedThrough = null
-                val queued = queuedMessages.firstOrNull()
-                if (queued != null) {
-                    queuedMessages = queuedMessages.drop(1)
-                    input = TextFieldValue(queued.first)
-                    pendingImageData = queued.second
-                    sendMessage()
+                    transcriptSyncedThrough = null
+
+                    // Poll the durable run to its terminal state. The submit
+                    // connection is already closed, so mobile networks have
+                    // nothing to abort while the Agent works for minutes.
+                    var terminalStatus: JSONObject? = null
+                    while (true) {
+                        val status = runCatching { gatewayRunStatus(activity, requestId) }.getOrNull()
+                        if (status?.optString("status") in setOf("completed", "failed")) {
+                            terminalStatus = status
+                            break
+                        }
+                        delay(5_000)
+                    }
+
+                    if (terminalStatus?.optString("status") == "completed") {
+                        val completedThread = terminalStatus!!.optString("thread_id").ifBlank { remoteThreadId.orEmpty() }
+                        val detail = completedThread.takeIf { it.isNotBlank() }?.let { runCatching { gatewayLoadThread(activity, it) }.getOrNull() }
+                        val persistedReply = detail?.messages?.lastOrNull { it.fromAssistant && !it.isError }?.text.orEmpty().ifBlank { terminalStatus!!.optString("reply") }
+                        if (completedThread.isNotBlank()) { remoteThreadId = completedThread; AssistantSessionStore.saveCurrentThread(activity, completedThread) }
+                        if (persistedReply.isNotBlank()) {
+                            messages = messages + ChatMessage(true, persistedReply)
+                            activity.showReplyNotificationIfNeeded(completedThread, persistedReply)
+                        }
+                        runCatching { gatewayListThreads(activity) }.onSuccess { threads = it }
+                    } else {
+                        val status = terminalStatus!!
+                        val failedThread = status.optString("thread_id").ifBlank { remoteThreadId.orEmpty() }
+                        val failedDetail = failedThread.takeIf { it.isNotBlank() }?.let { runCatching { gatewayLoadThread(activity, it) }.getOrNull() }
+                        val rawError = agentFailureText(status, AssistantGatewayException(status.optString("error").ifBlank { "Agent 运行失败" }))
+                        val localFailure = ChatMessage(fromAssistant = true, text = rawError, isError = true, requestId = requestId)
+                        if (failedDetail != null) {
+                            remoteThreadId = failedDetail.thread.id
+                            AssistantSessionStore.saveCurrentThread(activity, failedDetail.thread.id)
+                            messages = mergeTranscriptWithLocalRunFailures(failedDetail.messages, messages + localFailure)
+                        } else {
+                            messages = messages + localFailure
+                        }
+                    }
+                    monitorJob.cancel(); agentActivity = ""; aiBusy = false
+                    transcriptSyncedThrough = null
+                    val queued = queuedMessages.firstOrNull()
+                    if (queued != null) {
+                        queuedMessages = queuedMessages.drop(1)
+                        input = TextFieldValue(queued.first)
+                        pendingImageData = queued.second
+                        sendMessage()
+                    }
+                    return@launch
                 }
             }
         }
