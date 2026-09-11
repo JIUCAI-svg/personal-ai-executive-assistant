@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.TimePickerDialog
 import android.content.Context
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -67,6 +68,7 @@ import androidx.compose.material.icons.filled.ListAlt
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.NotificationsNone
+import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Send
@@ -820,6 +822,21 @@ class MainActivity : ComponentActivity() {
 
     fun openUsageAccessSettings() {
         startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+    }
+
+    fun hasNotificationListenerAccess(): Boolean {
+        val listener = ComponentName(this, PaymentNotificationListener::class.java)
+        return androidx.core.app.NotificationManagerCompat.getEnabledListenerPackages(this)
+            .contains(packageName) || isNotificationListenerEnabled(listener)
+    }
+
+    private fun isNotificationListenerEnabled(listener: ComponentName): Boolean {
+        val flat = android.provider.Settings.Secure.getString(contentResolver, "enabled_notification_listeners").orEmpty()
+        return flat.split(":").any { ComponentName.unflattenFromString(it) == listener }
+    }
+
+    fun openNotificationListenerSettings() {
+        startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
     }
 
     fun openExactAlarmSettings() {
@@ -3451,6 +3468,20 @@ private fun AppUsageMonitorCard(
             if (!usageAccess) {
                 Text("需要一次性开启 Android 的“使用情况访问权限”，才能识别当前应用和累计时长。", color = Color(0xFF7A5F42), fontSize = 10.sp, lineHeight = 15.sp)
                 TextButton(onClick = { activity.openUsageAccessSettings() }) { Text("去开启权限", color = Green, fontSize = 12.sp) }
+            }
+            val notificationAccess = remember { activity.hasNotificationListenerAccess() }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.NotificationsActive, null, tint = Color(0xFF277267), modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(9.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("消费通知捕获", color = Green, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                    Text("读取支付通知的金额和来源，用于消费记录；验证码自动打码", color = Muted, fontSize = 10.sp)
+                }
+                if (!notificationAccess) {
+                    TextButton(onClick = { activity.openNotificationListenerSettings() }) { Text("去开启", color = Green, fontSize = 12.sp) }
+                } else {
+                    Text("已开启", color = Green, fontSize = 12.sp)
+                }
             }
             Text("关注应用", color = Green, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
             Text("勾选后才会按下方阈值提醒。可多选。", color = Muted, fontSize = 10.sp)

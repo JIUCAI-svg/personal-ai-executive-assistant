@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import chokidar from 'chokidar';
@@ -1100,10 +1100,38 @@ app.post('/api/mcp', async (request, response, next) => {
     });
     const argumentsValue = mcpArguments(params.arguments);
     const readLimit = Math.max(1, Math.min(30, Number(argumentsValue.limit) || 10));
-    if (['get_now', 'get_today_plan', 'list_tasks', 'list_projects', 'get_app_usage', 'search_memory', 'get_memory', 'search_vault', 'search_conversations'].includes(name)) {
+    if (['get_now', 'get_today_plan', 'list_tasks', 'list_projects', 'get_app_usage', 'search_memory', 'get_memory', 'search_vault', 'search_conversations', 'expense_summary', 'query_expenses'].includes(name)) {
       const state = await store.bootstrap();
       let data = [];
-      if (name === 'get_now') {
+      if (name === 'expense_summary') {
+        const month = stringValue(argumentsValue.month, 7);
+        const monthPrefix = /^\d{4}-\d{2}$/.test(month) ? month : nowParts().date.slice(0, 7);
+        const file = await readExpensesFile();
+        const monthRecords = file.payments.filter((item) => (item.occurred_at || '').startsWith(monthPrefix));
+        const byDirection = { expense: 0, income: 0, refund: 0 };
+        const bySource = {};
+        for (const item of monthRecords) {
+          byDirection[item.direction] = (byDirection[item.direction] || 0) + item.amount;
+          bySource[item.source] = (bySource[item.source] || 0) + (item.direction === 'expense' ? item.amount : 0);
+        }
+        data = [{
+          month: monthPrefix,
+          payment_count: monthRecords.length,
+          total_expense: byDirection.expense,
+          total_income: byDirection.income,
+          total_refund: byDirection.refund,
+          expense_by_source: bySource
+        }];
+      } else if (name === 'query_expenses') {
+        const direction = stringValue(argumentsValue.direction, 20);
+        const keyword = stringValue(argumentsValue.keyword, 80).toLocaleLowerCase('zh-CN');
+        const queryLimit = Math.max(1, Math.min(100, Number(argumentsValue.limit) || 20));
+        const file = await readExpensesFile();
+        data = file.payments
+          .filter((item) => !direction || item.direction === direction)
+          .filter((item) => !keyword || `${item.source} ${item.merchant} ${item.note}`.toLocaleLowerCase('zh-CN').includes(keyword))
+          .slice(-queryLimit);
+      } else if (name === 'get_now') {
         data = [{ now: state.plan?.now || new Date().toISOString(), planning_date: state.plan?.planning_date || '', sleep_time: state.plan?.sleep_time || '', wake_time: state.plan?.wake_time || '' }];
       } else if (name === 'get_today_plan') {
         data = [{ ...(state.plan || {}), scheduled: state.plan?.scheduled || [], deferred: state.plan?.deferred || [] }];
@@ -1633,6 +1661,145 @@ app.post('/api/assistant/usage', async (request, response, next) => {
   } catch (error) { next(error); }
 });
 
+// ---- Expense capture (observation phase) ----
+// Payment records and raw notification observations live in their own file,
+// never inside state.json: consumption data is sensitive, high-churn, and
+// must not re-inflate the snapshot the phone downloads every launch.
+const expensesFilePath = () => path.join(vaultPath, '.forward-assistant', 'expenses.json');
+const EXPENSE_RETENTION_DAYS = 400;
+const OBSERVATION_RETENTION_DAYS = 7;
+const OBSERVATION_CAP = 400;
+
+function isoDaysAgo(days) {
+  return new Date(Date.now() - days * 86_400_000).toISOString();
+}
+
+function expenseIsoValue(input) {
+  const result = stringValue(input, 48);
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/.test(result) ? result : '';
+}
+
+async function readExpensesFile() {
+  try {
+    const parsed = JSON.parse(await readFile(expensesFilePath(), 'utf8'));
+    return {
+      payments: Array.isArray(parsed.payments) ? parsed.payments : [],
+      observations: Array.isArray(parsed.observations) ? parsed.observations : []
+    };
+  } catch {
+    return { payments: [], observations: [] };
+  }
+}
+
+async function writeExpensesFile(data) {
+  await mkdir(path.dirname(expensesFilePath()), { recursive: true });
+  const temporaryPath = `${expensesFilePath()}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temporaryPath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+  await rename(temporaryPath, expensesFilePath());
+  return data;
+}
+
+// Defense in depth: the device masks verification codes before upload, but
+// the ingest never stores an unmasked code even if a future client forgets.
+function maskVerificationCodes(text) {
+  return String(text || '')
+    .replace(/(验证码|校验码|动态码|code|otp)[^0-9]{0,16}(\d{4,8})/gi,
+      (match, label, digits) => match.slice(0, match.length - digits.length) + '•'.repeat(digits.length))
+    .replace(/(\d{4,8})(?=[^\d]{0,6}(?:是您的|为您的|，请勿|, please))/gi,
+      (match, digits) => '•'.repeat(digits.length) + match.slice(digits.length));
+}
+
+function normalizeExpenseRecord(entry) {
+  const amount = Number(entry?.amount);
+  if (!entry || !Number.isFinite(amount) || amount <= 0) return null;
+  const direction = ['expense', 'income', 'refund'].includes(entry?.direction) ? entry.direction : 'expense';
+  return {
+    key: stringValue(entry.key, 120) || crypto.randomUUID(),
+    amount: Math.min(amount, 10_000_000),
+    direction,
+    source: stringValue(entry.source, 80) || 'unknown',
+    package_name: stringValue(entry.package_name, 120),
+    merchant: stringValue(entry.merchant, 160),
+    note: stringValue(entry.note, 240),
+    occurred_at: expenseIsoValue(entry.occurred_at) || new Date().toISOString(),
+    created_at: new Date().toISOString()
+  };
+}
+
+function normalizeObservationRecord(entry) {
+  const text = maskVerificationCodes(entry?.text).slice(0, 600);
+  if (!text) return null;
+  return {
+    key: stringValue(entry.key, 140) || crypto.randomUUID(),
+    package_name: stringValue(entry.package_name, 120),
+    app: stringValue(entry.app, 80),
+    title: maskVerificationCodes(entry?.title).slice(0, 120),
+    text,
+    is_payment: entry?.is_payment === true,
+    posted_at: expenseIsoValue(entry.posted_at) || new Date().toISOString(),
+    created_at: new Date().toISOString()
+  };
+}
+
+app.post('/api/assistant/expenses', async (request, response, next) => {
+  try {
+    if (!bridgeAuthorized(request, response)) return;
+    const payments = (Array.isArray(request.body?.payments) ? request.body.payments : [])
+      .map(normalizeExpenseRecord).filter(Boolean);
+    const observations = (Array.isArray(request.body?.observations) ? request.body.observations : [])
+      .map(normalizeObservationRecord).filter(Boolean);
+    if (!payments.length && !observations.length) return response.status(400).json({ error: '需要有效的消费记录或通知观察记录。' });
+
+    const file = await readExpensesFile();
+    const seenPayments = new Set(file.payments.map((item) => item.key));
+    const acceptedPayments = payments.filter((item) => !seenPayments.has(item.key) && seenPayments.add(item.key));
+    for (const item of acceptedPayments) file.payments.push(item);
+    const seenObservations = new Set(file.observations.map((item) => item.key));
+    const acceptedObservations = observations.filter((item) => !seenObservations.has(item.key) && seenObservations.add(item.key));
+    for (const item of acceptedObservations) file.observations.push(item);
+
+    const cutoffPayments = isoDaysAgo(EXPENSE_RETENTION_DAYS);
+    const cutoffObservations = isoDaysAgo(OBSERVATION_RETENTION_DAYS);
+    file.payments = file.payments
+      .filter((item) => item.occurred_at >= cutoffPayments)
+      .slice(-5_000);
+    file.observations = file.observations
+      .filter((item) => item.posted_at >= cutoffObservations)
+      .slice(-OBSERVATION_CAP);
+
+    await writeExpensesFile(file);
+    response.json({
+      ok: true,
+      accepted: { payments: acceptedPayments.length, observations: acceptedObservations.length },
+      totals: { payments: file.payments.length, observations: file.observations.length }
+    });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/assistant/expenses', async (request, response, next) => {
+  try {
+    if (!assistantAuthorized(request, response)) return;
+    const file = await readExpensesFile();
+    const limit = Math.max(1, Math.min(200, Number(request.query.limit) || 50));
+    const direction = stringValue(request.query.direction, 20);
+    const keyword = stringValue(request.query.keyword, 80).toLocaleLowerCase('zh-CN');
+    const payments = file.payments
+      .filter((item) => !direction || item.direction === direction)
+      .filter((item) => !keyword || `${item.source} ${item.merchant} ${item.note}`.toLocaleLowerCase('zh-CN').includes(keyword))
+      .slice(-limit);
+    response.json({
+      ok: true,
+      payments,
+      observations: file.observations.slice(-Number(request.query.observation_limit) || 0),
+      summary: {
+        payment_count: file.payments.length,
+        total_expense: file.payments.filter((item) => item.direction === 'expense').reduce((sum, item) => sum + item.amount, 0),
+        total_income: file.payments.filter((item) => item.direction !== 'expense').reduce((sum, item) => sum + item.amount, 0)
+      }
+    });
+  } catch (error) { next(error); }
+});
+
 app.get('/api/assistant/usage', async (request, response, next) => {
   try {
     if (!bridgeAuthorized(request, response)) return;
@@ -2079,7 +2246,7 @@ app.use((error, _request, response, _next) => {
 const androidApkPath = path.join(appRoot, 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
 app.get('/download/forward.apk', (_request, response) => {
   if (!existsSync(androidApkPath)) return response.status(404).json({ error: 'Android 安装包尚未生成。' });
-  response.download(androidApkPath, 'forward-assistant-v0.7.5-hide-abort-card-debug.apk');
+  response.download(androidApkPath, 'forward-assistant-v0.7.6-expense-capture-debug.apk');
 });
 
 app.post('/api/assistant/device-actions/status', async (request, response, next) => {

@@ -46,6 +46,14 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUB_TYPE"
                 android:value="app_usage_monitoring" />
         </service>
+        <service
+            android:name=".PaymentNotificationListener"
+            android:exported="false"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
         <receiver
             android:name=".UsageMonitorBootReceiver"
             android:enabled="true"

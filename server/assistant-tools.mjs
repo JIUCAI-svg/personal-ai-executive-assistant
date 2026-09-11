@@ -179,6 +179,16 @@ export const ASSISTANT_TOOLS = Object.freeze([
     name: 'replan_today',
     description: '按最新作息、任务和可用时间重新计算计划。',
     parameters: { reason: '重排原因' }
+  },
+  {
+    name: 'expense_summary',
+    description: '查询手机捕获的消费/收款汇总（来自微信、支付宝等支付通知）。回答“这个月花了多少”“最近消费情况”一类问题时调用。',
+    parameters: { month: '可选 YYYY-MM，默认本月', reason: '查询原因' }
+  },
+  {
+    name: 'query_expenses',
+    description: '按条件检索捕获的消费/收款明细记录。',
+    parameters: { direction: '可选 expense/income/refund', keyword: '可选关键词（来源、商户、备注）', limit: '最多返回条数', reason: '查询原因' }
   }
 ]);
 
